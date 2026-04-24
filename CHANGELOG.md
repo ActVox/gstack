@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.12.2.0] - 2026-04-24
+
+## **`/setup-gbrain` polish: PATH parsing, repo init order, MCP user scope.**
+
+Small refinements to the /setup-gbrain onboarding path.
+
+### Fixed
+- `bin/gstack-gbrain-install`: parse `gbrain --version` output with `awk '{print $NF}'` so the D19 PATH-shadow check compares just the version number.
+- `bin/gstack-brain-init`: omit `--source` from `gh repo create`. Later steps handle `git init` + remote setup explicitly.
+- `setup-gbrain` Step 9: smoke test uses `gbrain put <slug>` with body piped on stdin.
+- `setup-gbrain` Step 5a: MCP registers with `--scope user` and an absolute path to the gbrain binary, so `mcp__gbrain__*` tools are available in every Claude Code session on the machine.
+
+### Changed
+- `test/gstack-brain-init-gh-mock.test.ts`: asserts `--source` is absent from the `gh repo create` call.
+
 ## [1.12.1.0] - 2026-04-24
 
 ## **Plan-mode review skills run the review directly, no more "exit and rerun" prompt.**

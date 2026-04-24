@@ -151,7 +151,7 @@ if ! command -v gbrain >/dev/null 2>&1; then
   fail "bun link completed but 'gbrain' is not on PATH. Ensure ~/.bun/bin is in your PATH."
 fi
 
-actual_version=$(gbrain --version 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+actual_version=$(gbrain --version 2>/dev/null | head -1 | awk '{print $NF}' | tr -d '[:space:]' || true)
 if [ -z "$actual_version" ]; then
   fail "gbrain is on PATH but 'gbrain --version' produced no output — the binary may be broken."
 fi
