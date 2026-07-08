@@ -64,8 +64,16 @@ for (const file of SKILL_FILES) {
 
 console.log('\n  Templates:');
 const TEMPLATES = discoverTemplates(ROOT);
+const claudeGeneration = getHostConfig('claude').generation;
+
+function shouldSkipClaudeSkill(relPath: string): boolean {
+  const dir = relPath.includes('/') ? relPath.split('/')[0] : path.basename(ROOT);
+  if (claudeGeneration.includeSkills?.length && !claudeGeneration.includeSkills.includes(dir)) return true;
+  return Boolean(claudeGeneration.skipSkills?.includes(dir));
+}
 
 for (const { tmpl, output } of TEMPLATES) {
+  if (shouldSkipClaudeSkill(tmpl)) continue;
   const tmplPath = path.join(ROOT, tmpl);
   const outPath = path.join(ROOT, output);
   if (!fs.existsSync(tmplPath)) {
@@ -82,6 +90,7 @@ for (const { tmpl, output } of TEMPLATES) {
 
 // Skills without templates
 for (const file of SKILL_FILES) {
+  if (shouldSkipClaudeSkill(file)) continue;
   const tmplPath = path.join(ROOT, file + '.tmpl');
   if (!fs.existsSync(tmplPath) && !TEMPLATES.some(t => t.output === file)) {
     console.log(`  \u26a0\ufe0f  ${file.padEnd(30)} — no template (OK if no $B commands)`);
@@ -90,7 +99,7 @@ for (const file of SKILL_FILES) {
 
 // ─── External Host Skills (config-driven) ───────────────────
 
-import { getExternalHosts } from '../hosts/index';
+import { getExternalHosts, getHostConfig } from '../hosts/index';
 
 for (const hostConfig of getExternalHosts()) {
   const hostDir = path.join(ROOT, hostConfig.hostSubdir, 'skills');
