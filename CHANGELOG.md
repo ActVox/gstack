@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.60.2.0] - 2026-07-15
+
+## **ActVox now runs the full upstream GStack gate instead of waiting forever for a runner it does not have.**
+
+This integration brings the latest upstream GStack changes into the ActVox fork and maps upstream's Ubicloud Linux jobs to GitHub-hosted `ubuntu-latest` runners. The fork had no Ubicloud runner assignment, leaving every Linux gate queued indefinitely while macOS and Windows completed.
+
+### Itemized changes
+
+- Integrated upstream through `garrytan/gstack@a3259400`.
+- Preserved generated skill documentation for all supported hosts.
+- Switched ActVox Linux workflow labels from `ubicloud-standard-8` to `ubuntu-latest`; macOS and Windows lanes are unchanged.
+- Restored the release metadata required by the workspace-aware version gate.
+
 ## [1.60.1.0] - 2026-07-09
 
 ## **The /autoplan dual-voice eval is back on the board, catching real regressions.**
