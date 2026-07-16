@@ -9,7 +9,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}/ci
+  # GHCR repository names must be lowercase; the ActVox org contains capitals.
+  IMAGE: ghcr.io/actvox/gstack/ci
   EVALS_TIER: periodic
   EVALS_ALL: 1  # Ignore diff — run all periodic tests
 

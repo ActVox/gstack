@@ -36,6 +36,7 @@ jobs:
           context: .github/docker
           file: .github/docker/Dockerfile.ci
           push: true
+          # GHCR repository names must be lowercase; the ActVox org contains capitals.
           tags: |
-            ghcr.io/${{ github.repository }}/ci:latest
-            ghcr.io/${{ github.repository }}/ci:${{ github.sha }}
+            ghcr.io/actvox/gstack/ci:latest
+            ghcr.io/actvox/gstack/ci:${{ github.sha }}
