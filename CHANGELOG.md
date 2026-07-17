@@ -19,6 +19,12 @@ This integration brings the latest upstream GStack changes into the ActVox fork 
 ## **Eval timeouts now return evidence instead of hanging the suite.**
 
 The dual-voice eval proves both halves of /autoplan's Phase 1, the Claude review subagent and the Codex outside voice, actually fire. It now registers its skills the way real installs do (project-level `.claude/skills/`), so it exercises the same slash-command path users hit. Claude Code 2.x resolves slash commands strictly from registered skills, and the eval's old sandbox layout predates that. The eval harness also gained a hard guarantee: when a spawned session hits its timeout, the runner returns everything it collected instead of waiting on orphaned child processes.
+## [1.60.1.0] - 2026-07-09
+
+## **The /autoplan dual-voice eval is back on the board, catching real regressions.**
+## **Eval timeouts now return evidence instead of hanging the suite.**
+
+The dual-voice eval proves both halves of /autoplan's Phase 1, the Claude review subagent and the Codex outside voice, actually fire. It now registers its skills the way real installs do (project-level `.claude/skills/`), so it exercises the same slash-command path users hit. Claude Code 2.x resolves slash commands strictly from registered skills, and the eval's old sandbox layout predates that. The eval harness also gained a hard guarantee: when a spawned session hits its timeout, the runner returns everything it collected instead of waiting on orphaned child processes.
 
 ### The numbers that matter
 
