@@ -58,6 +58,8 @@ jobs:
   evals:
     runs-on: ${{ matrix.suite.runner || 'ubuntu-latest' }}
     needs: build-image
+    env:
+      HAS_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
     container:
       image: ${{ needs.build-image.outputs.image-tag }}
       credentials:
@@ -154,7 +156,7 @@ jobs:
       # hermetic E2E child env seeds). Scoped to this suite; needs its OWN key
       # env (the secrets block below is on the Run step only).
       - name: Seed claude interactive config
-        if: matrix.suite.name == 'e2e-pty-plan-smoke'
+        if: matrix.suite.name == 'e2e-pty-plan-smoke' && env.HAS_ANTHROPIC_API_KEY == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -183,7 +185,7 @@ jobs:
       # claude inherits it (this runner adds no HOME/CLAUDE_CONFIG_DIR override,
       # no hermetic mode) and the Seed step already proved claude reads $HOME.
       - name: Register gstack skills for PTY smoke
-        if: matrix.suite.name == 'e2e-pty-plan-smoke'
+        if: matrix.suite.name == 'e2e-pty-plan-smoke' && env.HAS_ANTHROPIC_API_KEY == 'true'
         run: |
           set -eu
           SKILLS_DIR="$HOME/.claude/skills"
@@ -244,6 +246,7 @@ jobs:
           echo "skill registry OK"
 
       - name: Run ${{ matrix.suite.name }}
+        if: matrix.suite.name != 'e2e-pty-plan-smoke' || env.HAS_ANTHROPIC_API_KEY == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -251,6 +254,10 @@ jobs:
           EVALS_CONCURRENCY: "40"
           PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
         run: EVALS=1 bun test --retry 2 --concurrent --max-concurrency 40 ${{ matrix.suite.file }}
+
+      - name: Skip credential-dependent PTY smoke
+        if: matrix.suite.name == 'e2e-pty-plan-smoke' && env.HAS_ANTHROPIC_API_KEY != 'true'
+        run: echo "Skipping PTY smoke because ANTHROPIC_API_KEY is not configured for this repository."
 
       - name: Upload eval results
         if: always()
