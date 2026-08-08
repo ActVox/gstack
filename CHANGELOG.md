@@ -1,6 +1,41 @@
 # Changelog
 
-## [1.60.2.0] - 2026-07-15
+## [1.60.2.0] - 2026-08-07
+
+## **Three free-suite tests fail-proofed against machine drift.**
+## **Plus a filed P1: the suite's exit code can lie, and now we know why.**
+
+A full-suite health check turned up three tests that failed on dev machines while CI stayed green, all test-side drift rather than product bugs. The eval:list CLI test now spawns from a neutral directory, so slug detection cannot route reads away from the fixture store it seeds (the old cwd made it fail on any machine with the dev symlink). The benchmark CLI's remediation-hint check is case-insensitive, matching the reworded Gemini guidance ("Export GEMINI_API_KEY..."). The session-runner observability floor now expects the 5 wrapped I/O sites that actually exist since the shell-free spawn removed the prompt-file unlink.
+
+### The numbers that matter
+
+Source: this branch's investigation logs (~/.gstack-dev/logs/free-suite-*.log) and per-file reruns.
+
+| Check | Before | After |
+|-------|--------|-------|
+| eval-list-cli on dev machines | 1 fail (reads empty project dir) | 2/2 pass, deterministic everywhere |
+| benchmark-cli remediation hint | 1 fail (case-brittle regex) | 15/15 pass |
+| observability check 11 floor | expects >= 6 markers, counts 5 | floor matches the 5 real sites |
+
+One deeper finding got filed instead of rushed: at least five browse test files force-exit the shared bun process with `setTimeout(() => process.exit(0), 500)`, which can exit 0 before the summary prints and mask real failures. That is now a P1 in TODOS.md with receipts, because removing the exits without fixing the handle leaks they paper over would trade silent failure for hangs.
+
+### What this means for you
+
+`bun test` gives the same verdict on your laptop as in CI for these three tests, and the exit-code trust problem is documented with a concrete fix path instead of lurking.
+
+### Itemized changes
+
+#### Fixed
+
+- `test/eval-list-cli.test.ts`: spawn from neutral cwd + absolute script path so `getProjectEvalDir()` slug probes fail deterministically and the seeded legacy store is read.
+- `test/benchmark-cli.test.ts`: remediation-hint pattern made case-insensitive for the updated Gemini NOT-READY message.
+- `test/helpers/observability.test.ts`: check 11 floor 6 → 5 with the surviving wrapped-I/O sites named.
+
+#### For contributors
+
+- TODOS.md: new P1 (free-suite exit code masked by in-process force-exits, with repro + receipts) filed under Test infrastructure.
+
+## ActVox fork notes for 1.60.2.0 - 2026-07-15
 
 ## **ActVox now runs the full upstream GStack gate instead of waiting forever for a runner it does not have.**
 
@@ -13,12 +48,6 @@ This integration brings the latest upstream GStack changes into the ActVox fork 
 - Switched ActVox Linux workflow labels from `ubicloud-standard-8` to `ubuntu-latest`; macOS and Windows lanes are unchanged.
 - Restored the release metadata required by the workspace-aware version gate.
 
-## [1.60.1.0] - 2026-07-09
-
-## **The /autoplan dual-voice eval is back on the board, catching real regressions.**
-## **Eval timeouts now return evidence instead of hanging the suite.**
-
-The dual-voice eval proves both halves of /autoplan's Phase 1, the Claude review subagent and the Codex outside voice, actually fire. It now registers its skills the way real installs do (project-level `.claude/skills/`), so it exercises the same slash-command path users hit. Claude Code 2.x resolves slash commands strictly from registered skills, and the eval's old sandbox layout predates that. The eval harness also gained a hard guarantee: when a spawned session hits its timeout, the runner returns everything it collected instead of waiting on orphaned child processes.
 ## [1.60.1.0] - 2026-07-09
 
 ## **The /autoplan dual-voice eval is back on the board, catching real regressions.**
