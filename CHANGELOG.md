@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.60.3.0] - 2026-08-08
+
+## **ActVox imports upstream's free-suite drift fixes without changing runtime behavior.**
+
+This fork release integrates upstream `v1.60.2.0`. The incoming changes make three developer-machine checks deterministic, preserve both upstream and ActVox release history, and leave the fork's runner mapping and runtime paths untouched.
+
+### Itemized changes
+
+- Merged upstream through `garrytan/gstack@960c3a8d`.
+- Preserved the ActVox fork notes for the prior `1.60.2.0` integration.
+- Kept the fork-specific GitHub-hosted Linux runner mapping unchanged.
+
 ## [1.60.2.0] - 2026-08-07
 
 ## **Three free-suite tests fail-proofed against machine drift.**
