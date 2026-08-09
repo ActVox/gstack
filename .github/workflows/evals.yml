@@ -73,23 +73,31 @@ jobs:
         suite:
           - name: llm-judge
             file: test/skill-llm-eval.test.ts
+            requires_anthropic: true
           - name: e2e-browse
             file: test/skill-e2e-bws.test.ts
             runner: ubuntu-latest
+            requires_anthropic: true
           - name: e2e-plan
             file: test/skill-e2e-plan.test.ts
+            requires_anthropic: true
           - name: e2e-deploy
             file: test/skill-e2e-deploy.test.ts
+            requires_anthropic: true
           - name: e2e-design
             file: test/skill-e2e-design.test.ts
+            requires_anthropic: true
           - name: e2e-qa-bugs
             file: test/skill-e2e-qa-bugs.test.ts
           - name: e2e-qa-workflow
             file: test/skill-e2e-qa-workflow.test.ts
+            requires_anthropic: true
           - name: e2e-review
             file: test/skill-e2e-review.test.ts
+            requires_anthropic: true
           - name: e2e-workflow
             file: test/skill-e2e-workflow.test.ts
+            requires_anthropic: true
           - name: e2e-routing
             file: test/skill-routing-e2e.test.ts
           - name: e2e-codex
@@ -106,6 +114,7 @@ jobs:
           - name: e2e-pty-plan-smoke
             file: test/skill-e2e-office-hours-auto-mode.test.ts test/skill-e2e-plan-mode-no-op.test.ts
             timeout: 35
+            requires_anthropic: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -246,7 +255,7 @@ jobs:
           echo "skill registry OK"
 
       - name: Run ${{ matrix.suite.name }}
-        if: matrix.suite.name != 'e2e-pty-plan-smoke' || env.HAS_ANTHROPIC_API_KEY == 'true'
+        if: matrix.suite.requires_anthropic != true || env.HAS_ANTHROPIC_API_KEY == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -255,9 +264,9 @@ jobs:
           PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
         run: EVALS=1 bun test --retry 2 --concurrent --max-concurrency 40 ${{ matrix.suite.file }}
 
-      - name: Skip credential-dependent PTY smoke
-        if: matrix.suite.name == 'e2e-pty-plan-smoke' && env.HAS_ANTHROPIC_API_KEY != 'true'
-        run: echo "Skipping PTY smoke because ANTHROPIC_API_KEY is not configured for this repository."
+      - name: Skip credential-dependent eval suite
+        if: matrix.suite.requires_anthropic == true && env.HAS_ANTHROPIC_API_KEY != 'true'
+        run: echo "Skipping ${{ matrix.suite.name }} because ANTHROPIC_API_KEY is not configured for this repository."
 
       - name: Upload eval results
         if: always()
