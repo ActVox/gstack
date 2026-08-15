@@ -7,12 +7,19 @@
 import fs from "fs";
 import path from "path";
 import { requireApiKey } from "./auth";
+import { receiptedFetch } from "./receipted-fetch";
 import { parseBrief } from "./brief";
+import { normalizeIntFlag } from "./flag-utils";
 
 export interface VariantsOptions {
   brief?: string;
   briefFile?: string;
-  count: number;
+  /**
+   * Raw CLI flag value or a number. Normalized inside variants() (#2032):
+   * nonsense errors loudly; above STYLE_VARIATIONS.length clamps with a
+   * warning — past that index variants degrade to duplicate base-brief runs.
+   */
+  count?: number | string | boolean;
   outputDir: string;
   size?: string;
   quality?: string;
@@ -61,7 +68,7 @@ export async function generateVariant(
     const timeout = setTimeout(() => controller.abort(), 240_000);
 
     try {
-      const response = await fetchFn("https://api.openai.com/v1/responses", {
+      const response = await receiptedFetch("variants-image-request", "https://api.openai.com/v1/responses", {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${apiKey}`,
@@ -73,7 +80,7 @@ export async function generateVariant(
           tools: [{ type: "image_generation", model: "gpt-image-2", size, quality }],
         }),
         signal: controller.signal,
-      });
+      }, fetchFn);
 
       clearTimeout(timeout);
 
@@ -153,7 +160,15 @@ export async function variants(options: VariantsOptions): Promise<void> {
     return;
   }
 
-  const count = Math.min(options.count, 7); // Cap at 7 style variations
+  // #2032: normalize at the consumption site so every caller (CLI or
+  // programmatic) gets the loud-on-nonsense contract; the ceiling derives
+  // from STYLE_VARIATIONS so it self-adjusts when styles are added.
+  const count = normalizeIntFlag(options.count, {
+    name: "count",
+    def: 3,
+    min: 1,
+    max: STYLE_VARIATIONS.length,
+  });
   const size = options.size || "1536x1024";
 
   console.error(`Generating ${count} variants...`);

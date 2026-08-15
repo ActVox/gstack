@@ -73,23 +73,31 @@ jobs:
         suite:
           - name: llm-judge
             file: test/skill-llm-eval.test.ts
+            requires_anthropic: true
           - name: e2e-browse
             file: test/skill-e2e-bws.test.ts
             runner: ubuntu-latest
+            requires_anthropic: true
           - name: e2e-plan
             file: test/skill-e2e-plan.test.ts
+            requires_anthropic: true
           - name: e2e-deploy
             file: test/skill-e2e-deploy.test.ts
+            requires_anthropic: true
           - name: e2e-design
             file: test/skill-e2e-design.test.ts
+            requires_anthropic: true
           - name: e2e-qa-bugs
             file: test/skill-e2e-qa-bugs.test.ts
           - name: e2e-qa-workflow
             file: test/skill-e2e-qa-workflow.test.ts
+            requires_anthropic: true
           - name: e2e-review
             file: test/skill-e2e-review.test.ts
+            requires_anthropic: true
           - name: e2e-workflow
             file: test/skill-e2e-workflow.test.ts
+            requires_anthropic: true
           - name: e2e-routing
             file: test/skill-routing-e2e.test.ts
           - name: e2e-codex
@@ -106,6 +114,7 @@ jobs:
           - name: e2e-pty-plan-smoke
             file: test/skill-e2e-office-hours-auto-mode.test.ts test/skill-e2e-plan-mode-no-op.test.ts
             timeout: 35
+            requires_anthropic: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -171,19 +180,28 @@ jobs:
             console.log("seeded", p);
           '
 
-      # PTY smokes drive the interactive `claude` TUI and send /office-hours and
-      # /plan-ceo-review. Claude Code discovers user-scoped skills from
-      # $HOME/.claude/skills/<name>/SKILL.md, but .claude/skills is gitignored, so
-      # a fresh CI checkout has NO registry — claude prints "Unknown command:
-      # /plan-ceo-review". Mirror setup's --no-prefix registry minimally: a gstack
-      # root symlink (resolves the preamble's absolute ~/.claude/skills/gstack/bin/*
-      # and ~/.claude/skills/gstack/<skill>/sections/* paths) plus a per-skill
-      # top-level dir holding SKILL.md (+ sections) symlinks for the two skills
+      # PTY smokes drive the interactive `claude` TUI and send /office-hours,
+      # /plan-ceo-review, /plan-eng-review, and /plan-design-review. Claude Code
+      # discovers user-scoped skills from $HOME/.claude/skills/<name>/SKILL.md,
+      # but .claude/skills is gitignored, so a fresh CI checkout has NO registry
+      # — claude prints "Unknown command: /plan-ceo-review". Mirror setup's
+      # --no-prefix registry minimally: a gstack root symlink (resolves the
+      # preamble's absolute ~/.claude/skills/gstack/bin/* and
+      # ~/.claude/skills/gstack/<skill>/sections/* paths) plus a per-skill
+      # top-level dir holding SKILL.md (+ sections) symlinks for the four skills
       # these tests invoke. No ./setup (it builds binaries, launches Chromium,
       # installs fonts, reads a /dev/tty prompt) and no binary build (SKILL.md +
       # bin/ + sections/ are committed). $HOME is /github/home here; the spawned
       # claude inherits it (this runner adds no HOME/CLAUDE_CONFIG_DIR override,
       # no hermetic mode) and the Seed step already proved claude reads $HOME.
+      #
+      # KEEP THIS STEP even though seedSkills/hermeticSkillsConfigDir() now
+      # registers skills for hermetic PTY children: that registry is SYMLINKS
+      # into the repo checkout, and this container's cross-mount symlinks
+      # defeat the TUI skill scanner (see the note inside the step below) —
+      # the real-file copies here are what the TUI actually reads. HOME is
+      # also not hermeticized, so the absolute ~/.claude/skills/gstack/...
+      # preamble paths resolve through the gstack root symlink this step makes.
       - name: Register gstack skills for PTY smoke
         if: matrix.suite.name == 'e2e-pty-plan-smoke' && env.HAS_ANTHROPIC_API_KEY == 'true'
         run: |
@@ -203,7 +221,7 @@ jobs:
           # registry recognized it, isolating the failure to the container's
           # cross-mount symlink). Copy SKILL.md + sections as real files so the TUI
           # reads them directly.
-          for s in office-hours plan-ceo-review; do
+          for s in office-hours plan-ceo-review plan-eng-review plan-design-review; do
             rm -rf "${SKILLS_DIR:?}/$s"
             mkdir -p "$SKILLS_DIR/$s"
             cp "$REPO/$s/SKILL.md" "$SKILLS_DIR/$s/SKILL.md"
@@ -218,7 +236,7 @@ jobs:
           # ~/.claude/skills/gstack symlink above.
           PROJ_SKILLS="$REPO/.claude/skills"
           mkdir -p "$PROJ_SKILLS"
-          for s in office-hours plan-ceo-review; do
+          for s in office-hours plan-ceo-review plan-eng-review plan-design-review; do
             rm -rf "${PROJ_SKILLS:?}/$s"
             mkdir -p "$PROJ_SKILLS/$s"
             cp "$REPO/$s/SKILL.md" "$PROJ_SKILLS/$s/SKILL.md"
@@ -231,22 +249,26 @@ jobs:
           for f in \
             "$SKILLS_DIR/office-hours/SKILL.md" \
             "$SKILLS_DIR/plan-ceo-review/SKILL.md" \
+            "$SKILLS_DIR/plan-eng-review/SKILL.md" \
+            "$SKILLS_DIR/plan-design-review/SKILL.md" \
             "$SKILLS_DIR/gstack/bin/gstack-update-check" \
             "$SKILLS_DIR/gstack/office-hours/sections/design-and-handoff.md" \
-            "$SKILLS_DIR/gstack/plan-ceo-review/sections/review-sections.md"; do
+            "$SKILLS_DIR/gstack/plan-ceo-review/sections/review-sections.md" \
+            "$SKILLS_DIR/gstack/plan-eng-review/sections/review-sections.md" \
+            "$SKILLS_DIR/gstack/plan-design-review/sections/review-sections.md"; do
             if [ ! -e "$f" ]; then
               echo "ERROR: skill-registry target missing (symlink dangles): $f" >&2
               exit 1
             fi
           done
-          grep -m1 '^name: office-hours$'    "$SKILLS_DIR/office-hours/SKILL.md"    >/dev/null \
-            || { echo "ERROR: office-hours SKILL.md missing 'name: office-hours' frontmatter" >&2; exit 1; }
-          grep -m1 '^name: plan-ceo-review$' "$SKILLS_DIR/plan-ceo-review/SKILL.md" >/dev/null \
-            || { echo "ERROR: plan-ceo-review SKILL.md missing 'name: plan-ceo-review' frontmatter" >&2; exit 1; }
+          for s in office-hours plan-ceo-review plan-eng-review plan-design-review; do
+            grep -m1 "^name: $s\$" "$SKILLS_DIR/$s/SKILL.md" >/dev/null \
+              || { echo "ERROR: $s SKILL.md missing 'name: $s' frontmatter" >&2; exit 1; }
+          done
           echo "skill registry OK"
 
       - name: Run ${{ matrix.suite.name }}
-        if: matrix.suite.name != 'e2e-pty-plan-smoke' || env.HAS_ANTHROPIC_API_KEY == 'true'
+        if: matrix.suite.requires_anthropic != true || env.HAS_ANTHROPIC_API_KEY == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -255,9 +277,9 @@ jobs:
           PLAYWRIGHT_BROWSERS_PATH: /opt/playwright-browsers
         run: EVALS=1 bun test --retry 2 --concurrent --max-concurrency 40 ${{ matrix.suite.file }}
 
-      - name: Skip credential-dependent PTY smoke
-        if: matrix.suite.name == 'e2e-pty-plan-smoke' && env.HAS_ANTHROPIC_API_KEY != 'true'
-        run: echo "Skipping PTY smoke because ANTHROPIC_API_KEY is not configured for this repository."
+      - name: Skip credential-dependent eval suite
+        if: matrix.suite.requires_anthropic == true && env.HAS_ANTHROPIC_API_KEY != 'true'
+        run: echo "Skipping ${{ matrix.suite.name }} because ANTHROPIC_API_KEY is not configured for this repository."
 
       - name: Upload eval results
         if: always()
