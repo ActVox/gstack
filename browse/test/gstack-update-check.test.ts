@@ -42,6 +42,7 @@ beforeEach(() => {
   const binDir = join(gstackDir, 'bin');
   mkdirSync(binDir);
   symlinkSync(join(import.meta.dir, '..', '..', 'bin', 'gstack-config'), join(binDir, 'gstack-config'));
+  symlinkSync(join(import.meta.dir, '..', '..', 'bin', 'gstack-egress-lib.sh'), join(binDir, 'gstack-egress-lib.sh'));
 });
 
 afterEach(() => {
