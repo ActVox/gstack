@@ -2,6 +2,88 @@
 
 ## NEXT PRIORITY
 
+### P2: Persona-fleet hostile-user harness (fork port wave 2 deferral)
+
+**What:** Port the methodology behind time-attack/gstack's 87-hostile-user
+field run (418 findings): machine-written t0 in an append-only run.jsonl
+(elapsed time measured, never self-reported), every metric resolving to an
+artifact, and a mandatory-quit contract with machine-checkable caps (300s to
+first useful output, 900s total, 40K context tokens, 3 consecutive dead ends)
+so abandonment is a computable outcome. Specs: fork `evals/fleet/METRICS.md`
++ `evals/fleet/ABANDONMENT.md` (methodology only — no runner code exists to
+port; this is a build).
+
+**Why:** A periodic hostile-user round against OUR 44-skill tree would surface
+the same first-five-minutes failure class the fork closed 418 of. Fits the
+existing eval-store/e2e harness as a new runner.
+
+**Effort:** L (human ~2wk) → M with CC. **Priority:** P2.
+**Depends on:** decisions on cost ceilings + journal storage.
+
+### P3: Answer-key eval methodology (rides the persona-fleet work)
+
+**What:** Pre-registered answer keys (fork `evals/answer-keys/` —
+codex-decorrelation, health-trending) grading our /codex and /health surfaces
+against planted ground truth instead of judge vibes.
+
+**Why:** Deterministic scoring for surfaces where LLM-judge drift is the
+known failure mode. **Effort:** M → S with CC. **Priority:** P3.
+**Depends on:** persona-fleet harness (shared runner shape).
+
+### P3: Quarterly Apple-journey live re-verification
+
+**What:** Run the /ship Apple release adapter against a real (TestFlight-only)
+release once a quarter, or on first user bug report, and fix drift. Apple's
+APIs move (the fork caught fastlane price_tier breaking live); the adapter's
+claims are evidence-backed today and must stay that way per its own
+evidence-before-claimed-limitations rule.
+
+**Effort:** S per run. **Priority:** P3. **Depends on:** a paid ADP account.
+
+### P2: office-hours design-doc dual-write functional E2E (fork port wave 2 review shortfall)
+
+**What:** A paid E2E (claude -p) that runs the office-hours Phase 5 handoff in
+a tmp repo and asserts BOTH write paths (docs/designs/<topic>.md + the
+~/.gstack copy) land and that `bin/gstack-redact` was invoked at the sink.
+Today only a static prose pin exists (test/skill-validation.test.ts) — the
+plan's R9 asked for the functional shape.
+
+**Why:** The dual-write is an egress path into the user's repo; prose drift
+that skips the redact scan-at-sink would ship user PII into git history with
+nothing failing. **Effort:** M → S with CC. **Priority:** P2.
+**Tier:** periodic (quality, non-deterministic).
+
+### P2: migration runners honor per-migration skip state
+
+**What:** Both migration runners (setup's post-setup block and
+/gstack-upgrade Step 4.75) select migrations purely by version window, so a
+migration that exits via the non-interactive default-skip (v1.27's
+GSTACK_MIGRATE_ASSUME_YES gate) is never offered again — the version marker
+advances past it. The remediation text now prints the honest direct
+invocation, but the runners should track per-migration .done/.skipped
+touchfiles and re-offer pending ones on the next interactive run.
+
+**Why:** Every remaining pre-v1.27 user upgrading via an agent session ([ -t 0 ]
+false) permanently misses the artifacts-rename migration unless they paste the
+manual command. **Effort:** M. **Priority:** P2.
+
+### P2: periodic tier — three documented-red tests need structural repair
+
+**What:** (1) The sidebar E2E trio (navigate, url-accuracy, css-interaction)
+POSTs to /sidebar-command and /sidebar-chat — endpoints removed on every tree
+when the PTY terminal replaced the chat queue (server.ts tombstone ~2671);
+rewrite them against the PTY surface or delete them. (2)
+skill-e2e-ship-idempotency: the PTY child sits at the Claude Code welcome
+screen in plan mode for the full budget — the typed /ship never lands
+(readiness/typing race vs CLI v2.1.233's welcome screen); never green since
+it was born in v1.63. (3) skill-e2e-brain-privacy-gate: never green anywhere;
+the artifacts-sync stop-gate preconditions don't survive the hermetic env
+even with per-test HOME/GSTACK_HOME injection — needs a transcript-level
+debug of what the child's preamble actually echoes.
+
+**Why:** every red periodic run costs triage time; two of these have burned
+three triage passes across two releases. **Effort:** M. **Priority:** P2.
+
 ### P1: #1882 — portable skill-install prefix (non-`gstack` install dirs break silently)
 
 **What:** Every generated SKILL.md hardcodes the literal `~/.claude/skills/gstack/...`
@@ -25,6 +107,9 @@ So #1882 is now purely the body-preamble portability work.
 invocation-time failures.
 **Cons:** Touches the most load-bearing bash in the repo (every skill's preamble);
 a silent mistake breaks all 52 skills. High blast radius — needs its own focused PR.
+**Note (fork port wave 2):** the Apple release adapter (ship/sections/
+apple-release.md) added template surface with `~/.claude/skills/gstack/bin`
+references — include it in this fix's coverage list.
 
 **Context / where to start:**
 - Rewire `ctx.paths.binDir` (and browse/design dir paths) + the ~9 resolvers that
@@ -45,6 +130,50 @@ a silent mistake breaks all 52 skills. High blast radius — needs its own focus
 
 ## Test infrastructure
 
+### P2: /context-save worktree-identity hardening (the #2052 residual)
+
+**What:** Persist a stable worktree identity (path hash or worktree name) into
+checkpoint frontmatter at save time; `/context-restore` prefers identity match
+over branch-name match. PR #2054 (@jbetala7, absorbed in the June 2026 wave)
+fixed restore ORDERING (current-branch first), but branch frontmatter is not a
+stable worktree identity: same-name branches across clones/remotes, renamed
+branches, and detached HEAD can still restore the wrong checkpoint.
+
+**Why:** Closes the residual wrong-checkpoint class entirely instead of the
+common case. Codex outside-voice concurred during the wave's eng review.
+
+**Pros:** Eliminates cross-clone checkpoint collisions.
+**Cons:** Frontmatter schema change; needs a migration story for old
+checkpoints (no-identity checkpoints rank as fallback, like #2054's
+no-branch handling).
+
+**Context:** Filed from the June 2026 fix-wave eng review (NOT-in-scope item).
+Start at `context-restore/SKILL.md.tmpl` Step 1 + `/context-save`'s frontmatter
+writer; mirror #2054's partition logic with identity as the first key.
+
+**Effort:** S (human ~4h, CC ~20min). **Depends on:** #2054 (landed in the wave).
+
+### P3: gbrain reindex-in-place on perpetual drift (conditional — check the drift log first)
+
+**What:** IF the `[gbrain-sources] drift:` stderr line (added in the June 2026
+wave) shows drift firing on every sync for some environment, implement #1985's
+reporter design: refresh an existing source in place with `gbrain reindex-code`
+instead of remove+add (which drops and re-embeds the full index — 768 pages /
+6,786 embeddings in the reporter's case).
+
+**Why:** Perpetual drift means paying full re-embed cost every sync. The wave's
+`realpathSync` normalization (symlink aliases are a match, not drift) may have
+eliminated the drift class entirely — that's why this is conditional.
+
+**Pros:** Avoids repeated embedding spend for affected environments.
+**Cons:** Speculative until the drift log produces evidence; reindex-in-place
+has its own consistency questions (stale chunks for deleted files).
+
+**Context:** Filed from the June 2026 fix-wave eng review (4A observability).
+Trigger condition documented in `lib/gbrain-sources.ts` at the drift log line.
+
+**Effort:** M (human ~1d, CC ~45min). **Depends on:** drift-log evidence from
+the wave's `ensureSourceRegistered` logging.
 ### P2: Periodic CI matrix covers 9 of ~66 e2e files — decide the coverage contract
 
 **Priority:** P2
@@ -67,6 +196,14 @@ claim true.
 **Cons:** Full periodic coverage costs real money weekly (rough order: ~$1/file/run);
 some orphans are deliberately manual (ios-device, opus-47 overlay harness), so a plain
 glob is wrong — needs a curated exclude list.
+
+**Fresh receipts (2026-08-16, v1.66.0.0 re-baseline):** the first full local
+periodic run in this store gave the never-baselined tail its first results:
+`skill-e2e-setup-gbrain-{bad-token,path4-local-pglite,remote}` all failed
+(spawned-process exit 1 — likely live-gbrain interference on a dev box) and
+`skill-e2e-ship-idempotency` timed out at the 1800s shard wall. None are in
+the weekly matrix, so these failures are invisible to CI — exactly this
+item's thesis. Start the burn-down with those four.
 
 **Context / where to start:** `.github/workflows/evals-periodic.yml:71` (matrix),
 `test/helpers/touchfiles.ts` E2E_TIERS (tier labels already exist per test), orphan
@@ -132,6 +269,76 @@ future bloat is still caught — only the stale anchor moved. Mirrors the earlie
 v1.47.0.0 baselines retained in `test/fixtures/` for the v1→v2 audit trail. The
 captured skill bytes match `origin/main` exactly (the rebasing branch left every
 SKILL.md untouched). `bun test` is green again.
+
+## Scope-gate follow-ups (filed via /plan-eng-review on the plan-mode auto-select-B change)
+
+### P2: SDK eval budgets charge API-queue latency to the work budget — pick a structural fix
+
+**What:** `runSkillTest`'s single `setTimeout(timeout)` arms at spawn, so session
+startup AND the model's first-completion queue time are charged against the
+test's work budget. Under concurrent load (11 CI matrix jobs, or local eval
+runs sharing the org API), a first completion can queue 60-90s+, producing the
+deterministic `0 turns / $0.00 / <budget>s x3 attempts` failure shape. Observed:
+`review-dashboard-via` (PR #2472, 180s→300s), `retro-base-branch` (240s→360s),
+`plan-ceo-plan-mode` (300s→420s, 2026-08-12), `design-consultation-preview`
+(90s→300s, PR #2533 CI). Every fix so far is a per-test budget bump.
+
+**Why not just re-arm the timer on first stream event:** an audit (2026-08-12)
+found ~100 outer bun-timeout literals sized as inner+30-60s; re-arming the inner
+clock breaks every outer/inner relationship and needs a codemod of all of them.
+
+**Options:** (a) two-phase timer in session-runner (startup grace, re-arm on
+first NDJSON line) + codemod outer literals to inner+grace+slack; (b) adopt a
+300s floor for all CI SDK budgets (statically enforceable — a free test can
+assert no `timeout: <300_000` in skill-e2e files) and stop re-litigating per
+test; (c) startup-spawn semaphore in the runner (bounds the boot stampede but
+not API-side queuing — evidence says queuing dominates, so likely insufficient
+alone). Recommend (b) short-term + (a) properly sequenced with the codemod.
+
+**Depends on / blocked by:** none.
+
+### P2: Wire the four demoted plan-mode/finding-floor PTY tests into periodic CI
+
+**What:** `evals-periodic.yml` runs an explicit 9-file matrix; the four tests
+demoted to `periodic` in v1.62.0.0 (`skill-e2e-plan-eng-plan-mode`,
+`skill-e2e-plan-design-plan-mode`, `skill-e2e-plan-eng-finding-floor`,
+`skill-e2e-plan-design-finding-floor`) are not in it, so they currently run
+only locally/manually (`bun run test:periodic` or `eval:bg:periodic`). Wiring
+them needs a PTY-capable periodic job: the container skill-registration setup
+from evals.yml's `e2e-pty-plan-smoke` job (real-file SKILL.md copies for the
+TUI's cross-mount symlink bug) with `EVALS_TIER=periodic`.
+
+**Why:** Codex re-review P2 on the v1.62.0.0 ship. This is a named instance of
+the existing periodic-orphans problem (see "P1/P2 periodic coverage" TODO in
+Test infrastructure) — solve it there or here, once.
+
+**Depends on / blocked by:** none; sibling of the periodic-orphans TODO above.
+
+### P3: Extract the whole scope gate to a shared `{{SCOPE_GATE}}` resolver
+
+**What:** Move the duplicated scope-gate prose (heading, intro sentence, the
+plan-mode/named-target exceptions block, numbered items, the A/B/C menu, and the
+Recommendation line) from `plan-eng-review/SKILL.md.tmpl` and
+`plan-design-review/SKILL.md.tmpl` into a `scripts/resolvers/` module with 4-5
+injected variant slots (preceded-by list, item-2 phrasing, option-C vocabulary,
+recommendation tail, exceptions action tail).
+
+**Why:** The two copies are hand-synced today. The drift-guard test in
+`test/gen-skill-docs.test.ts` ("scope-gate exceptions drift-guard") makes the
+duplication safe but is a stopgap — one source of truth is the real fix. Filed
+as D5 of the eng review on the plan-mode auto-select-B change (2026-08-11).
+
+**Pros:** Single source for a load-bearing gate; future gate changes (new
+exceptions, wording tuning) land once.
+**Cons:** Touches the resolver registry and its tests; must preserve the exact
+generated bytes or re-baseline the carve/parity ceilings.
+
+**Context / where to start:** structural-only diff, sequenced AFTER the
+behavior change (refactor and behavior never together). The drift-guard test
+becomes the migration's acceptance check: extract, regen, confirm byte-identical
+output, then retire or simplify the guard. Effort: human ~half day / CC ~20 min.
+
+**Depends on / blocked by:** the plan-mode auto-select-B PR landing on main.
 
 ## Token-reduction follow-ups (Phase B, filed via /plan-eng-review on the plan-ceo-review carve)
 
@@ -704,32 +911,6 @@ cc-pty-import landed.
 **Priority:** P2 (nice-to-have).
 **Effort:** M. Likely needs a per-tab session map keyed by chrome.tabs.id
 plus a TTL so abandoned PTYs eventually exit.
-
----
-
-### v1.1+: Audit `/health` token distribution
-
-**What:** Codex's outside-voice review on cc-pty-import flagged that
-`/health` already surfaces `AUTH_TOKEN` to any localhost caller in headed
-mode (`server.ts:1657`). That's a pre-existing soft leak — anything
-running on localhost gets the root token by hitting `/health`.
-
-**Why:** cc-pty-import sidesteps it by NOT putting the PTY token there
-(uses an HttpOnly cookie path instead). But the underlying leak is still
-shippable surface. A second extension or a localhost web app could
-currently scrape `AUTH_TOKEN` and hit any browse-server endpoint.
-
-**Pros:** Closes a real privilege-escalation path on multi-extension
-machines. **Cons:** Either we tighten the gate (Origin must be OUR
-extension id, not just any chrome-extension://) or we move bootstrap
-discovery off `/health` entirely. Either has migration cost for tests
-and the existing extension.
-
-**Context:** codex finding #2 on cc-pty-import plan-eng review. Not in
-scope of that PR; deliberately deferred to keep PTY-import small.
-
-**Priority:** P2.
-**Effort:** M.
 
 ---
 
@@ -2128,7 +2309,211 @@ Shipped in v0.6.5. TemplateContext in gen-skill-docs.ts bakes skill name into pr
 
 **Depends on:** v1.47.0.0 ships; gather real false-negative data from the v1 string matcher.
 
+## Test/evals/CI speedup follow-ups (filed v1.66.0.0 via /ship review army)
+
+### P2: Free-suite shard balancing — LPT by recorded durations instead of stable hash
+
+**What:** Full-suite shard assignment is a stable hash; measured shard durations
+spread 69.5s-168.5s (max 2.4x min), so ~35-40s of every run is idle tail. Local
+full-suite mode doesn't need deterministic indices (only the CI --shards matrix
+does) — bin-pack by recorded per-file durations (bun prints them in the logs the
+runner already captures), keep assignFilesToShards untouched for --shard mode.
+**Where:** scripts/test-free-shards.ts main() full-suite path.
+**Effort:** S (human ~4h, CC ~20min).
+
+### P2: Propagate parent eval selection to shard children (EVALS_SELECTION_JSON)
+
+**What:** The sharded paid runner computes selection once in the parent, but each
+shard child re-derives it at e2e-helpers module load (git spawns per shard; plus a
+bun child evaluating the old touchfiles-data when map-diff is active). Serialize
+the parent's selection into the child env and honor it in computeDiffSelection,
+keeping child self-derivation for non-sharded entrypoints. Add a parent/child
+selection drift test (same fixture through computePaidDiffSelection and
+computeDiffSelection) while there.
+**Where:** scripts/test-paid-shards.ts runPaidShards env block; test/helpers/e2e-helpers.ts.
+**Effort:** S (human ~4h, CC ~20min).
+
+### P2: evals.yml matrix census tripwire — gate files must appear in the CI matrix
+
+**What:** The branch's headline incident (two rehomed gate files silently never ran
+for 48 versions because the monolith's filename missed the hand-listed evals.yml
+matrix) has no tripwire binding gate-tier skill-e2e files to the matrix.
+e2e-tier-alignment covers the LOCAL sharded runner's mapper; the CI matrix can
+still drift. Parse the workflow YAML in a free test and diff against E2E_TIERS
+gate files (curated exclude list for deliberately-manual files).
+**Where:** new test beside test/e2e-tier-alignment.test.ts; .github/workflows/evals.yml.
+**Effort:** S (human ~3h, CC ~15min).
+
+### P2: E2E dep-list self-registration sweep — 129 of 177 keys omit their own test file
+
+**What:** Editing only a test's assertions/prompt selects nothing for most keys
+(the adversarial review measured 129/177), and parent-side shard skipping makes
+the hole cheaper to hit. This branch fixed the rehomed files' keys; sweep the
+rest mechanically (each key's dep list appends the file that declares it) and
+upgrade e2e-tier-alignment's report-only mode to enforce self-registration.
+**Where:** test/helpers/touchfiles-data.ts; test/e2e-tier-alignment.test.ts.
+**Effort:** S (human ~3h, CC ~15min).
+
+### P3: Paid runner spools non-live shard output to disk instead of RAM
+
+**What:** Non-live shards buffer their entire 30-min stream-json stdout+stderr in
+memory (Buffer[]), x jobs concurrent shards. Spool to a temp file like the free
+runner's per-run log.
+**Where:** scripts/test-paid-shards.ts runPaidShard buffered path.
+**Effort:** S (human ~2h, CC ~10min).
+
+### P3: Eval Docker image freshness tripwire
+
+**What:** The cache-key trio means the image rebuilds only when Dockerfile/bun.lock
+change; freshness of the baked unpinned claude CLI now rides entirely on
+ci-image.yml's cron. If the cron silently fails or is disabled, eval CI pins to an
+ever-older CLI with no signal. Add an image-age check (fail the eval workflow when
+the image tag's created date exceeds N days) or a cron-liveness alert.
+**Where:** .github/workflows/ci-image.yml, evals.yml.
+**Effort:** S (human ~2h, CC ~10min).
+
+### P3: Detach-floor self-check against runtime knobs (EVALS_JOBS)
+
+**What:** test/eval-detach-timeout-floor.test.ts computes the worst case from
+constants; an operator exporting EVALS_JOBS=2 doubles the gate worst case past the
+25,200s watchdog and healthy tail shards report never-started. Add a runtime
+self-check in test-paid-shards main(): warn/fail when the computed worst case with
+LIVE options exceeds a GSTACK_DETACH_TIMEOUT env exported by gstack-detach.
+**Where:** scripts/test-paid-shards.ts; bin/gstack-detach.
+**Effort:** S (human ~2h, CC ~10min).
+
+### P3: Eval store records the effective judge/capture model per run
+
+**What:** Model defaults moved (capture Opus→Sonnet) and GSTACK_EVAL_MODEL_JUDGE
+can silently change graders; eval:compare deltas across a model boundary conflate
+model swap with skill regressions. Record the resolved models in the eval-store
+record and surface them in eval:compare.
+**Where:** test/helpers/eval-store.ts, llm-judge.ts, eval-compare.
+**Effort:** S (human ~2h, CC ~10min).
+
+### P3: SECURITY_BENCH periodic lane — classifier behavioral coverage runs nowhere
+
+**What:** Gating the live L4 classifier tests on SECURITY_BENCH=1 fixed local
+suite speed but left the prompt-injection classifier with no scheduled lane.
+Add SECURITY_BENCH=1 (with model-cache warmup, 112MB first run) to
+evals-periodic.yml so behavioral coverage exists weekly.
+**Where:** .github/workflows/evals-periodic.yml; browse/test/security-live-playwright.test.ts.
+**Effort:** S (human ~2h, CC ~10min).
+
+### P3: Shared child-lifecycle helper for the two shard runners
+
+**What:** runFreeShard and runPaidShard duplicate ~35 lines of spawn/group-kill/
+wall-timer scaffold verbatim (and the ShardCommand type). Extract into
+scripts/test-strict-output.ts, which already hosts the shared lifecycle
+primitives, leaving stream policy per runner.
+**Where:** scripts/test-free-shards.ts, scripts/test-paid-shards.ts.
+**Effort:** S (human ~3h, CC ~15min).
+
+### P3: DI-refactor gstack-gbrain-detect-mcp-mode test (~40s spawn cost, absorbed but real)
+
+**What:** Plan item 5 of the v1.66.0.0 pass, deferred: the test spawns the real
+binary repeatedly. Refactor to import the module with a DI-injected exec seam
+(never env-set-before-import), keep 1-2 spawn smokes. Cost is currently absorbed
+by shard parallelism; the per-file wall cost remains.
+**Where:** test/gstack-gbrain-detect-mcp-mode.test.ts.
+**Effort:** S (human ~2h, CC ~15min).
+
+### P2: In-shard eval concurrency (40) is the shared root of the timeout-flake family
+
+**What:** Every timeout-flake member on PR #2593 (document-release 180s->300s,
+review-dashboard-via 300s->360s after PR #2472's 180s->300s, retro-base-branch
+240s->360s) shares one story: claude session STARTUP queues behind up to 39
+siblings under evals.yml's `--max-concurrency 40`, eating the per-test budget
+before the first turn. Per-test ratchets treat symptoms. Systemic options:
+(a) drop in-shard concurrency to ~15-20 and measure the wall-clock cost,
+(b) startup-aware budgets (start the timer at first turn, not spawn),
+(c) per-row concurrency overrides like the retries field. Receipts: the
+PR #2593 flake ledger comment.
+**Where:** .github/workflows/evals.yml:309 (--max-concurrency 40);
+test/helpers/session-runner.ts (budget start point).
+**Effort:** M (human ~1d, CC ~45min + measurement rounds).
+
+### P2: plan-design-review scope-gate detector is marginal under CI contention
+
+**What:** `plan-design-review reaches a terminal outcome outside plan mode`
+(test/skill-e2e-plan-mode-no-op.test.ts) intermittently fails ONLY the
+`scopeGateQuestionObserved` check on unchanged code — PR #2593 CI: failed
+rounds 3/11 + one rerun, passed rounds 5/6, all attempts reaching a terminal
+outcome with no plan-mode leak. Hypothesis: the PTY detector anchors on a
+render shape that scrolls out or gets rephrased under 40-way in-shard
+contention. The assertion now throws WITH the last-2KB evidence tail, so the
+next CI failure carries the screen contents; fix the detector (scan full
+scrollback, or widen the anchored shape) from that data.
+
+**Where:** test/helpers/claude-pty-runner.ts (scopeGateQuestionObserved
+detector), test/skill-e2e-plan-mode-no-op.test.ts.
+**Effort:** S (human ~3h, CC ~20min + one CI round with evidence).
+
+### P3: Diagnose the browser-manager-unit wedge on windows-latest
+
+**What:** The expanded Windows lane wedges to its wall deadline inside
+browse/test/browser-manager-unit.test.ts (in-flight at kill, PR #2593 run
+31919227507); the file is green on macOS and Linux. Excluded from the Windows
+curation with a receipt; needs a Windows repro to find which describe hangs
+(fake-timer/unref semantics under bun-windows are the suspects).
+**Where:** browse/test/browser-manager-unit.test.ts; scripts/test-free-shards.ts
+KNOWN_WINDOWS_INCOMPATIBLE (remove the entry once fixed).
+**Effort:** S (human ~2h with a Windows box, CC ~15min + CI rounds).
+
+### P3: skill-census Windows compatibility
+
+**What:** skillCensus() throws at module load on windows-latest
+(test/helpers/skill-census.ts:63) — the skills-tree symlink layout needs
+Developer Mode CI runners lack. Either branch the census walk on win32
+(treat copy-dirs as the setup script's _link_or_copy fallback produces) or
+keep the exclusion. Consumers (catalog budget, coverage matrix) currently
+have no Windows signal.
+**Where:** test/helpers/skill-census.ts; test/skill-census.test.ts.
+**Effort:** S (human ~3h, CC ~20min + CI rounds).
+
+### P3: Tighten revived coverage-audit E2E assertions
+
+**What:** The revived skill-e2e-coverage-audit tests assert hasGap OR hasTested
+(near-vacuous) and reference skill sections their own DRIFT WARNING says moved.
+Tighten to conjunctive assertions and retarget the prompts at live sections;
+needs one paid run to validate, so it didn't ride the ship.
+**Where:** test/skill-e2e-coverage-audit.test.ts.
+**Effort:** S (human ~2h, CC ~15min + one paid run).
+
 ## Completed
+
+### ✅ DONE (v1.66.0.0): Free suite exit code is untrustworthy — in-process force-exits mask failures
+
+**Priority:** P1
+
+**What:** At least five browse test files end with `setTimeout(() => process.exit(0), 500)`
+(browse/test/commands.test.ts:101, snapshot.test.ts:36, batch.test.ts:47,
+handoff.test.ts:31, content-security.test.ts:465). The timer fires inside the SHARED
+`bun test` process, exiting 0 before bun prints its final summary — so `bun test` can
+report exit 0 while real test failures scrolled by earlier. Remove the force-exits and
+fix the underlying handle leaks they paper over (lingering Playwright/daemon handles
+that once made the suite hang), or scope the exit to a spawned child process.
+
+**Why:** Observed 2026-08-07: three genuinely failing tests (eval-list-cli,
+benchmark-cli, observability check 11) rode green `bun test` exit codes across
+multiple runs; the failures only surfaced by grepping logs for "(fail)" lines. A test
+suite that exits 0 on failure is worse than no suite — it manufactures false
+confidence at commit time and in any CI job that trusts the exit code.
+
+**Pros:** Restores the one contract everything (CI, /ship, humans) relies on: exit
+code == truth. Also un-hides the missing final summary block.
+**Cons:** The force-exits exist because the suite once hung on leaked handles;
+removing them without fixing the leaks trades silent failure for hangs. Needs a
+focused pass: find each leaked handle (daemon children, PTY, Playwright contexts),
+close them in afterAll, then delete the exits one file at a time.
+
+**Context / where to start:** `grep -rn "process.exit(0)" browse/test/` — the
+setTimeout variants are the offenders (server-no-import-side-effects.test.ts:62 is a
+spawned-child probe, fine). Repro: run the full free suite and note the log ends at
+the browse files with no "Ran N tests" summary. Receipts:
+~/.gstack-dev/logs/free-suite-main-check.log (3 masked fails, exit 0).
+
+**Completed:** v1.66.0.0 (2026-08-15) — main's v1.64 removed the force-exits; v1.66.0.0 adds runner-level strict-output classification (a shard without bun's terminal summary FAILS), size-scaled wall deadlines, and the failure-naming epilogue, so exit code == truth is enforced by the runner, not by convention.
 
 ### Slim preamble + real-PTY plan-mode E2E harness (v1.13.1.0)
 
@@ -2486,3 +2871,158 @@ CI-hard-fail contract has to land five times.
 five green files at the tail of a release. Zero user-facing value; pure DRY.
 
 **Effort:** S (human ~3h, CC ~20min). **Depends on:** None.
+
+## Egress-receipt follow-ups (filed via /plan-eng-review + /codex on the v1.63 port wave)
+
+### P2: egress ledger rotation with chain-genesis records
+
+**What:** Rotate `~/.gstack/security/egress.jsonl` at a size threshold (match
+`attempts.jsonl`'s 10MB/5-generation pattern in `browse/src/security.ts`), where
+each new generation's FIRST record embeds the prior file's tail hash so
+`gstack-egress verify` can walk across generations.
+
+**Why:** v1.63 ships WARN-at-25MB (visible growth) but nothing bounds the file.
+Rotation was deliberately deferred: it changes the verify contract, and a wrong
+implementation makes healthy ledgers verify as "broken".
+
+**Pros:** Bounded disk forever; verify stays meaningful across generations.
+**Cons:** Chain-genesis semantics are subtle; needs its own focused tests
+(cross-generation verify, mid-rotation crash).
+
+**Context:** `lib/egress-receipt.ts` (`appendChained`/`verifyLedger`) carries the
+design sketch in its rotation TODO comment. Start from the `attempts.jsonl`
+rotation precedent.
+
+**Effort:** S (human ~4h, CC ~25min). **Depends on:** v1.63 port wave landed.
+
+### P3: launch-nonce token bootstrap (local-process impersonation)
+
+**What:** Add a launch-time nonce to the `/extension-token` bootstrap: `browse`
+mints a nonce at headed launch, seeds it into the extension (CDP
+`chrome.storage` injection or a launcher-written sidecar), and the endpoint
+requires it alongside the pinned origin.
+
+**Why:** v1.63's pinned-origin check authenticates browser contexts; any local
+PROCESS can still forge an Origin header with curl. That threat is explicitly
+outside the current model (any local process can hit the port anyway) — this
+TODO documents the deliberate boundary and the designed path across it.
+
+**Pros:** Closes the local-process impersonation path (strongest of the three
+options evaluated in the v1.63 plan review).
+**Cons:** Largest bootstrap change; CDP seeding is fiddly across the three
+launch paths (`--load-extension`, baked-in Browser.app, real-Chrome fallback);
+low present-day value.
+
+**Context:** `browse/src/server.ts` `/extension-token` handler +
+`GSTACK_EXTENSION_ID`; launch paths in `browse/src/browser-manager.ts` (~358,
+~455, ~1562); `extension/background.js` bootstrap.
+
+**Effort:** M (human ~2 days, CC ~1h). **Depends on:** none.
+
+### P3: eval-watch shard-awareness
+
+**What:** Teach `scripts/eval-watch.ts` (hardcoded `_partial-e2e.json` path at
+~line 17) about the sharded layout: watch `<evalDir>/shards/*/_partial-e2e.json`
+and aggregate live progress across shard subdirs.
+
+**Why:** v1.63's sharded runner gives each shard its own eval subdir (so shards
+baseline against their own priors); `findPreviousRun`, `eval-compare`,
+`eval-list`, and `eval-summary` were all made shard-aware, but the live watcher
+intentionally stayed flat — it shows nothing during sharded runs.
+
+**Pros:** Live progress during `eval:bg:gate` sharded runs again.
+**Cons:** Multi-file watch + aggregation UI; low stakes (the run-scoped detach
+log already streams per-shard results).
+
+**Context:** `scripts/eval-watch.ts`; shard layout defined in
+`scripts/test-paid-shards.ts` (slug = test filename); `listEvalJsonFiles` in
+`test/helpers/eval-store.ts` already enumerates the layout — reuse it.
+
+**Effort:** S (human ~2h, CC ~15min). **Depends on:** v1.63 port wave landed.
+
+## v1.63 port-wave review follow-ups (deferred from /ship review army — non-blocking polish)
+
+Genuine review findings deferred from the v1.63 ship because they are
+informational/polish, not correctness-blocking, and several want their own
+tests. Filed so they are tracked, not dropped.
+
+- **P2 — telemetry-sync HTTP-status outcome is dead code.** `_GSTACK_EGRESS_LAST_RECEIPT`
+  is set inside a command-substitution subshell in `bin/gstack-telemetry-sync`, so the
+  parent-shell guard that would append the HTTP status to the receipt never fires. The
+  generic `exit:N` outcome is still recorded, so the ledger is correct, just less
+  precise. Fix: have `_receipted_curl` persist the receipt id to a caller-readable temp
+  file, or restructure the call out of the subshell. (Confirmed by 3 review specialists.)
+- **P2 — context-bill "TOTAL on disk" double-counts child skills** in a root-as-container
+  tree (this repo's own layout): `buildBill` sums the root skill's whole-tree walk plus
+  each child's subtree again (~2x the TOTAL line). ALWAYS-ON / EAGER / --diff / --budget
+  are all unaffected — only the informational TOTAL is wrong. Fix: compute the tree total
+  from a single deduplicated `walkMd(root)` pass, or exclude child dirs from the root
+  skill's `totalMd`. Needs a fixture test. (`lib/context-bill.ts`.)
+- **P3 — DRY/robustness polish:** one shared `_gstack_egress_host_of` helper for the
+  ~11 hand-rolled URL-to-host extractions across the egress shell sinks; extract the
+  duplicated tunnel-open `writeReceipt` block in `browse/src/server.ts` (two sites);
+  hoist the per-iteration `SharedArrayBuffer` alloc out of the egress-receipt lock spin;
+  replace context-bill's exact-mode `errorPct === 0` sentinel with an explicit flag;
+  reuse `frontmatterName()` from `skill-census.ts` in `catalog-budget.test.ts`.
+- **P3 — test-coverage gaps the audit named:** `PAID_TEST_GLOBS` ↔ `package.json`
+  `test:gate` parity test; `GSTACK_EXTENSION_ID` ↔ `manifest.json` key derivation parity
+  test (`browse/scripts/extension-id.ts`); a runner test asserting each shard child gets
+  its own `GSTACK_EVAL_DIR` under `shards/<slug>`; receipt-refusal branch tests for
+  supabase-provision / gbrain-sync / memory-ingest.
+
+## P2: harden or re-tier skill-e2e-plan-design-with-ui PTY detection
+
+**What:** The gate-tier `test/skill-e2e-plan-design-with-ui.test.ts` began executing
+for the first time once v1.63's `seedSkills` registered skills in hermetic PTY
+children (the fork had deleted this file; it measured nothing before). It now
+reliably TIMES OUT even though the skill runs correctly: the transcript shows
+`/plan-design-review` reaching its scope-gate AskUserQuestion (5 options, the
+`<gstack-qid:plan-design-review-scope-gate>` marker present), but the test's
+`isNumberedOptionListVisible`/`parseNumberedOptions` scraping can't classify it out
+of the PTY buffer because spinner frames (`[?25l✻Sprouting… still thinking`) are
+interleaved character-by-character with the option text.
+
+**Why:** Shipped behavior is correct — this is a test-harness detection limitation,
+not a product bug. But a gate test that always times out is worse than no test.
+
+**Fix options:** (a) harden the tail-scraping (drop DEC private-mode + spinner
+residue before matching; widen/clean the window); (b) add an LLM-judge fallback
+classifier (the file's own comments note the regex detectors are "brittle to PTY
+rendering quirks"); or (c) move this test to periodic until (a)/(b) lands.
+
+**Context:** `test/skill-e2e-plan-design-with-ui.test.ts`,
+`test/helpers/claude-pty-runner.ts:308` (`isNumberedOptionListVisible`). Evidence:
+`~/.gstack-dev/eval-runs/pdwu-verify-*.log`. **Effort:** M (human ~half day / CC ~30min).
+
+### P2: Follow-up fix waves from the 2026-08-14 tracker audit (v1.64.0.0)
+
+The full-tracker audit behind v1.64.0.0 verified every open PR/issue against
+main and consciously deferred four coherent fix waves. Audit records:
+`~/.gstack/projects/garrytan-gstack/` eng-review artifacts + the v1.64 PR body.
+
+**Wave A — browse-daemon lifecycle.** Watchdog kills headed handoff sessions
+(PRs 2565/2405/2346), macOS headed launch broken by the rebrand-invalidated
+Chromium signature + XProtect (issues 2554/2242/2138/1829/1379 — the three
+darwin-skipped handoff tests in browse/test/handoff.test.ts un-skip when this
+lands), busy-daemon kill (2219/2231), cosmetic SIGTERM ignore (2220),
+Playwright pin bump (PR 1761, #1703 — rebuilds the CI browser image).
+Start with the signature/re-sign question; everything else is small.
+
+**Wave B — install integrity.** connect-chrome alias shadowing (PR 2202,
+issues 2201/2511), Playwright bootstrap aborts/timeouts (PRs 2233/2359,
+issues 1902/2136), --host cursor/slate wiring (PRs 2547/2432, issue 2361),
+review checklist/specialists never copied (issues 2317/2518), Windows re-run
+refresh (#2444). Blast radius is `setup` — one focused PR.
+
+**Wave C — gbrain trust boundary.** Transcript trust/scope/source isolation
+(PR 2232, issue 2140), brain-sync queue truncation (#2549), worktree source
+pins (PR 2417, #2516), thin-client detection gaps (#2520/#2456), plus small
+absorbs (2371/2360/2406/2369/2368/2321). Needs never-double-store review.
+
+**Wave D — ship/version allocator.** Queue-down fallback (PRs 2545/2546),
+npm-invalid subdir manifest versions (PR 2531), versionless repos
+(2343/2334/2501, #1474), diff-scope specialist routing rewrite
+(#2526/#2299/#2455), /review token runaway (#2519).
+
+**Depends on:** v1.64.0.0 landing. Each wave is one bundled PR per the
+fix-wave pattern.

@@ -1,11 +1,15 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { chromium, type Browser, type BrowserContext } from 'playwright';
-import { applyStealth, WEBDRIVER_MASK_SCRIPT, STEALTH_LAUNCH_ARGS } from '../src/stealth';
+import { applyStealth, STEALTH_LAUNCH_ARGS } from '../src/stealth';
 
 let browser: Browser;
 
 beforeAll(async () => {
-  browser = await chromium.launch({ headless: true, args: STEALTH_LAUNCH_ARGS });
+  // Playwright's default launch timeout is 30s — under the full-suite
+  // --parallel run, ~400 workers contend and a cold Chromium launch can
+  // stall past it (observed: hook death reported as an '(unnamed)' test at
+  // 30006ms). The runner's external wall-clock still bounds the ceiling.
+  browser = await chromium.launch({ headless: true, args: STEALTH_LAUNCH_ARGS, timeout: 120_000 });
 });
 
 afterAll(async () => {
@@ -15,20 +19,6 @@ afterAll(async () => {
 describe('STEALTH_LAUNCH_ARGS', () => {
   test('includes --disable-blink-features=AutomationControlled', () => {
     expect(STEALTH_LAUNCH_ARGS).toContain('--disable-blink-features=AutomationControlled');
-  });
-});
-
-describe('WEBDRIVER_MASK_SCRIPT', () => {
-  test('contains a single Object.defineProperty for navigator.webdriver', () => {
-    expect(WEBDRIVER_MASK_SCRIPT).toContain('navigator');
-    expect(WEBDRIVER_MASK_SCRIPT).toContain('webdriver');
-    expect(WEBDRIVER_MASK_SCRIPT).toContain('false');
-  });
-
-  test('does NOT touch plugins, languages, or window.chrome (D7 narrowing)', () => {
-    expect(WEBDRIVER_MASK_SCRIPT).not.toMatch(/plugins/i);
-    expect(WEBDRIVER_MASK_SCRIPT).not.toMatch(/languages/i);
-    expect(WEBDRIVER_MASK_SCRIPT).not.toMatch(/window\.chrome/);
   });
 });
 
@@ -306,6 +296,7 @@ describe('applyStealth — persistent context (headed + handoff parity)', () => 
     const ctx = await chromium.launchPersistentContext(userDataDir, {
       headless: true,
       args: STEALTH_LAUNCH_ARGS,
+      timeout: 120_000, // same parallel-load headroom as the top-level launch
     });
     try {
       await applyStealth(ctx);

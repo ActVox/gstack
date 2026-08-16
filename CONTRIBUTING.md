@@ -141,24 +141,32 @@ Bun auto-loads `.env` — no extra config. Conductor workspaces inherit `.env` f
 
 | Tier | Command | Cost | What it tests |
 |------|---------|------|---------------|
-| 1 — Static | `bun test` | Free | Command validation, snapshot flags, SKILL.md correctness, TODOS-format.md refs, observability unit tests |
+| 1 — Static | `bun run test` | Free | Command validation, snapshot flags, SKILL.md correctness, TODOS-format.md refs, observability unit tests |
 | 2 — E2E | `bun run test:e2e` | ~$3.85 | Full skill execution via `claude -p` subprocess |
-| 3 — LLM eval | `bun run test:evals` | ~$0.15 standalone | LLM-as-judge scoring of generated SKILL.md docs |
+| 3 — LLM eval | `EVALS=1 bun test test/skill-llm-eval.test.ts` | ~$0.15 standalone | LLM-as-judge scoring of generated SKILL.md docs |
 | 2+3 | `bun run test:evals` | ~$4 combined | E2E + LLM-as-judge (runs both) |
 
 ```bash
-bun test                     # Tier 1 only (runs on every commit, <5s)
+bun run test                 # Tier 1 only (run before every commit, ~90-100s for the full ~7,000-test suite)
 bun run test:e2e             # Tier 2: E2E only (needs EVALS=1, can't run inside Claude Code)
 bun run test:evals           # Tier 2 + 3 combined (~$4/run)
 ```
 
 ### Tier 1: Static validation (free)
 
-Runs automatically with `bun test`. No API keys needed.
+Runs with `bun run test`, which routes through `scripts/test-free-shards.ts`: N
+concurrent shard processes under a strict output contract — a shard that exits
+without bun's own terminal summary line, or a crashed worker, fails the run, so
+silent truncation can never report green. Pass `--verbose` to forward the full
+child stream; `--wall-timeout <secs>` overrides the per-shard kill deadline.
+Don't type bare `bun test` for the suite: it walks the whole repo, loads paid
+eval files, and misses the strict classifier. No API keys needed.
 
 - **Skill parser tests** (`test/skill-parser.test.ts`) — Extracts every `$B` command from SKILL.md bash code blocks and validates against the command registry in `browse/src/commands.ts`. Catches typos, removed commands, and invalid snapshot flags.
 - **Skill validation tests** (`test/skill-validation.test.ts`) — Validates that SKILL.md files reference only real commands and flags, and that command descriptions meet quality thresholds.
 - **Generator tests** (`test/gen-skill-docs.test.ts`) — Tests the template system: verifies placeholders resolve correctly, output includes value hints for flags (e.g. `-d <N>` not just `-d`), enriched descriptions for key commands (e.g. `is` lists valid states, `press` lists key examples).
+- **Tier-alignment invariant** (`test/e2e-tier-alignment.test.ts`) — For every self-gated `test/skill-e2e-*.test.ts` named in a touchfiles dep list, the file's `EVALS_TIER` self-gate must match its declared tier in `E2E_TIERS`. Kills the "inert demotion" class where a test is re-tiered in `touchfiles.ts` but the file still gates on the old tier and keeps running in the wrong lane. Unmapped or mixed-tier files are reported, never silently skipped.
+- **Catalog budget** (`test/catalog-budget.test.ts`) — Caps the aggregate discovery surface: the sum of every skill's frontmatter `name` + `description` (what every host loads at discovery, every session) must stay under 1,150 token-equivalents, with a 260-byte per-skill cap. Counting goes through the shared census in `test/helpers/skill-census.ts` (physical files vs authored skills vs registry entries — three deliberately different counts). Adding a skill? The failure message carries the re-measure + ratchet protocol.
 
 ### Tier 2: E2E via `claude -p` (~$3.85/run)
 
@@ -183,10 +191,16 @@ seeded `CLAUDE_CONFIG_DIR`, a temp `GSTACK_HOME`, and `--strict-mcp-config`. You
 operator `~/.claude` config, MCP servers (gbrain, Conductor), skills, `~/.gstack`
 decision logs, and `CONDUCTOR_*` env never leak into the child, so local eval
 signal matches CI instead of disagreeing for reasons unrelated to the code under
-test. Set `EVALS_HERMETIC=0` to debug against your real operator state (this also
+test. The hermetic `CLAUDE_CONFIG_DIR` seeds no skills by default; a PTY test
+that types a `/skill` slash command passes `seedSkills: true` to the PTY runner,
+which swaps in `hermeticSkillsConfigDir()` — a seeded skill registry that
+symlinks the LIVE working tree's SKILL.md files (by design: the skills are the
+subject under test, so a snapshot would measure stale copies). Set
+`EVALS_HERMETIC=0` to debug against your real operator state (this also
 drops `--strict-mcp-config`). The wiring is pinned by `test/hermetic-wiring.test.ts`
-(a free static tripwire) and two gate-tier isolation canaries in
-`test/skill-e2e-hermetic-canary.test.ts`.
+(a free static tripwire), two gate-tier isolation canaries in
+`test/skill-e2e-hermetic-canary.test.ts`, and the skill-seeding tripwires in
+`test/hermetic-skills-seeding.test.ts` / `test/pty-skill-seeding-wiring.test.ts`.
 
 ### E2E observability
 
@@ -226,8 +240,21 @@ bun run eval:bg:gate         # detached gate-tier suite
 bun run eval:bg:periodic     # detached periodic-tier suite
 ```
 
-Each prints its log path. Humans running `bun run test:evals` foreground in their
-own terminal don't need this — Ctrl-C is intended there.
+Each prints its log path. The gate and periodic variants run their tier through
+the sharded paid runner (`scripts/test-paid-shards.ts`, also available directly
+as `bun run test:gate:sharded` / `bun run test:periodic:sharded`): one Bun
+process per test file, an external wall-clock timeout that kills the shard's
+whole process group (stray `claude`/`codex` grandchildren included), a per-shard
+eval dir (`GSTACK_EVAL_DIR=<evalDir>/shards/<slug>/`), and an aggregate that
+distinguishes failed vs timed-out vs never-started shards. The runner also
+selects by diff: shards untouched by your branch are reported as
+skipped-by-diff, with a selection banner naming the reason (`EVALS_ALL=1`
+forces everything). `EVALS_JOBS` sets how many shard processes run at once
+(default 4); `EVALS_CONCURRENCY` is bun's concurrency WITHIN a shard — they
+are deliberately separate knobs. `eval:list`,
+`eval:compare`, and `eval:summary` are shard-aware. Humans running
+`bun run test:evals` foreground in their own terminal don't need this — Ctrl-C
+is intended there.
 
 **Eval comparison commentary:** `eval:compare` generates natural-language Takeaway sections interpreting what changed between runs — flagging regressions, noting improvements, calling out efficiency gains (fewer turns, faster, cheaper), and producing an overall summary. This is driven by `generateCommentary()` in `eval-store.ts`.
 
@@ -235,7 +262,8 @@ Artifacts are never cleaned up — they accumulate in `~/.gstack-dev/` for post-
 
 ### Tier 3: LLM-as-judge (~$0.15/run)
 
-Uses Claude Sonnet to score generated SKILL.md docs on three dimensions:
+Uses Claude Sonnet to score generated SKILL.md docs on three dimensions.
+Override the judge model per run with `GSTACK_EVAL_MODEL_JUDGE`:
 
 - **Clarity** — Can an AI agent understand the instructions without ambiguity?
 - **Completeness** — Are all commands, flags, and usage patterns documented?
@@ -254,6 +282,15 @@ Each dimension is scored 1-5. Threshold: every dimension must score **≥ 4**. T
 ### CI
 
 A GitHub Action (`.github/workflows/skill-docs.yml`) runs `bun run gen:skill-docs --dry-run` on every push and PR. If the generated SKILL.md files differ from what's committed, CI fails. This catches stale docs before they merge.
+
+Supply-chain gates run alongside it:
+
+- **Quality gate** (`.github/workflows/quality-gate.yml`, every PR and push) — scans the diff's added lines for credentials using gstack's own redact engine (`.github/scripts/gate-secret-scan.mjs`). HIGH findings fail the job; MEDIUM findings surface as an advisory count. Fails closed if the scan can't produce a report. Also gates critical dependency advisories and runs ShellCheck on the setup/build boundaries.
+- **Dependency review** (`.github/workflows/dependency-review.yml`) — reviews dependency changes on PRs that touch lockfiles or workflow files.
+- **OSV scanner** (`.github/workflows/osv-scanner.yml`) — weekly vulnerability scan against the OSV database (config in `.osv-scanner.toml`).
+- **Dependabot** (`.github/dependabot.yml`) — grouped dependency update PRs.
+
+The supply-chain workflows pin their third-party actions to commit SHAs. The PR template (`.github/PULL_REQUEST_TEMPLATE.md`) asks for evidence — tests run, eval output — not promises.
 
 Tests run against the browse binary directly — they don't require dev mode.
 
@@ -346,7 +383,7 @@ See `scripts/host-config.ts` for the full `HostConfig` interface.
 
 ```bash
 # Run all static tests (includes parameterized smoke tests for all hosts)
-bun test
+bun run test
 
 # Check freshness for all hosts
 bun run gen:skill-docs --host all --dry-run
@@ -363,7 +400,7 @@ See [docs/ADDING_A_HOST.md](docs/ADDING_A_HOST.md) for the full guide. Short ver
 2. Add to `hosts/index.ts`
 3. Add `.myhost/` to `.gitignore`
 4. Run `bun run gen:skill-docs --host myhost`
-5. Run `bun test` (parameterized tests auto-cover it)
+5. Run `bun run test` (parameterized tests auto-cover it)
 
 Zero generator, setup, or tooling code changes needed.
 
@@ -478,7 +515,7 @@ When community PRs accumulate, batch them into themed waves:
 2. **Deduplicate** — if two PRs fix the same thing, pick the one that
    changes fewer lines. Close the other with a note pointing to the winner.
 3. **Collector branch** — create `pr-wave-N`, merge clean PRs, resolve
-   conflicts for dirty ones, verify with `bun test && bun run build`
+   conflicts for dirty ones, verify with `bun run test && bun run build`
 4. **Close with context** — every closed PR gets a comment explaining
    why and what (if anything) supersedes it. Contributors did real work;
    respect that with clear communication.
@@ -533,7 +570,7 @@ Failures are logged but never block the upgrade.
 
 ### Testing migrations
 
-Migrations are tested as part of `bun test` (tier 1, free). The test suite
+Migrations are tested as part of `bun run test` (tier 1, free). The test suite
 verifies that all migration scripts in `gstack-upgrade/migrations/` are
 executable and parse without syntax errors.
 
