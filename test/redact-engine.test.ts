@@ -21,6 +21,7 @@ import {
   shannonEntropy,
   isPublicIPv4,
   isPlaceholderSpan,
+  URL_PASSWORD_PLACEHOLDER_WORDS,
 } from "../lib/redact-patterns";
 
 function ids(text: string, vis: RepoVisibility = "private"): string[] {
@@ -134,6 +135,28 @@ describe("HIGH credential patterns", () => {
     expect(ids("https://root:" + "pa" + "ss@127.0.0.1/")).toContain("creds.basic_auth_url");
     // Structural placeholders still suppress at the URL position.
     expect(ids("postgres://user:<your-password>@host/db")).not.toContain("db.url_with_password");
+    // An ALL-CAPS password that is NOT an exact placeholder token is a real
+    // secret and must block — the pre-fix shape rule (/^[A-Z][A-Z0-9_]*$/) waved
+    // every all-caps password through. Substring of a placeholder word (SECRET)
+    // must not rescue it. Assembled at runtime so this file's own pushed bytes
+    // carry no live DSN shape.
+    expect(ids("postgres://admin:" + "PROD2026" + "SECRET@db-prod.internal/app")).toContain("db.url_with_password");
+    expect(ids("postgres://admin:" + "ADMIN" + "123@host/db")).toContain("db.url_with_password");
+  });
+
+  // Every curated placeholder word must suppress at the URL-password position.
+  // The fix replaced a shape rule with a hand-curated EXACT set, so a typo or a
+  // dropped entry (CHANGEME -> CHANGME) would silently start blocking a legit
+  // doc placeholder with zero failure elsewhere. Loop the real exported set so
+  // the test can't drift from the source list.
+  test("db.url_with_password suppresses every curated placeholder word", () => {
+    for (const word of URL_PASSWORD_PLACEHOLDER_WORDS) {
+      expect(ids(`postgres://user:${word}@host/db`)).not.toContain("db.url_with_password");
+    }
+    // Guard the set stays a non-trivial curated list (catches an accidental clear).
+    expect(URL_PASSWORD_PLACEHOLDER_WORDS.size).toBeGreaterThanOrEqual(8);
+    // And a real secret that merely CONTAINS a placeholder word still blocks.
+    expect(ids("postgres://user:" + "MY" + "SECRETPASS@host/db")).toContain("db.url_with_password");
   });
 
   test("all HIGH patterns block (exit 3)", () => {
