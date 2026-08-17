@@ -1,10 +1,255 @@
 # Changelog
 
-## ActVox fork integration - 2026-08-16
+## ActVox fork integration - 2026-08-17
 
-- Integrated upstream through `garrytan/gstack@410b4928`.
+- Integrated upstream through `garrytan/gstack@ae8914af` (`v1.67.0.0`).
 - Retained GitHub-hosted `ubuntu-latest` Linux lanes because the ActVox fork has no Ubicloud runner assignment.
-- Retained the lowercase `ghcr.io/actvox/gstack/ci` image path and credential-aware PTY eval skip.
+- Retained the lowercase `ghcr.io/actvox/gstack/ci` image path, credential-aware PTY eval skip, and upstream's patch-aware CI image cache key.
+
+## [1.67.0.0] - 2026-08-16
+
+**The tracker wave: browse survives macOS, installs are complete,**
+**memory sync never drops a record. 30 contributors landed.**
+
+This release mines the full issue tracker and community PR queue. Browse now
+classifies a macOS XProtect kill at Chromium launch and heals itself. It
+clears the quarantine flag, reinstalls the pinned browser revision from the
+right install root, and retries, all bounded and logged. Fresh installs link
+every runtime asset a skill references, so /review and friends work on a
+clean machine the first time. Brain-sync's queue is drained with a classified
+disposition. Privacy-held records are retained and labeled, a failed push
+keeps its commit and re-delivers it on the next run, and the retry only ever
+publishes commits it authored itself. Twenty-five community PRs landed with
+credit, and roughly thirty-five issues close on merge.
+
+### The numbers that matter
+
+From the wave's gate eval run (`bun run eval:bg:gate`, log in
+`~/.gstack-dev/eval-runs/`) and the free suite (`bun run test`) at HEAD.
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Browse launch on macOS 26 (XProtect kill) | manual reinstall | classified + self-healed | automatic |
+| Skill runtime assets on a fresh install | SKILL.md + sections only | every referenced asset | /review works day one |
+| Brain-sync queue at a push failure | truncated | retained + re-delivered | no data loss |
+| Detector push with an interleaved user commit | published it | refuses | author boundary holds |
+| Gate evals | 41/43 | 43/43 | both reds root-caused |
+| Free suite | — | ~7,000 tests, ~90-100s | green at HEAD |
+
+The brain-sync row is the one to internalize: the queue is only ever rewritten
+by subtracting the exact records that were staged, against a live re-read, so
+a record enqueued mid-drain survives to the next boundary.
+
+### What this means for gstack users
+
+Upgrade and the three most-reported failure classes disappear: browse comes
+back on macOS without touching a terminal, a teammate's first `./setup`
+produces working skills, and your cross-machine memory stops silently thinning
+under flaky networks. If you filed one of the ~35 issues this closes, your
+repro is now a regression test with your name on the commit.
+
+### Itemized changes
+
+#### Fixed — the three P0s
+
+- **Browse dead on macOS (#2554).** Playwright pinned to 1.62.1 (split from
+  dependabot #2582), plus an XProtect kill-signature classifier with positive
+  AND negative fixtures, a one-shot quarantine-clear + bounded (~120s,
+  process-group-killed) reinstall from the gstack install root that pins the
+  matching Chromium revision, structured heal logging, and an upgrade-time
+  quarantine-clear + reinstall in `setup` for already-poisoned caches. The
+  heal resolves the install
+  root via `os.homedir()` and keeps its manual-remediation guidance even when
+  the post-heal retry fails.
+- **Fresh installs missing runtime assets (#2317, #2454).** `setup` links
+  every runtime asset with an explicit exclusion list (node_modules, dist,
+  *.tmpl, test, hidden), pinned by a two-class referenced-paths test:
+  alias-relative references must exist under the installed alias, repo-anchored
+  ones in the tree modulo a reasoned dist/ allowlist.
+- **Brain-sync data loss (#2549).** Queue records are classified at drain
+  time: skip-filtered and nonexistent drop WITH counts (full paths in a 0600
+  sidecar), privacy-held records are retained and labeled instead of being
+  wiped as "no allowlisted changes", unparseable lines are preserved, and the
+  rewrite subtracts the staged set from a LIVE re-read so concurrent enqueues
+  survive. A failed push keeps its commit; a run-start detector re-delivers it
+  — receipted, locked, throttled to one attempt per 10 minutes, bounded by
+  git's low-speed limits (portable to stock macOS), and gated to fire only
+  when EVERY unpushed commit is its own, so an interleaved manual commit in
+  ~/.gstack is never auto-published. The sync lock releases on every exit
+  path, including interrupts mid-push.
+
+#### Fixed — browse & daemon lifecycle
+
+- A healthy daemon is never killed by `browse start` (the #2219 iron rule):
+  a total-budget health probe answers in ~8s, busy daemons get "retry or
+  --force-restart" plus a nonzero exit, and only an explicit `--force-restart`
+  ever kills an alive pid — pinned by a regression test. `browse stop` on a
+  dead daemon short-circuits to success (#2254); `/gstack-upgrade` defers to a
+  busy daemon and prints the escape hatch (#2551).
+- Chromium no longer dies with the terminal: signal handling moved off
+  Playwright's defaults at all three launch sites with a SIGHUP handler
+  routing through the real shutdown path, and a tripwire pinning the count.
+- The terminal-agent allocates from the same fixed port range as the daemon
+  (#2314) — and that range now ends at 49151, actually below the macOS
+  ephemeral pool it exists to avoid; boot retries a raced bind instead of
+  dying. Windows terminal-agent leaks fixed via `process.kill(pid, 0)`
+  liveness (#1952) and the error-handling helpers. Contributed by @SYKhayyat
+  (#2414).
+- Daemon crash logs persist without tokens or unsanitized page content
+  (needle-tested). Contributed by @phuttimatebenchanakatkul (#2461).
+- The dead security-shield surface was removed end to end (−272 net lines) while
+  the live L4 sidecar path keeps its status endpoint — docs updated in the
+  same commit. Contributed by @frederik-kaster-noygear (#2557, with the
+  pipe-capture core from #2559). CDP `Emulation.setEmulatedMedia` joins the
+  allowlist — contributed by @meshailabs (#2419). Windows gbrain probe
+  timeout — contributed by @vaston-viji (#2450). `browse/dist` mkdir —
+  contributed by @guyua9 (#2542).
+- First `patchedDependencies` entry: playwright-core's two Windows spawn
+  sites carry `windowsHide` (#2160, #1989), statically pinned and
+  independently revertable.
+
+#### Fixed — install & setup correctness
+
+- Root-alias skills install as rewritten copies, never symlinks whose edits
+  would corrupt generated sources (#2511, #2201). Windows re-runs refresh
+  real-directory installs (#2444), and uninstall deletes only directories
+  that pass BOTH the inventory match and the generated-banner provenance gate,
+  listing (never deleting) anything else (#2563).
+- `--host cursor` gets the full install slice — contributed by @szsunyuan
+  (#2547). Settings-hook dedup includes the command (#2382) — contributed by
+  @gregario (#2431). `:user` renders route through `--out-dir` (#2569) with a
+  migration that cleans legacy in-place render dirt. setup-gbrain invocation
+  paths fixed (#2250) — contributed by @SomSamantray (#2409). Office-hours
+  installs into codex/factory/opencode runtime roots (#2449).
+- The redact pre-push hook stays opt-in but its fail-open gaps are closed,
+  with a one-time consent prompt (#1946). Skills-timeline Stop hook ships
+  fail-open (always exit 0, 2s budget) with setup registration (#2553).
+- iOS QA: DebugBridgeTouch compiles out of Release builds — contributed by
+  @Bastea (#2585); front-most bridge ordering — contributed by @IDSTUK
+  (#2397); compat preflight docs — contributed by @itstimwhite (#2581).
+
+#### Fixed — memory & gbrain
+
+- Windows slug resolution and the decisions.jsonl allowlist (#2396) —
+  contributed by @source-utsho (#2561). Brain-sync arithmetic-injection
+  guard — contributed by @sneakygriff (#2588). Windows bash routing for
+  brain-sync/gbrain — contributed by @ShahriarLak (#2510), extended to every
+  gbrain-sources spawn (#2471). `--full` walks the full tree — contributed by
+  @ShahriarLak (#2406). Honest "missing" from brain-cache — contributed by
+  @sneakygriff (#2587). Memory-ingest parses both codex rollout shapes and
+  stages outside GSTACK_HOME (#2105, #2104).
+- gbrain detection: engine-locked is a healthy status (#2456), bearer-token
+  thin clients are recognized (#2520), GBRAIN_HOME gets its .gbrain segment
+  (#2521), project-scoped MCP registrations are honored (#2499). Source pins
+  respected — contributed by @exGeni (#2417); `--dry-run` works offline
+  (#2536) — contributed by @CarringtonCreative (#2540); bun-on-npm PATH
+  guidance (#2487); dream-stage classifier anchored (#2341).
+
+#### Fixed — version tooling, diff-scope, redaction
+
+- VERSION stays the 4-digit source of truth; package.json carries the
+  npm-valid 3-digit translation, lockfiles sync only when they already exist,
+  and drift is judged on translated forms. Built on re-derived work
+  contributed by @YiftahR (#2501), @ortonom (#2568), and
+  @CarringtonCreative (#2531, #2545). Pinned repos compare base and current
+  against the SAME file (#2462). JSON version-paths get honest per-file
+  recovery messages. The path pins (`.gstack/version-path`,
+  `.gstack/package-json-path`) cannot escape the repository — absolute paths,
+  `..` traversal, and symlink escapes are all refused, and a lockfile
+  symlinked outside the repo is skipped with a warning.
+- Diff-scope covers api/*, migrations/*, and db/data, with a no-match exit
+  code and uncommitted-work handling (#2526, #2455, #2299). Redact scans the
+  merge-base range and knows parcel IDs are not phone numbers — contributed
+  by @Two-Six-Alpha-1115 (#2592, #2591); rebased force-pushes are scanned
+  correctly, proven by test (#2573).
+- The codex model probe caches its verdicts both ways: a working model for an
+  hour, a deterministic model-400 for 15 minutes (editing config.toml
+  re-probes immediately) — so the affected account stops paying a 30s round
+  trip per review section (#2477). Its timeout wrapper now enforces the
+  deadline with a bash-native watchdog on stock macOS, where no timeout
+  binary exists.
+
+#### Fixed — templates & everything else
+
+- Skills running under Codex skip the nested codex specialist with a printed
+  notice (#2519). Codex web-search flag unified behind one resolver constant
+  across 19 sites (#2525). Slugs are sanitized in every path position
+  (#2550) — with groundwork contributed by @harjothkhara (#1851). AGENTS.md
+  routing probe — contributed by @gamerey43 (#2500); empty-find fallthrough
+  killed — contributed by @tranthanhnhatkhoa (#2483); cygpath MSYS builds —
+  contributed by @chiragborse1 (#2452). /ship's review army loops until clean
+  (#2391). Question-registry path is absolute (#2489). Retro glob (#2552),
+  capability-check temp file (#2503), repo-mode stat order (#2195), hover doc
+  note (#2445), make-pdf boolean flags — including `--strict` and
+  `--confidential` — no longer swallow the input file, with a guard test that
+  derives the flag set from the source (#2514).
+
+#### For contributors
+
+- Test/generator infra hardened first: host-config golden isolation (#2532),
+  hermetic-wiring tripwire and YAML ellipsis quoting — contributed by
+  @sneakygriff (#2586, #2589); prepush PATH separator — contributed by
+  @luckywenapere (#2544); gen-skill-docs throws on duplicate preamble tokens.
+- Dependency hygiene: puppeteer-core removed outright (zero consumers),
+  adm-zip CVE closed via lock override — contributed by @anupamme (#2485);
+  transformers/marked/socks bumped with the ONNX sidecar smoke green;
+  .gitattributes LF pin — contributed by @mlaniak (#2527); GitHub Actions
+  bumps — contributed by @dependabot (#2594).
+- The wave's own adversarial reviews (Codex + Claude, 28 findings) landed as
+  fixes in-branch; verified residuals are filed in TODOS.md with rationale.
+
+## [1.66.1.0] - 2026-08-16
+
+**Every claim gstack makes now binds to the content it was made on.**
+**Tracker text is data. Guard hooks actually guard.**
+
+Reviews and test results used to be prose claims: "review is recent" meant a commit-count guess that a rebase could crash, and "tests passed" meant trusting output from a tree that may have changed since. Both now carry a working-tree content fingerprint (`bin/gstack-wtree`, ~0.2s). A review of identical content grades CURRENT through rebases, amends, and squashes. A test run recorded by the new `bin/gstack-evidence` ledger stays citable at /ship's verification gate only while the content is byte-identical (release files carve out), the command hash matches, and nothing edited the tree mid-run. /ship and /land-and-deploy cite fresh evidence instead of re-running, and re-run live when anything moved.
+
+PR bodies, PR comments, and model-judged issue titles now enter agent context only through a trust envelope (`bin/gstack-issue-guard`): content is data even when clean, injection-shaped lines get labeled through fullwidth and invisible-character evasion, forged envelope banners are defused, and a CI scanner fails the suite on any raw tracker-text read at all 8 ingress points. Write-backs keep a raw artifact so envelope markup can never reach a live PR.
+
+/freeze now fails closed: unparseable payloads, quote or newline paths (the deny used to silently no-op on them), boundaries with spaces, symlinks pointing outside the boundary, and a broken install all block instead of passing. /careful gains a hard-deny tier for `rm -rf /`-class deletes and force-pushes to the default branch — including the flag-less `git push origin +main` form and quoted or refspec targets — plus additive-only custom warn patterns that can never weaken the built-ins.
+
+### The numbers that matter
+
+Measured on this branch; re-run with `bun test`, `time bin/gstack-wtree`, and the commands in each bin's header.
+
+| Metric | Before | After | Δ |
+|---|---|---|---|
+| Review staleness on rebased/amended identical content | crash or STALE | CURRENT | correct |
+| "Tests passed" binding | none (prose) | content fingerprint + command hash + max-age | new |
+| Tracker-text ingress points enveloped | 0 | 8, CI-scanner enforced | new |
+| /freeze deny on hostile/edge paths | silent no-op | blocks, fail-closed | fixed |
+| Working-tree fingerprint cost | — | ~0.09s warm (stat-cache seeded, 40x vs naive) | new |
+| Adversarial findings fixed pre-merge | — | 50 (4 specialists + red team + fresh-context pass), 6 critical | — |
+
+The fingerprint survives commits of identical content, so the common flow — test on a dirty tree, commit, ship — keeps its evidence valid, while one untracked new source file invalidates it.
+
+### What this means for you
+
+/ship stops re-running suites the content already proved green and stops trusting suites the content has outgrown — the IRON LAW is now a mechanical check, not an honor system. A hostile PR comment can no longer speak to your agent with authority, and /guard's boundary actually holds on the paths where it used to silently fail. Nothing to configure: the bins ship wired into /ship, /land-and-deploy, /review, /spec, and /document-release.
+
+### Itemized changes
+
+### Added
+- `bin/gstack-wtree` — working-tree content fingerprint (temp-index, stat-cache-seeded; identical hash to a full re-hash at ~40x less cost).
+- `bin/gstack-evidence` — verification-evidence ledger: `run` wraps any command transparently (exit code always passes through; 0600 per-run logs with 2MB cap and 30-day prune; HIGH credentials in commands stored redacted; mid-run tree edits void the fingerprint) and `check` grades FRESH/STALE/MISSING per label with `--expect-cmd`, `--max-age`, and `--allow-paths` binding.
+- `lib/tracker-guard.ts` + `bin/gstack-issue-guard` — trust envelope for tracker text: envelope-always, detection-only NFKC + full Unicode format-character sweep, banner-forgery defusal, no-envelope-on-fetch-failure, numeric argv validation.
+- `/careful` HIGH tier (hard deny: root/home recursive deletes incl. `--no-preserve-root` and `/*` forms; default-branch force-pushes incl. plus-refspec, refspec-colon, and quoted targets; simple commands only, `--force-with-lease` never matches) and additive-only project warn patterns (`~/.gstack/careful-patterns.txt`, per-project variant).
+- CI wiring scanner (`test/tracker-guard-wiring.test.ts`) failing the suite on raw tracker-text reads outside the guard, with reasoned, liveness-checked exemptions; template-drift tripwire pinning the grading rules and the write-side banner tripwire.
+
+### Changed
+- Review records (`bin/gstack-review-log`) stamp `commit_full`/`tree`/`dirty`/`wtree` authoritatively — caller-supplied binding fields are ignored; `bin/gstack-review-read` emits `---WTREE---`/`---TREE---`/`---DIRTY---`; the /ship dashboard and /land-and-deploy grade diff-scoped reviews content-first (plan-tier reviews keep time-based logic), and a rebased-away commit grades UNKNOWN instead of erroring.
+- /ship Step 5 test lanes run wrapped with per-lane labels and per-run logs (no shared /tmp collisions between concurrent ships); Step 16 and /land-and-deploy 3.5b check the ledger first and cite fresh evidence, advisory-never-blocking.
+- /document-release PR/MR body updates use a two-artifact flow (enveloped copy for reading, raw copy for the splice-and-write-back) with a banner tripwire that compares against the fetched original.
+- /spec issue-title dedupe reads titles through the envelope and distinguishes pipeline failure from zero matches instead of silently skipping.
+
+### Fixed
+- /freeze: five boundary defects — deny JSON silently no-oped on quote/newline paths, internal spaces in the boundary path were stripped (space-bearing project dirs could never match), symlink final components weren't resolved (in-boundary symlink wrote outside the boundary), the JSON extractor truncated at escaped quotes and failed open, and a missing helper file passed edits through instead of blocking.
+- /careful and /freeze now share one JSON extractor and one analytics writer (both honor `GSTACK_HOME`), ending the two-copy drift that let one hook keep a bug the other had fixed.
+
+### For contributors
+- `test/helpers/scratch-repo.ts` — shared hermetic git fixture (identity pinned, gpg signing disabled so fixture commits never invoke the operator's gpg-agent) and a PATH `gh` shim for exercising real gh success/failure branches.
+- ~150 new tests across six files, including the keystone case: evidence recorded on a dirty tree stays FRESH after committing the exact tested content.
 
 ## [1.66.0.0] - 2026-08-15
 

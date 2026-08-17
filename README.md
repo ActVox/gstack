@@ -223,7 +223,7 @@ Each skill feeds into the next. `/office-hours` writes a design doc that `/plan-
 | Skill | What it does |
 |-------|-------------|
 | `/codex` | **Second Opinion** — independent code review from OpenAI Codex CLI. Three modes: review (pass/fail gate), adversarial challenge, and open consultation. Cross-model analysis when both `/review` and `/codex` have run. |
-| `/careful` | **Safety Guardrails** — warns before destructive commands (rm -rf, DROP TABLE, force-push). Say "be careful" to activate. Override any warning. |
+| `/careful` | **Safety Guardrails** — warns before destructive commands (rm -rf, DROP TABLE, force-push). Say "be careful" to activate. Override any MEDIUM warning; root/home recursive deletes and default-branch force-pushes are hard-denied. |
 | `/freeze` | **Edit Lock** — restrict file edits to one directory. Prevents accidental changes outside scope while debugging. |
 | `/guard` | **Full Safety** — `/careful` + `/freeze` in one command. Maximum safety for prod work. |
 | `/unfreeze` | **Unlock** — remove the `/freeze` boundary. |
@@ -247,9 +247,19 @@ Beyond the slash-command skills, gstack ships standalone CLIs for workflows that
 | `gstack-context-bill` | **Token bill-of-materials** — read-only, offline audit of what an installed skills tree costs in tokens: always-on frontmatter every session pays vs per-invocation SKILL.md + forced references. `--diff` compares two trees, `--budget` enforces a ceiling, `--exact` opts into Anthropic `count_tokens` (sends file text off-machine; writes an egress receipt first, degrades to the offline estimate if the receipt can't be written). |
 | `gstack-code-intelligence` | **Code-intelligence provider picker** — wraps GBrain, Sourcebot, and Graphify behind one interface: `options`/`status` to see what's available, `select` to pick one, `index`/`search` to use it, `suggest` to check whether the one-time indexing offer should fire here. The offer triggers on large repos (1,000+ tracked files; a decline is persisted). Non-local providers refuse to index *or search* until you record per-repo consent (`consent <repo> yes\|no` — the query text is repo-derived content), the per-repo trust policy's deny and read-only tiers veto write-class operations regardless of consent, and every off-machine send writes an egress receipt. Fully optional — with nothing selected, gstack falls back to grep. |
 | `gstack-verify-gate` | **Verification stop hook (opt-in)** — blocks a Claude Code turn from ending until the project's declared verify command passes (after 3 blocked re-entries it yields with a loud still-RED warning instead of looping forever). Declare it on one line in CLAUDE.md: `<!-- gstack:verify: bun test -->`. Hooks bypass the permission system, so a declared command never runs until you trust it once per repo (`gstack-verify-gate --trust`); editing the command invalidates trust until re-granted, and every grant is audit-logged. `./setup` never registers it for you — opt in with `gstack-settings-hook add-event --event Stop --command ~/.claude/skills/gstack/bin/gstack-verify-gate --source verify-gate`, remove with `gstack-settings-hook remove-source --source verify-gate`. |
+| `gstack-wtree` | **Working-tree fingerprint** — prints a content hash of what's actually on disk (temp index seeded from the stat cache, ~40x cheaper than a full re-hash; untracked source counts, gitignored scratch doesn't). Identical content fingerprints identically through commits, rebases, amends, and squashes — it's what binds reviews and test evidence to content instead of commit SHAs. |
+| `gstack-evidence` | **Verification-evidence ledger** — `run --label <lane> -- <cmd>` transparently wraps any test command (the child's exit code always passes through) and records what ran against which working-tree fingerprint; `check` grades each label FRESH/STALE/MISSING with `--expect-cmd`, `--max-age`, and `--allow-paths` binding. /ship and /land-and-deploy cite fresh evidence instead of re-running suites. Per-run logs are 0600, capped at 2MB, pruned after 30 days; the ledger and logs stay machine-local by design. |
+| `gstack-issue-guard` | **Tracker-text trust envelope** — fetches GitHub issue/PR text (`issue <n>`, `pr-body`, `pr-comments`, or `--stdin`) and wraps it in a labeled envelope so agents treat it as data: injection-shaped lines get labeled even through fullwidth and invisible-character evasion, and forged envelope banners are defused. Every tracker-text ingress in gstack routes through it, enforced by a CI scanner. |
 | `gstack-ios-qa-daemon` | **iOS QA daemon** — Mac-side broker between an agent and a connected iPhone over USB CoreDevice. Loopback by default; `--tailnet` opens a Tailscale-facing listener with identity-gated capability tiers. Single-instance via flock on `~/.gstack/ios-qa-daemon.pid`. See [docs/howto-ios-testing-with-gstack.md](docs/howto-ios-testing-with-gstack.md). |
 | `gstack-ios-qa-mint` | **iOS allowlist manager** — owner-grant CLI for the tailnet allowlist. `grant`/`revoke`/`list` against `~/.gstack/ios-qa-allowlist.json` (mode 0600). Remote agents never auto-allowlist; this is the explicit-intent path. |
 | `gstack-ios-qa-regen` | **iOS bridge regenerator** — deterministically installs the canonical DebugBridge package, generates typed state accessors, and records the installed gstack version. Safe to rerun after source changes or upgrades. |
+
+`./setup` also registers one default-on Stop hook in `~/.claude/settings.json`:
+`gstack-timeline-stop` (closes dangling session-timeline entries when a session
+is interrupted; fail-open — 2s internal budget, always exits 0, can never block
+a session). Skip it with `./setup --no-team`, remove it with
+`gstack-settings-hook remove-source --source gstack-timeline-stop`;
+`gstack-uninstall` removes it too.
 
 ### Continuous checkpoint mode (opt-in, local by default)
 
@@ -294,7 +304,7 @@ gstack works well with one sprint. It gets interesting with ten running at once.
 
 **Personal automation.** The sidebar agent isn't just for dev workflows. Example: "Browse my kid's school parent portal and add all the other parents' names, phone numbers, and photos to my Google Contacts." Two ways to get authenticated: (1) log in once in the headed browser, your session persists, or (2) click the "cookies" button in the sidebar footer to import cookies from your real Chrome. Once authenticated, Claude navigates the directory, extracts the data, and creates the contacts.
 
-**Prompt injection defense.** Hostile web pages try to hijack your sidebar agent. gstack ships a layered defense: a 22MB ML classifier bundled with the browser scans every page and tool output locally, a Claude Haiku transcript check votes on the full conversation shape, a random canary token in the system prompt catches session exfil attempts across text, tool args, URLs, and file writes, and a verdict combiner requires two classifiers to agree before blocking (prevents single-model false positives on Stack Overflow-style instruction pages). A shield icon in the sidebar header shows status (green/amber/red). Opt in to a 721MB DeBERTa-v3 ensemble via `GSTACK_SECURITY_ENSEMBLE=deberta` for 2-of-3 agreement. Emergency kill switch: `GSTACK_SECURITY_OFF=1`. See [ARCHITECTURE.md](ARCHITECTURE.md#prompt-injection-defense-sidebar-agent) for the full stack.
+**Prompt injection defense.** Hostile web pages try to hijack your sidebar agent. gstack ships a layered defense: content filters (datamarking, hidden-element stripping, ARIA scrubbing, URL blocklist) on every page read, plus a 22MB ML classifier running locally in a sidecar subprocess that scans page-derived content before the agent sees it, with a verdict combiner that requires classifier agreement before blocking (prevents single-model false positives on Stack Overflow-style instruction pages). Everything runs on your machine, no network calls. Emergency kill switch: `GSTACK_SECURITY_OFF=1`. See [ARCHITECTURE.md](ARCHITECTURE.md#prompt-injection-defense-sidebar-agent) for the full stack.
 
 **Browser handoff when the AI gets stuck.** Hit a CAPTCHA, auth wall, or MFA prompt? `$B handoff` opens a visible Chrome at the exact same page with all your cookies and tabs intact. Solve the problem, tell Claude you're done, `$B resume` picks up right where it left off. The agent even suggests it automatically after 3 consecutive failures.
 
@@ -341,6 +351,7 @@ If you don't have the repo cloned (e.g. you installed via a Claude Code paste an
 pkill -f "gstack.*browse" 2>/dev/null || true
 
 # 2. Remove per-skill directories whose SKILL.md points into gstack/
+#    (rm -rf, not rmdir — installed dirs also contain runtime-asset links)
 find ~/.claude/skills -mindepth 1 -maxdepth 1 -type d ! -name gstack 2>/dev/null |
 while IFS= read -r dir; do
   link="$dir/SKILL.md"
@@ -348,11 +359,12 @@ while IFS= read -r dir; do
   target=$(readlink "$link" 2>/dev/null) || continue
   case "$target" in
     gstack/*|*/gstack/*)
-      rm -f "$link"
-      rmdir "$dir" 2>/dev/null || true
+      rm -rf "$dir"
       ;;
   esac
 done
+# Alias skills install as copies (no symlink to detect) — remove by name
+rm -rf ~/.claude/skills/_gstack-command ~/.claude/skills/connect-chrome 2>/dev/null
 
 # 3. Remove gstack
 rm -rf ~/.claude/skills/gstack
@@ -365,6 +377,8 @@ rm -rf ~/.codex/skills/gstack* 2>/dev/null
 rm -rf ~/.factory/skills/gstack* 2>/dev/null
 rm -rf ~/.kiro/skills/gstack* 2>/dev/null
 rm -rf ~/.openclaw/skills/gstack* 2>/dev/null
+rm -rf ~/.cursor/skills/gstack* 2>/dev/null
+rm -rf ~/.config/opencode/skills/gstack* 2>/dev/null
 
 # 6. Remove temp files
 rm -f /tmp/gstack-* 2>/dev/null
@@ -373,6 +387,10 @@ rm -f /tmp/gstack-* 2>/dev/null
 rm -rf .gstack .gstack-worktrees .claude/skills/gstack 2>/dev/null
 rm -rf .agents/skills/gstack* .factory/skills/gstack* 2>/dev/null
 ```
+
+Manual removal leaves the gstack Stop hook entry behind in `~/.claude/settings.json`
+(the uninstall script removes it for you). Edit that file and delete the hook whose
+command path ends in `hosts/claude/hooks/timeline-stop-hook`.
 
 ### Clean up CLAUDE.md
 
