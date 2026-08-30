@@ -129,6 +129,9 @@ jobs:
         run: xvfb-run -a bun run test:free
         env:
           GSTACK_EXPECT_BINARIES: "1"
+          # Browser integration tests share one daemon endpoint. Multiple
+          # shard processes race that endpoint on the 4-core GitHub runner.
+          GSTACK_FREE_JOBS: "1"
 
       # The runner streams the full child output to per-run logs under the OS
       # tmpdir and prints only the quiet contract to the console. Without this

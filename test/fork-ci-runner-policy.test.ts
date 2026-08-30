@@ -9,6 +9,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 const WORKFLOWS = path.resolve(import.meta.dir, '..', '.github', 'workflows');
+const DOCKERFILE = path.resolve(import.meta.dir, '..', '.github', 'docker', 'Dockerfile.ci');
 
 describe('ActVox CI runner policy', () => {
   test('no workflow references unprovisioned Ubicloud runners', () => {
@@ -22,5 +23,11 @@ describe('ActVox CI runner policy', () => {
   test('the required free-tests lane uses a GitHub-hosted Linux runner', () => {
     const source = fs.readFileSync(path.join(WORKFLOWS, 'free-tests.yml'), 'utf8');
     expect(source).toContain('runs-on: ubuntu-latest');
+    expect(source).toContain('GSTACK_FREE_JOBS: "1"');
+  });
+
+  test('the CI image keeps Ubuntu sources reachable from GitHub-hosted runners', () => {
+    const source = fs.readFileSync(DOCKERFILE, 'utf8');
+    expect(source).not.toContain('mirror.hetzner.com');
   });
 });
