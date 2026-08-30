@@ -25,7 +25,7 @@ jobs:
     # (EV6, fork port wave 2). Skip the build for dependabot; the evals job's
     # needs-chain tolerates it because no eval test selects on a lockfile-only
     # diff — a maintainer's next push rebuilds the image with real perms.
-    if: github.actor != 'dependabot[bot]'
+    if: vars.ENABLE_PAID_EVALS == 'true' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -94,7 +94,7 @@ jobs:
   evals:
     runs-on: ${{ matrix.suite.runner || 'ubuntu-latest' }}
     needs: build-image
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.ENABLE_PAID_EVALS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # Least privilege for the job that executes PR-authored code with three
     # provider API keys in env: read-only contents, packages:read for the
     # container-image pull below. Without this block the job ran on the
@@ -393,7 +393,7 @@ jobs:
   report:
     runs-on: ubuntu-latest
     needs: evals
-    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    if: always() && vars.ENABLE_PAID_EVALS == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 5
     permissions:
       contents: read
@@ -502,7 +502,7 @@ jobs:
   plan-slices:
     runs-on: ubuntu-latest
     needs: [build-image, evals]
-    if: always() && needs.build-image.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    if: always() && vars.ENABLE_PAID_EVALS == 'true' && needs.build-image.result == 'success' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     timeout-minutes: 10
     permissions:
       contents: read
@@ -545,7 +545,7 @@ jobs:
   eval-slices:
     runs-on: ubuntu-latest
     needs: [build-image, plan-slices]
-    if: always() && needs.plan-slices.result == 'success'
+    if: always() && vars.ENABLE_PAID_EVALS == 'true' && needs.plan-slices.result == 'success'
     # Aggregate spawn-concurrency budget: 6 slices x EVALS_JOBS=2 x
     # EVALS_CONCURRENCY=2 = 24 concurrent tests lane-wide (the old matrix's
     # 40-way per row queued claude session STARTUP behind 39 siblings and ate
@@ -689,7 +689,7 @@ jobs:
     needs: [plan-slices, eval-slices]
     # always(): the report must run (and FAIL) when an executor died — a
     # missing slice artifact reading as green is the class this lane kills.
-    if: always() && needs.plan-slices.result == 'success'
+    if: always() && vars.ENABLE_PAID_EVALS == 'true' && needs.plan-slices.result == 'success'
     timeout-minutes: 5
     permissions:
       contents: read
