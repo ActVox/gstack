@@ -1,5 +1,12 @@
 # Changelog
 
+## ActVox fork integration - 2026-08-30
+
+- Integrated upstream through `garrytan/gstack@07b59e39` (`v1.75.0.0`).
+- Retained GitHub-hosted `ubuntu-latest` Linux lanes because the ActVox fork has no Ubicloud runner assignment.
+- Retained the lowercase `ghcr.io/actvox/gstack/ci` image path and upstream's patch-aware CI image cache key.
+- Dropped the narrow PTY-only missing-Anthropic skip: upstream's v1.74 paid-shard runner now performs one fail-closed Anthropic preflight for the whole paid lane, so the old per-suite workaround no longer preserves a valid execution contract.
+
 ## [1.75.0.0] - 2026-08-29
 
 **Your review now hunts over-built code, not just broken code.**
