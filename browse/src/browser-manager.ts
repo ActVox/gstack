@@ -186,12 +186,32 @@ export async function resolveDisconnectCause(browser: Browser | null): Promise<'
 }
 
 /**
- * Headless `launch()` disconnect handler. Exits 0 on clean user-quit, 1 on
- * crash. Inlined into the launch() body via a one-line dispatch so
+ * Exit-on-disconnect is DAEMON-ONLY semantics. The standalone server
+ * entrypoint opts in via markDaemonProcess() (under its import.meta.main
+ * gate, same contract as its signal handlers); embedders — gbrowser
+ * phoenix, and every test that launches a BrowserManager in-process —
+ * must never have a Chromium crash process.exit() their HOST. Observed
+ * live before this flag: a test-launched browser died mid-suite and the
+ * exit(1) killed the whole bun shard with no terminal summary (the
+ * truncation class the strict runner exists to catch).
+ */
+let daemonProcess = false;
+export function markDaemonProcess(): void {
+  daemonProcess = true;
+}
+
+/**
+ * Headless `launch()` disconnect handler. In the standalone daemon: exits 0
+ * on clean user-quit, 1 on crash. Embedded contexts get the log line only.
+ * Inlined into the launch() body via a one-line dispatch so
  * browser-manager's flow stays grep-friendly.
  */
 export async function handleChromiumDisconnect(browser: Browser | null): Promise<void> {
   const cause = await resolveDisconnectCause(browser);
+  if (!daemonProcess) {
+    console.error(`[browse] Chromium disconnected (${cause}) in an embedded context — host process continues.`);
+    return;
+  }
   if (cause === 'clean') {
     console.error('[browse] Chromium closed cleanly (user-initiated quit). Server exiting (0).');
     process.exit(0);
@@ -1054,6 +1074,25 @@ export class BrowserManager {
   transferTab(tabId: number, toClientId: string): void {
     if (!this.pages.has(tabId)) throw new Error(`Tab ${tabId} not found`);
     this.tabOwnership.set(tabId, toClientId);
+  }
+
+  /**
+   * Release all tab ownership held by a client (called on revoke / reducing
+   * re-pair). Deletes the ownership entries so an own-only client re-pairing
+   * under the same name can no longer inherit the revoked agent's
+   * authenticated tabs (checkTabAccess gates own-only on owner === clientId).
+   * Tabs are NOT closed — leaving the page open is the local human's call, not
+   * the daemon's; the residual is a root-only tab. Returns the released ids.
+   */
+  releaseClientTabs(clientId: string): number[] {
+    const released: number[] = [];
+    for (const [tabId, owner] of this.tabOwnership) {
+      if (owner === clientId) {
+        this.tabOwnership.delete(tabId);
+        released.push(tabId);
+      }
+    }
+    return released;
   }
 
   async getTabListWithTitles(): Promise<Array<{ id: number; url: string; title: string; active: boolean }>> {
