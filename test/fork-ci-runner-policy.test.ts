@@ -23,6 +23,7 @@ describe('ActVox CI runner policy', () => {
   test('the required free-tests lane uses a GitHub-hosted Linux runner', () => {
     const source = fs.readFileSync(path.join(WORKFLOWS, 'free-tests.yml'), 'utf8');
     expect(source).toContain('runs-on: ubuntu-latest');
+    expect(source).toContain('GSTACK_FREE_JOBS: "1"');
     expect(source).toContain('GSTACK_FREE_RETRY_FLAKY: "1"');
   });
 
