@@ -28,12 +28,9 @@ concurrency:
   group: ci-image-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  IMAGE: ghcr.io/actvox/gstack/ci
-
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-8
     timeout-minutes: 30
     permissions:
       contents: read
@@ -49,7 +46,7 @@ jobs:
       # the tag the eval matrix looks up first — without pushing it here, the
       # weekly/main prebuild never warms the cache that matters.
       - id: meta
-        run: echo "tag=${{ env.IMAGE }}:${{ hashFiles('.github/docker/Dockerfile.ci', 'bun.lock', 'patches/**') }}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=ghcr.io/${{ github.repository }}/ci:${{ hashFiles('.github/docker/Dockerfile.ci', 'bun.lock', 'patches/**') }}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
@@ -80,9 +77,9 @@ jobs:
           context: .github/docker
           file: .github/docker/Dockerfile.ci
           push: true
-          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/ci:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}/ci:buildcache,mode=max
           tags: |
             ${{ steps.meta.outputs.tag }}
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/ci:latest
+            ghcr.io/${{ github.repository }}/ci:${{ github.sha }}
