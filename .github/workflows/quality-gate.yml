@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   quality:
-    runs-on: ubicloud-standard-8
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       # Shallow checkout: fetch-depth:0 cost 74s of a 92s job for checks that

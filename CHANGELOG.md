@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased - ActVox fork
+
+- Kept required checks on GitHub-hosted runners because this fork has no Ubicloud runner substrate.
+- Kept paid eval workflows disabled until the fork explicitly enables `ENABLE_PAID_EVALS` and provisions credentials.
+- Pinned the fork's CI image to lowercase `ghcr.io/actvox/gstack/ci` so GHCR publication remains valid regardless of repository-name casing.
+- Kept the CI container on Ubuntu's standard package sources because GitHub-hosted runners cannot reach the upstream Hetzner mirror.
+- Added retry handling plus persistent flake-ledger artifact upload to the required free-test lane.
 ## [1.79.0.0] - 2026-09-01
 
 **/ship can no longer be stranded by a backgrounded subagent.**
@@ -118,6 +125,7 @@ Plan reviews ask their questions again, `browse stop` actually stops Chromium, s
 - 19 carve skeleton ceilings re-pinned with measured values (+~440 bytes/skill for the AUQ fence); autoplan re-pinned again for the broken-install preflight arm.
 - `gen-skill-docs --link-root` exists for render-into-tmp-then-swap callers; direct-render callers need no change.
 - The absorbed test files gained spawn timeouts (v1.77 sync-spawn tripwire predates them).
+
 
 ## [1.77.0.0] - 2026-08-31
 

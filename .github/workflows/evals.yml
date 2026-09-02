@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}/ci
+  IMAGE: ghcr.io/actvox/gstack/ci
 
 jobs:
   # Build Docker image with pre-baked toolchain (cached — only rebuilds on Dockerfile/lockfile change)
@@ -24,8 +24,8 @@ jobs:
     # (EV6, fork port wave 2). Skip the build for dependabot; the evals job's
     # needs-chain tolerates it because no eval test selects on a lockfile-only
     # diff — a maintainer's next push rebuilds the image with real perms.
-    if: github.actor != 'dependabot[bot]'
-    runs-on: ubicloud-standard-8
+    if: vars.ENABLE_PAID_EVALS == 'true' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
@@ -102,9 +102,9 @@ jobs:
   # deterministically; fork work gets real coverage via a trusted base-repo
   # branch (see CLAUDE.md's garrytan-agents workflow).
   plan-slices:
-    runs-on: ubicloud-standard-8
+    runs-on: ubuntu-latest
     needs: build-image
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: vars.ENABLE_PAID_EVALS == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     timeout-minutes: 10
     permissions:
       contents: read
@@ -140,9 +140,9 @@ jobs:
           retention-days: 30
 
   eval-slices:
-    runs-on: ubicloud-standard-8
+    runs-on: ubuntu-latest
     needs: [build-image, plan-slices]
-    if: always() && needs.plan-slices.result == 'success'
+    if: vars.ENABLE_PAID_EVALS == 'true' && always() && needs.plan-slices.result == 'success'
     # Aggregate spawn-concurrency budget: 6 slices x EVALS_JOBS=2 x
     # EVALS_CONCURRENCY=2 = 24 concurrent tests lane-wide (the old matrix's
     # 40-way per row queued claude session STARTUP behind 39 siblings and ate
@@ -236,11 +236,11 @@ jobs:
           retention-days: 30
 
   slices-report:
-    runs-on: ubicloud-standard-2
+    runs-on: ubuntu-latest
     needs: [plan-slices, eval-slices]
     # always(): the report must run (and FAIL) when an executor died — a
     # missing slice artifact reading as green is the class this lane kills.
-    if: always() && needs.plan-slices.result == 'success'
+    if: vars.ENABLE_PAID_EVALS == 'true' && always() && needs.plan-slices.result == 'success'
     timeout-minutes: 5
     # contents:read ONLY — this job executes PR-authored code (bun install
     # lifecycle scripts + the reconcile runner from the PR checkout), so it
@@ -304,9 +304,9 @@ jobs:
   # checkout, no bun install — only downloaded artifacts, jq, and gh. See the
   # trust-boundary note on slices-report.
   slices-comment:
-    runs-on: ubicloud-standard-2
+    runs-on: ubuntu-latest
     needs: slices-report
-    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.slices-report.result != 'skipped'
+    if: vars.ENABLE_PAID_EVALS == 'true' && always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.slices-report.result != 'skipped'
     timeout-minutes: 5
     permissions:
       pull-requests: write
