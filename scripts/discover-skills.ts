@@ -8,6 +8,25 @@ import * as path from 'path';
 
 const SKIP = new Set(['node_modules', '.git', 'dist']);
 
+export interface SkillGenerationFilter {
+  includeSkills?: readonly string[];
+  skipSkills?: readonly string[];
+}
+
+/** Keep generation and health checks on the same host-specific skill set. */
+export function isSkillGeneratedForHost(
+  skillDir: string,
+  generation: SkillGenerationFilter,
+): boolean {
+  if (generation.includeSkills?.length && !generation.includeSkills.includes(skillDir)) {
+    return false;
+  }
+  if (generation.skipSkills?.includes(skillDir)) {
+    return false;
+  }
+  return true;
+}
+
 function subdirs(root: string): string[] {
   return fs.readdirSync(root, { withFileTypes: true })
     .filter(d => d.isDirectory() && !d.name.startsWith('.') && !SKIP.has(d.name))

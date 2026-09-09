@@ -9,7 +9,7 @@
  * Used by skill:check and CI freshness checks.
  */
 
-import { discoverTemplates, discoverSectionTemplates } from './discover-skills';
+import { discoverTemplates, discoverSectionTemplates, isSkillGeneratedForHost } from './discover-skills';
 import { writeLlmsTxt } from './gen-llms-txt';
 import { generateDesignChecklistMd } from './resolvers/design-checklist';
 import { DOM_DUMP_SCRIPT, DOM_DUMP_FILE } from '../lib/dom-dump-script';
@@ -1045,14 +1045,8 @@ for (const currentHost of hostsToRun) {
     for (const tmplPath of findTemplates()) {
       const dir = path.basename(path.dirname(tmplPath));
 
-      // includeSkills allowlist (union logic: include minus skip)
-      if (currentHostConfig.generation.includeSkills?.length) {
-        if (!currentHostConfig.generation.includeSkills.includes(dir)) continue;
-      }
-      // skipSkills denylist (subtracts from includeSkills or full set)
-      if (currentHostConfig.generation.skipSkills?.length) {
-        if (currentHostConfig.generation.skipSkills.includes(dir)) continue;
-      }
+      // includeSkills allowlist minus skipSkills denylist.
+      if (!isSkillGeneratedForHost(dir, currentHostConfig.generation)) continue;
 
       const { outputPath, content, symlinkLoop } = processTemplate(tmplPath, currentHost);
       const relOutput = path.relative(OUT_DIR || ROOT, outputPath);
