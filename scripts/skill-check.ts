@@ -17,6 +17,7 @@ import { ALL_HOST_CONFIGS, getExternalHosts, getHostConfig } from '../hosts/inde
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const ROOT_REALPATH = fs.realpathSync(ROOT);
+const CLAUDE_SKIPS = new Set(getHostConfig('claude').generation.skipSkills ?? []);
 
 function isRepoRootSymlink(candidateDir: string): boolean {
   try {
@@ -68,6 +69,8 @@ const TEMPLATES = discoverTemplates(ROOT);
 const CLAUDE_GENERATION = getHostConfig('claude').generation;
 
 for (const { tmpl, output } of TEMPLATES) {
+  // Source-root outputs are Claude Code renders; own-harness wrappers are absent.
+  if ((getHostConfig('claude').generation.skipSkills ?? []).includes(path.basename(path.dirname(tmpl)))) continue;
   const tmplPath = path.join(ROOT, tmpl);
   const outPath = path.join(ROOT, output);
   const skillDir = path.basename(path.dirname(tmplPath));
@@ -77,6 +80,11 @@ for (const { tmpl, output } of TEMPLATES) {
     continue;
   }
   if (!fs.existsSync(outPath)) {
+    const skillDir = output === 'SKILL.md' ? '' : output.split('/')[0];
+    if (CLAUDE_SKIPS.has(skillDir)) {
+      console.log(`  -  ${output.padEnd(30)} — intentionally omitted for Claude Code`);
+      continue;
+    }
     hasErrors = true;
     console.log(`  \u274c ${output.padEnd(30)} — generated file missing! Run: bun run gen:skill-docs`);
     continue;
