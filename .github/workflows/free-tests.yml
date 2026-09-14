@@ -1,6 +1,6 @@
 name: Free Tests
 
-# The free suite (~400 files: test/, browse/test/, make-pdf/test/, design/test/)
+# The free suite (~850 files: test/, browse/test/, make-pdf/test/, design/test/)
 # had ZERO Linux CI coverage before this lane — only a curated Windows subset
 # ran anywhere. This job runs the whole thing through the canonical runner
 # (scripts/test-free-shards.ts): N concurrent shard processes (serial within
@@ -111,7 +111,10 @@ jobs:
 
   free-suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # v1.87 reaches the retry/attribution phase after roughly 20 minutes on
+    # GitHub-hosted runners. The old 20-minute ceiling killed the suite before
+    # bounded flaky retries could classify failures, making every such run red.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
