@@ -69,10 +69,10 @@ describe("#2679: skill-content mktemp guards", () => {
     // source, so match to end-of-line rather than [^}]* (which stops at the
     // interpolation's closing brace).
     const body = readScript("scripts/resolvers/redact-doc.ts");
-    expect(body).toMatch(/REDACT_FILE=\$\(mktemp\)\s*\|\|\s*\{.*exit 1/);
+    expect(body).toMatch(/REDACT_FILE=\$\(mktemp(?:\s+[^)]*)?\)\s*\|\|\s*\{.*exit 1/);
     // And the rendered output (interpolation resolved) carries the guard too.
     const rendered = readScript("spec/sections/gate-and-file.md");
-    expect(rendered).toMatch(/REDACT_FILE=\$\(mktemp\)\s*\|\|\s*\{[^}]*exit 1/);
+    expect(rendered).toMatch(/REDACT_FILE=\$\(mktemp(?:\s+[^)]*)?\)\s*\|\|\s*\{[^}]*exit 1/);
   });
 
   test("ship pr-body template guards PR_BODY_FILE=$(mktemp) with a loud exit", () => {
