@@ -46,6 +46,9 @@ describe.skipIf(process.platform === 'win32')('Chromium profile isolation (#2817
   });
 
   afterEach(async () => {
+    // A successful stop/disconnect removes stateFile. Do not retain the daemon PID
+    // captured before that shutdown and then signal a stale/reused process group.
+    daemonPid = undefined;
     if (fs.existsSync(stateFile)) {
       daemonPid = JSON.parse(fs.readFileSync(stateFile, 'utf-8')).pid;
     }
