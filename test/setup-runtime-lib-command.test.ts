@@ -1,5 +1,10 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, setDefaultTimeout } from 'bun:test';
 import { spawnSync } from 'child_process';
+
+// Copy-install cells duplicate the fork's expanded runtime roots on disk. The
+// upstream 5s default is below observed clean execution time on the supported
+// macOS worktree, while each subprocess still retains its own 30s hard bound.
+setDefaultTimeout(30_000);
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
