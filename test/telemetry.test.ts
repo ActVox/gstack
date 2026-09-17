@@ -53,6 +53,17 @@ function curlRequests(): string[][] {
   return fs.readFileSync(file, 'utf8').split('\0\0').filter(Boolean).map(call => call.split('\0'));
 }
 
+async function waitForCurlRequests(expected = 1): Promise<string[][]> {
+  const deadline = Date.now() + 3_000;
+  let requests: string[][] = [];
+  while (Date.now() < deadline) {
+    requests = curlRequests();
+    if (requests.length >= expected) return requests;
+    await Bun.sleep(25);
+  }
+  return requests;
+}
+
 function unconfiguredRoot(): string {
   const fixture = path.join(tmpDir, 'unconfigured');
   fs.mkdirSync(path.join(fixture, 'bin'), { recursive: true });
@@ -86,7 +97,7 @@ afterEach(() => {
 });
 
 describe('gstack-telemetry-log', () => {
-  test('appends valid JSONL when tier=anonymous', () => {
+  test('appends valid JSONL when tier=anonymous', async () => {
     setConfig('telemetry', 'anonymous');
     run(`${BIN}/gstack-telemetry-log --skill qa --duration 142 --outcome success --session-id test-123`);
 
@@ -100,7 +111,7 @@ describe('gstack-telemetry-log', () => {
     expect(events[0].event_type).toBe('skill_run');
     expect(events[0].os).toBeTruthy();
     expect(events[0].gstack_version).toBeTruthy();
-    const requests = curlRequests();
+    const requests = await waitForCurlRequests();
     expect(requests).toHaveLength(1);
     expect(requests[0]).toContain(`${FIXTURE_SUPABASE_URL}/functions/v1/telemetry-ingest`);
     expect(requests[0]).toContain('apikey: fixture-anon-key');
