@@ -317,6 +317,7 @@ describe('test-free-shards: strict shard execution', () => {
         `const fs = require("fs");`
         + `fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({`
         + `  home: process.env.GSTACK_HOME ?? null, tmp: process.env.TMPDIR,`
+        + `  tmpCanonical: fs.realpathSync(process.env.TMPDIR || ""),`
         + `  tmpExists: fs.existsSync(process.env.TMPDIR || "") }));`
         + `console.log(${JSON.stringify(SUMMARY_1)});`;
       const outcome = await runFreeShard(['env-dump'], 1, 1, {
@@ -331,6 +332,7 @@ describe('test-free-shards: strict shard execution', () => {
       // TMPDIR is a per-shard throwaway, cleaned up once the shard finishes.
       expect(seen.tmp).toContain('gstack-free-shard-');
       expect(seen.tmpExists).toBe(true);
+      expect(seen.tmp).toBe(seen.tmpCanonical);
       expect(seen.tmp).not.toBe(process.env.TMPDIR ?? '');
       expect(fs.existsSync(seen.tmp)).toBe(false);
     } finally {
