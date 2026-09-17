@@ -43,7 +43,7 @@ export function createPlanCountFixture(prompt: string, opts: { nativeReviewOnly?
   env: Record<string, string>;
   cleanup(): void;
 } {
-  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-plan-count-'));
+  const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-plan-count-')));
   let nativeState: ReturnType<typeof createNativeReviewState> | undefined;
   const env: Record<string, string> = {};
   const cleanup = () => {
