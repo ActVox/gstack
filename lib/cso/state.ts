@@ -3,6 +3,7 @@ import { basename, dirname, isAbsolute, join, resolve, parse, relative, sep } fr
 import { randomBytes } from 'node:crypto';
 import { atomicWriteSync } from '../fs-atomic';
 import { CsoError, RunReportV3, canonical, completeness, fingerprint, renderReport, sha256 } from './contracts';
+import { resolvePlatformSystemAlias } from './path-identity';
 import { redact, sanitizeForJson, sanitizeHelperForJson } from './process';
 const MAX_STATE_FILE=1024*1024;
 
@@ -175,7 +176,7 @@ export function stateRoot(env: Record<string,string|undefined> = process.env): s
   return resolve(env.GSTACK_HOME || (env.CLAUDE_PLUGIN_ROOT?.toLowerCase().includes('gstack') ? env.CLAUDE_PLUGIN_DATA : '') || join(userHome || '.', '.gstack'));
 }
 function ensureDirectory(path:string,hardenExistingLeaf:boolean):string{
-  const p=resolve(path),root=parse(p).root;
+  const requested=resolve(path),p=resolvePlatformSystemAlias(requested),root=parse(p).root;
   if(p===root)throw new CsoError('UNSAFE_PATH','Private state cannot use a filesystem root');
   let cursor=root,leafCreated=false;
   for (const part of relative(root,p).split(sep).filter(Boolean)) {
@@ -192,7 +193,7 @@ function ensureDirectory(path:string,hardenExistingLeaf:boolean):string{
   const s = fs.statSync(p);
   if (process.getuid && s.uid !== process.getuid()) throw new CsoError('UNSAFE_PATH','Private directory must be owned by the current user');
   if(hardenExistingLeaf||leafCreated)fs.chmodSync(p,0o700);
-  return p;
+  return requested;
 }
 /** The supplied leaf is CSO-owned. Existing ancestors are validated, never mutated. */
 export function secureDirectory(path:string):string{return ensureDirectory(path,true);}
@@ -201,7 +202,7 @@ export function privateRoot():string{
   return secureDirectory(join(container,'security','cso'));
 }
 export function assertStateOutside(repo:string):void{
-  const source=fs.realpathSync(repo),candidate=resolve(stateRoot(),'security','cso');
+  const source=fs.realpathSync(repo),candidate=resolvePlatformSystemAlias(resolve(stateRoot(),'security','cso'));
   const relation=relative(source,candidate);if(relation===''||(!relation.startsWith(`..${sep}`)&&relation!=='..'&&!isAbsolute(relation)))throw new CsoError('UNSAFE_PATH','CSO private state must be outside the audited repository');
 }
 export function repoId(repo: string): string { return sha256(fs.realpathSync(repo)).slice(0,24); }

@@ -6,6 +6,7 @@ import { childEnvironment, executable, git, redact, runProcess } from './process
 import { secureDirectory, writeHelperJson, writeJson } from './state';
 import { scan } from '../redact-engine';
 import { atomicWriteSync } from '../fs-atomic';
+import { resolvePlatformSystemAlias } from './path-identity';
 
 const NO_READ_COMPONENTS=new Set(['.git','.hg','.svn','node_modules','.venv','venv','__pycache__','.bundle','.cache','.context','.gstack']);
 const OMIT_COMPONENTS=new Set([...NO_READ_COMPONENTS,'.claude','.agents','.codex','.cursor']);
@@ -97,14 +98,17 @@ function assertDirectoryIdentities(identities:DirectoryIdentity[],path:string):v
 }
 /** Validate the resolved inode after open so an ancestor-symlink swap cannot escape root. */
 export function assertOpenedFileContained(root:string,full:string,fd:number,opened:fs.Stats):void{
+  const rootStat=fs.lstatSync(root);
+  if(rootStat.isSymbolicLink()||!rootStat.isDirectory())throw new CsoError('UNSAFE_PATH','Audited root is not one real directory');
+  const canonicalRoot=resolvePlatformSystemAlias(root);
   if(process.platform==='linux'){
     let actual:string,current:fs.Stats;try{actual=fs.readlinkSync(`/proc/self/fd/${fd}`);current=fs.fstatSync(fd);}catch{throw new CsoError('SNAPSHOT_RACE','Opened source identity could not be resolved');}
     if(current.nlink!==1||current.dev!==opened.dev||current.ino!==opened.ino||current.mode!==opened.mode)throw new CsoError('SNAPSHOT_RACE','Opened source identity changed during containment validation');
-    if(!isAbsolute(actual)||!inside(root,actual))throw new CsoError('UNSAFE_PATH','Opened source escaped the audited root');
+    if(!isAbsolute(actual)||!inside(canonicalRoot,actual))throw new CsoError('UNSAFE_PATH','Opened source escaped the audited root');
     return;
   }
   let resolved:string,current:fs.Stats;try{resolved=fs.realpathSync(full);current=fs.lstatSync(resolved);}catch{throw new CsoError('SNAPSHOT_RACE','Opened source identity changed during containment validation');}
-  if(!inside(root,resolved))throw new CsoError('UNSAFE_PATH','Opened source escaped the audited root');
+  if(!inside(canonicalRoot,resolved))throw new CsoError('UNSAFE_PATH','Opened source escaped the audited root');
   if(current.isSymbolicLink()||!current.isFile()||current.nlink!==1||current.dev!==opened.dev||current.ino!==opened.ino||current.mode!==opened.mode||current.size!==opened.size)throw new CsoError('SNAPSHOT_RACE','Opened source identity changed during containment validation');
 }
 function readStable(root: string, path: string, maxBytes=MAX_OUTPUT): {data:Buffer; mode:number} {

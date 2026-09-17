@@ -18,6 +18,18 @@ function fixture(files: Record<string, unknown>): string {
   }
   return root;
 }
+function ancestorAliasFixture(files: Record<string, unknown>): string {
+  const container = mkdtempSync(join(tmpdir(), 'cso-preparation-alias-')); roots.push(container);
+  const physical = join(container, 'physical');
+  const root = join(physical, 'snapshot');
+  mkdirSync(root, { recursive: true });
+  symlinkSync('physical', join(container, 'alias'));
+  for (const [path, contents] of Object.entries(files)) {
+    const full = join(root, path); mkdirSync(join(full, '..'), { recursive: true });
+    writeFileSync(full, typeof contents === 'string' ? contents : JSON.stringify(contents));
+  }
+  return join(container, 'alias', 'snapshot');
+}
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const nodeFiles = (version = 3) => ({
   'package.json': { name: 'app', version: '1.0.0', dependencies: { cookie: '1.0.0' }, scripts: { postinstall: 'touch /tmp/CSO_UNSAFE' } },
@@ -45,6 +57,10 @@ BUNDLED WITH
 `;
 
 describe('CSO inert Node preparation', () => {
+  test('accepts a regular metadata file below a filesystem alias outside the snapshot root', () => {
+    const plan = inspectPreparation(ancestorAliasFixture(nodeFiles()));
+    expect(plan.status).toBe('ready'); expect(plan.stack).toBe('node');
+  });
   for (const version of [2, 3]) test(`accepts npm lock v${version} and separates lifecycle execution`, () => {
     const plan = inspectPreparation(fixture(nodeFiles(version)));
     expect(plan.status).toBe('ready'); expect(plan.stack).toBe('node');

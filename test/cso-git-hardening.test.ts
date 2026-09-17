@@ -10,7 +10,7 @@ const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))fs.rmSync(root,{recursive:true,force:true});});
 
 function fixture(){
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'cso-git-hardening-')),repo=path.join(root,'repo'),runDir=path.join(root,'state','run');
+  const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cso-git-hardening-'))),repo=path.join(root,'repo'),runDir=path.join(root,'state','run');
   roots.push(root);fs.mkdirSync(repo);fs.mkdirSync(runDir,{recursive:true,mode:0o700});
   const git=(...args:string[])=>{const result=spawnSync('/usr/bin/git',['-C',repo,...args],{encoding:'utf8',env:{HOME:root,PATH:'/usr/bin:/bin'},timeout:30_000});if(result.status)throw new Error(result.stderr);return result.stdout;};
   git('init','-q');git('config','user.email','fixture@example.test');git('config','user.name','Fixture');
@@ -57,6 +57,8 @@ describe('CSO Git metadata hardening',()=>{
 
   test.skipIf(process.platform==='win32')('pins every metadata read to the audited worktree and ignores configured global excludes',async()=>{
     const {root,repo,runDir,git}=fixture(),empty=path.join(root,'decoy-worktree'),excludes=path.join(root,'global-excludes');
+    // A case-variant pathname cannot exist independently on a case-insensitive volume.
+    if(fs.existsSync(path.join(repo,'TRACKED.ts')))return;
     fs.mkdirSync(empty);fs.writeFileSync(excludes,'untracked-security.ts\n');
     fs.writeFileSync(path.join(repo,'untracked-security.ts'),'export const vulnerable = true\n');
     fs.writeFileSync(path.join(repo,'TRACKED.ts'),'export const caseVariant = true\n');
