@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { PublicArchiveCache } from './cache';
 import { canonical, CsoError, MAX_OUTPUT, sha256 } from './contracts';
+import { resolvePlatformSystemAlias } from './path-identity';
 import {
   inspectPreparation, railsTestConfiguration, type CsoStack, type PreparationCommand,
   type PreparationInput, type PreparationPlan,
@@ -518,7 +519,7 @@ function treeManifest(rootPath: string, maxBytes: number, deadline: number, allo
   let rootStat: fs.Stats, canonicalRoot: string;
   try { rootStat = fs.lstatSync(root); canonicalRoot = fs.realpathSync(root); }
   catch { fail('MISSING_INPUT', 'Preparation source or output directory is missing'); }
-  if (!rootStat!.isDirectory() || rootStat!.isSymbolicLink() || canonicalRoot! !== root ||
+  if (!rootStat!.isDirectory() || rootStat!.isSymbolicLink() || canonicalRoot! !== resolvePlatformSystemAlias(root) ||
     (process.getuid && rootStat!.uid !== process.getuid()) || (rootStat!.mode & 0o022) !== 0)
     fail('UNSAFE_PATH', 'Preparation source or output must be one private real directory');
   const entries: TreeEntry[] = [];
@@ -544,7 +545,7 @@ function treeManifest(rootPath: string, maxBytes: number, deadline: number, allo
         let resolvedTarget: string, targetStat: fs.Stats;
         try { resolvedTarget = fs.realpathSync(path); targetStat = fs.statSync(path); }
         catch { fail('UNSAFE_PATH', `Prepared dependency symlink is dangling or cyclic: ${relativePath}`); }
-        if (resolvedTarget! !== root && !resolvedTarget!.startsWith(`${root}${sep}`)) fail('UNSAFE_PATH', `Prepared dependency symlink escapes its execution copy: ${relativePath}`);
+        if (resolvedTarget! !== canonicalRoot! && !resolvedTarget!.startsWith(`${canonicalRoot!}${sep}`)) fail('UNSAFE_PATH', `Prepared dependency symlink escapes its execution copy: ${relativePath}`);
         if (!targetStat!.isFile() && !targetStat!.isDirectory()) fail('UNSAFE_PATH', `Prepared dependency symlink resolves to a special object: ${relativePath}`);
         const after = fs.lstatSync(path);
         if (!after.isSymbolicLink() || after.dev !== stat.dev || after.ino !== stat.ino || after.mode !== stat.mode ||

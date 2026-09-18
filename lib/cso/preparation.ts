@@ -66,13 +66,23 @@ function contained(root: string, path: string): string {
 }
 function read(root: string, path: string, optional = false): string | undefined {
   const full = contained(root, path);
+  let canonicalRoot: string;
+  try {
+    const rootStat = lstatSync(root);
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) fail('UNSAFE_METADATA', 'Captured source must be a real directory.', path);
+    canonicalRoot = realpathSync(root);
+  } catch (error) {
+    if (error instanceof MetadataError) throw error;
+    fail('MISSING_METADATA', 'Captured source is missing or unreadable.', path);
+  }
   let stat;
   try { stat = lstatSync(full); } catch (error: any) {
     if (optional && error.code === 'ENOENT') return undefined;
     fail('MISSING_METADATA', 'Required dependency metadata is missing or unreadable.', path);
   }
   const actual = realpathSync(full);
-  if (stat!.isSymbolicLink() || actual !== full || !stat!.isFile()) fail('UNSAFE_METADATA', 'Dependency metadata must be a regular file without symlink ancestors.', path);
+  const expected = contained(canonicalRoot!, path);
+  if (stat!.isSymbolicLink() || actual !== expected || !stat!.isFile()) fail('UNSAFE_METADATA', 'Dependency metadata must be a regular file without symlink ancestors.', path);
   if (stat!.size > MAX_METADATA) fail('METADATA_LIMIT', 'Dependency metadata exceeds the 8 MiB inspection limit.', path);
   return readFileSync(full, 'utf8');
 }

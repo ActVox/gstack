@@ -78,7 +78,7 @@ const BUN_RUNTIME_POLICY_ARGS=['--no-install','--config=/opt/cso/no-auto-install
 // without processing .pth files, and import each runner before application cwd.
 const PYTHON_PURELIB="os.path.join(os.path.dirname(os.path.dirname(sys.executable)),'lib',f'python{sys.version_info.major}.{sys.version_info.minor}','site-packages')";
 const PYTEST_BOOTSTRAP=`import os,sys;sys.path.append(${PYTHON_PURELIB});import pytest;sys.path.insert(0,os.getcwd());raise SystemExit(pytest.main(sys.argv[1:]))`;
-const UNITTEST_BOOTSTRAP=`import os,sys,unittest;sys.path.append(${PYTHON_PURELIB});sys.path.insert(0,os.getcwd());unittest.main(module=None,argv=['unittest',*sys.argv[1:]])`;
+const UNITTEST_BOOTSTRAP=`import os,sys,unittest;sys.path.append(${PYTHON_PURELIB});sys.path.insert(0,os.getcwd());unittest.main(module=None,argv=['unittest',*((arg[2:] if arg.startswith('./') else arg) for arg in sys.argv[1:])])`;
 const DJANGO_BOOTSTRAP=`import os,sys,runpy;sys.path.append(${PYTHON_PURELIB});import django;sys.path.insert(0,os.getcwd());sys.argv=['manage.py',*sys.argv[1:]];runpy.run_path('manage.py',run_name='__main__')`;
 const FLASK_BOOTSTRAP=`import os,sys;sys.path.append(${PYTHON_PURELIB});from flask.cli import main as _cso_main;sys.path.insert(0,os.getcwd());sys.argv=['flask',*sys.argv[1:]];_cso_main()`;
 const UVICORN_BOOTSTRAP=`import os,sys;sys.path.append(${PYTHON_PURELIB});from uvicorn.main import main as _cso_main;sys.path.insert(0,os.getcwd());sys.argv=['uvicorn',*sys.argv[1:]];_cso_main()`;

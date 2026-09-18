@@ -22,6 +22,7 @@ describe('plan-count fixtures', () => {
   test('preloads the literal plan and initial context in a separate git repository', () => {
     const fixture = createPlanCountFixture(PROMPT);
     try {
+      expect(fixture.cwd).toBe(fs.realpathSync(fixture.cwd));
       expect(fs.realpathSync(fixture.cwd)).not.toBe(fs.realpathSync(ROOT));
       expect(gitRoot(fixture.cwd)).toBe(fs.realpathSync(fixture.cwd));
       expect(fs.readFileSync(path.join(fixture.cwd, 'PLAN.md'), 'utf8')).toBe(PROMPT);

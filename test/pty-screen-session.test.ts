@@ -121,6 +121,22 @@ process.stdout.write('native-summary-complete-after-heading-scrolled');`);
     } finally {clearTimeout(timer);child.kill('SIGKILL');fs.rmSync(f.dir,{recursive:true,force:true});}
   }, 32000);
 
+  test('installed headless source loads without an oversized module specifier', () => {
+    const f = fixture();
+    try {
+      const screenModule = pathToFileURL(path.join(ROOT, 'test/helpers/pty-screen.ts')).href;
+      const result = run(f.dir, f.fake, `
+import {createPtyScreen} from ${JSON.stringify(screenModule)};
+const screen=await createPtyScreen(20,4);
+try {screen.write('headless-ready');if(!(await screen.read()).includes('headless-ready'))throw new Error('screen did not render');process.stdout.write('headless-file-module-ready');}
+finally {await screen.dispose();}
+`);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe('headless-file-module-ready');
+      expect(fs.readFileSync(path.join(ROOT, 'test/helpers/pty-screen.ts'), 'utf8')).not.toContain('data:text/javascript');
+    } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+  }, 15_000);
+
   test('missing installed headless source fails explicitly before the CLI can spawn', () => {
     const f = fixture();
     try {

@@ -1245,7 +1245,9 @@ export async function runFreeShard(
     : { command: process.execPath, args: buildShardArgs(files, { parallel: options.parallel, rootDir }) };
 
   const env = { ...(options.env ?? process.env) };
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-free-shard-'));
+  // macOS exposes /tmp and /var as symlinked aliases. Pass children the
+  // physical directory so path-containment checks compare one identity.
+  const stateDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-free-shard-')));
   const childTmp = path.join(stateDir, 'tmp');
   fs.mkdirSync(childTmp);
   env.TMPDIR = childTmp;
