@@ -366,6 +366,7 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
   let streamError: Error | undefined;
   let processError: Error | undefined;
   let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  let cancelCloseTimer: ReturnType<typeof setTimeout> | undefined;
   let drainDeadline = Infinity;
   let releaseDrain!: () => void;
   const forcedDrain = new Promise<void>(resolve => { releaseDrain = resolve; });
@@ -422,13 +423,23 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
     // (observed: a 600s timeout stretching past 1400s while an orphan held
     // the pipes open).
     killProcessGroup(proc, 'SIGKILL');
-    // Belt and braces with the group kill: even if an orphan survives (EPERM
-    // fallback path), cancel() unblocks the read loop below.
-    closePipes();
+    // Give already-buffered stdout/exit events one short delivery window before
+    // closing the pipes. Immediate close discarded valid evidence; waiting only
+    // for the full drain allowance made broken/orphaned streams needlessly slow.
+    clearTimeout(cancelCloseTimer);
+    cancelCloseTimer = setTimeout(closePipes, 50);
+    // expireDrain() remains the fail-closed escape hatch for surviving orphans.
     armDrain();
   };
   const onAbort = () => killRun(false);
   const onExit = (code: number | null, exitSignal: NodeJS.Signals | null) => {
+    // A concrete exit code means the process completed independently before
+    // our kill won, even if its exit callback was delivered after cancellation.
+    // Preserve that stronger evidence instead of misclassifying it as timeout.
+    if (code !== null && timedOut) {
+      timedOut = false;
+      timedOutInStartup = false;
+    }
     exitCode = code ?? (exitSignal ? 128 + (os.constants.signals[exitSignal] ?? 0) : 1);
     clearTimeout(phaseTimer);
     armDrain();
@@ -502,6 +513,10 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
             // the startup timer live for the whole run (claude adversarial).
             workPhaseArmed = true;
             firstResponseMs = Date.now() - startTime;
+            // The first byte may have been buffered before cancellation but
+            // delivered after its timer callback. It still proves startup
+            // completed, so classify the cancellation as a work timeout.
+            if (timedOut) timedOutInStartup = false;
             // First byte: startup phase over — arm the work phase for the
             // REMAINING budget (total wall stays <= timeout).
             armWorkPhase(firstResponseMs);
@@ -577,6 +592,7 @@ Before source Reads and after each saved checkpoint, use Bash to run exactly \`d
   } finally {
     clearTimeout(phaseTimer);
     clearTimeout(drainTimer);
+    clearTimeout(cancelCloseTimer);
     signal?.removeEventListener('abort', onAbort);
     killProcessGroup(proc, 'SIGKILL');
     closePipes();

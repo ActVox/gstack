@@ -246,6 +246,14 @@ function running(pid: number): boolean {
   return state.length > 0 && !state.startsWith('Z');
 }
 
+async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  expect(predicate()).toBe(true);
+}
+
 const successLine = JSON.stringify({ type: 'result', subtype: 'success', result: 'captured output', num_turns: 2, total_cost_usd: 0.12 });
 
 describe('Office Hours real session runner with fake processes', () => {
@@ -285,17 +293,17 @@ describe('Office Hours real session runner with fake processes', () => {
   test('abort kills the group, preserves captured usage, and cannot turn a success line into a pass', async () => {
     await withProcessFixture(`echo '${successLine}'\nsleep 60 &\necho $! > "$FIXTURE_DIR/child.pid"\nwait`, async (dir, env) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 200);
-      try {
-        const captured = await runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
-        expect(captured.exitReason).toBe('timeout');
-        expect(captured.output).toBe('captured output');
-        expect(captured.costEstimate.estimatedCost).toBe(0.12);
-        expect(captured.duration).toBeLessThan(5_000);
-        for (const file of ['parent.pid', 'child.pid']) {
-          expect(running(Number(fs.readFileSync(path.join(dir, file), 'utf8')))).toBe(false);
-        }
-      } finally { clearTimeout(timer); }
+      const pending = runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+      await waitUntil(() => fs.existsSync(path.join(dir, 'child.pid')));
+      controller.abort();
+      const captured = await pending;
+      expect(captured.exitReason).toBe('timeout');
+      expect(captured.output).toBe('captured output');
+      expect(captured.costEstimate.estimatedCost).toBe(0.12);
+      expect(captured.duration).toBeLessThan(5_000);
+      for (const file of ['parent.pid', 'child.pid']) {
+        expect(running(Number(fs.readFileSync(path.join(dir, file), 'utf8')))).toBe(false);
+      }
     });
   }, 10_000);
 
@@ -317,12 +325,36 @@ describe('Office Hours real session runner with fake processes', () => {
   test('abort during a failed process drain preserves the independently observed exit', async () => {
     await withProcessFixture(`echo '${successLine}'\nsleep 60 &\necho $! > "$FIXTURE_DIR/child.pid"\nexit 7`, async (dir, env) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 200);
-      try {
-        const captured = await runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
-        expect(captured.exitReason).toBe('exit_code_7');
-        expect(captured.duration).toBeLessThan(2_000);
-      } finally { clearTimeout(timer); }
+      const pending = runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+      await waitUntil(() => {
+        const pidFile = path.join(dir, 'parent.pid');
+        return fs.existsSync(pidFile) && !running(Number(fs.readFileSync(pidFile, 'utf8')));
+      });
+      controller.abort();
+      const captured = await pending;
+      expect(captured.exitReason).toBe('exit_code_7');
+      expect(captured.duration).toBeLessThan(2_000);
+    });
+  }, 10_000);
+
+  test('abort preserves buffered output and a completed exit when the event loop has not delivered either event yet', async () => {
+    await withProcessFixture(`echo '${successLine}'\ntouch "$FIXTURE_DIR/completed"\nexit 7`, async (dir, env) => {
+      const controller = new AbortController();
+      const pending = runSkillTest({ prompt: 'fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+      // Wait synchronously until the child has written and exited, preventing Bun
+      // from dispatching its stdout/exit callbacks before cancellation.
+      const completed = path.join(dir, 'completed');
+      const waitDeadline = Date.now() + 2_000;
+      while (!fs.existsSync(completed) && Date.now() < waitDeadline) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+      expect(fs.existsSync(completed)).toBe(true);
+      controller.abort();
+      const captured = await pending;
+      expect(captured.exitReason).toBe('exit_code_7');
+      expect(captured.output).toBe('captured output');
+      expect(captured.costEstimate.estimatedCost).toBe(0.12);
+      expect(captured.duration).toBeLessThan(2_000);
     });
   }, 10_000);
 
@@ -532,16 +564,23 @@ describe('session runner native CLI max-turns exit semantics', () => {
   test('abort during a max-turn exit 1 drain retains the process failure', async () => {
     await withProcessFixture(`echo '${maxTurnsLine}'\nsleep 60 &\necho $! > "$FIXTURE_DIR/child.pid"\nexit 1`, async (dir, env) => {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 200);
-      try {
-        const captured = await runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
-        expect(captured.exitReason).toBe('exit_code_1');
-      } finally { clearTimeout(timer); }
+      const pending = runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+      await waitUntil(() => {
+        const pidFile = path.join(dir, 'parent.pid');
+        return fs.existsSync(pidFile) && !running(Number(fs.readFileSync(pidFile, 'utf8')));
+      });
+      controller.abort();
+      const captured = await pending;
+      expect(captured.exitReason).toBe('exit_code_1');
     });
   });
   test('a timeout cannot be overwritten by a max-turn result line', async () => {
-    await withProcessFixture(`echo '${maxTurnsLine}'\nexec sleep 60`, async (dir, env) => {
-      const captured = await runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 200, env });
+    await withProcessFixture(`echo '${maxTurnsLine}'\ntouch "$FIXTURE_DIR/ready"\nexec sleep 60`, async (dir, env) => {
+      const controller = new AbortController();
+      const pending = runSkillTest({ prompt: 'free fixture', workingDirectory: dir, timeout: 30_000, env, signal: controller.signal });
+      await waitUntil(() => fs.existsSync(path.join(dir, 'ready')));
+      controller.abort();
+      const captured = await pending;
       expect(captured.exitReason).toBe('timeout');
     });
   });
