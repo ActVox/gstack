@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   discoverTemplates,
+  includesSkill,
   isSkillGeneratedForHost,
 } from '../scripts/discover-skills';
 import { getHostConfig } from '../hosts/index';
@@ -15,6 +16,10 @@ describe('host-specific source generation coverage', () => {
     expect(isSkillGeneratedForHost('alpha', generation)).toBe(true);
     expect(isSkillGeneratedForHost('beta', generation)).toBe(false);
     expect(isSkillGeneratedForHost('gamma', generation)).toBe(false);
+    const host = { generation } as ReturnType<typeof getHostConfig>;
+    expect(includesSkill(host, 'alpha')).toBe(true);
+    expect(includesSkill(host, 'beta')).toBe(false);
+    expect(includesSkill(host, 'gamma')).toBe(false);
   });
 
   test('Claude health coverage excludes host-skipped templates', () => {
