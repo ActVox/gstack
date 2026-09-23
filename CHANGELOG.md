@@ -8,6 +8,56 @@
 - Kept the CI container on Ubuntu's standard package sources because GitHub-hosted runners cannot reach the upstream Hetzner mirror.
 - Added retry handling plus persistent flake-ledger artifact upload to the required free-test lane.
 
+## [1.88.1.0] - 2026-09-22
+
+Credential masking follows the exact detected source, and pre-push scans follow the actual destination. Browser agents and CSO operations retain precise ownership, while settings updates and artifact reinitialization preserve user-owned data.
+
+### Fixed
+- Credential masking uses original spans mapped from normalized matches, so anchored assignments, repeated values, Unicode and entity input redact the flagged value without masking a later neighbor. Sanitizable CSO source stays readable as masked text; unmaskable payloads remain withheld.
+- Pre-push scans bind their ranges to the destination's name and effective URL, including separate push URLs. Missing advertised objects use a conservative range, SHA-256 repositories get the correct empty tree, and bounded slices retain normalized proximity context without fabricating line anchors or duplicate findings. Unscannable long lines or context windows still block explicitly.
+- Hermetic evaluation children reject credential-shaped variables admitted through broad CI prefixes, while preserving CI metadata, named provider authentication and explicit runner overrides.
+- Browser agents belong to the persistent daemon and an exact process generation. Replacement requires confirmed exit, failed startup retains uncertain children, and publication and shutdown share a lock so older generations cannot delete a successor's discoverability files. Repeated failed respawns are bounded. Uncertain ownership and abandoned publication locks require manual recovery rather than a process sweep.
+- CSO lease recovery preserves 64-bit filesystem identities and nanosecond timestamps instead of rounding them. Adjacent identities remain distinct, replaced files remain protected, and ambiguous legacy state is still refused.
+- Settings mutations, backups and rollback resolve the selected symlink target and share its canonical lock. Links, private file modes and unrelated settings survive; changed or invalid targets are refused.
+- Artifact reinitialization updates managed allowlist entries while retaining the user suffix byte-for-byte, including comments and a missing final newline. Ambiguous markers and failed reads or assembly leave the original allowlist intact.
+
+### Changed
+- Required native macOS checks cover agent lifecycle, concurrent shutdown and linked settings. The native Windows CSO suite exercises repeated commands and exact high-ID lease recovery on NTFS.
+
+## [1.87.6.0] - 2026-09-18
+
+**Review gates keep their proof.**
+**Coverage audits read the code first.**
+
+Plan reviews now keep decisions, report checks, and publication checks in order when permissions, stale choices, or host metadata writes fail. Coverage audits for `/review`, `/ship`, and plan reviews read concrete source and test files before drawing their diagrams, so gaps are tied to code paths instead of diff and config noise.
+
+Generation now validates every host and expected artifact, and Codex evaluation records retain failed execution and assertions. Plan reviews carry approved decisions through scope changes and save complete reports before declaring completion. CEO and engineering reviews save and verify each question before asking it; Autoplan reads and verifies the current plan, then publishes the parent phase report before advancing.
+
+### Fixed
+- PR evaluation plans keep a small changed-behavior profile and selected quality judges, while weekly and manual runs retain fresh broad coverage. Deferred checks remain visible. Verified workflow-judge passes can be reused within the same PR for 24 hours only when their complete inputs and runtime match.
+- Free tests use a refreshed timing inventory and balanced isolated CI runners. `test:quick` provides an explicit partial feedback run; the complete suite remains required. Collection fixtures wait for actual readiness instead of repeating fixed startup delays. Recovered retries retain their original failure logs. Windows fixtures handle native paths and give independent scenarios separate deadlines; prepared Git fixtures disable background maintenance before copying.
+- `/plan-ceo-review` and `/plan-eng-review` preserve scoped decisions, required save/read-back checks, and report publication before declaring completion or advancing to the next section.
+- Coverage audits read source and test files in a dedicated step before mapping `[OK]` and `[GAP]` rows, while keeping framework and config context separate.
+- `/plan-eng-review` clarifies setup gates, targeted audit timing, report ordering, and Outside Voice output surfaces without losing saved-question verification.
+- The plan-count timeout fixture closes stdin without forcing process exit before diagnostics can be captured.
+- Ship host golden files and parity size guards match the generated Codex, Factory, and plan-review outputs.
+- Skill generation awaits every artifact across all hosts. Freshness checks detect missing output, validate generated content, preserve files and directories during dry runs, and report generation errors instead of accepting partial output.
+- Codex evaluation records follow the runner result and assertions. Timeouts, failed validations, inherited output pipes, and interrupted attempts retain their actual outcomes, captured usage, and bounded cleanup.
+- Paid test supervision allows each file to finish its existing cases and configured retries. CI and detached-run limits cover the full schedule without increasing model work budgets.
+- `gstack-decision-log --help` explains the accepted payload and safe shell quoting without creating state.
+- Plan reviews preserve the selected mode and prior approvals, compare each option against independent changes, and verify complete reports before recording completion. Engineering reviews assign independent decisions before drafting options, then audit and save the complete question before presenting it. Accepted scope includes the full selected option and its conditions; conflicting wording requires a corrected question and another answer. DX reviews use the same onboarding milestone for benchmarks, targets, examples, and measurement, and carry required factual verification forward without unnecessary approval questions. Outside-review suggestions use explicit approval menus; a dependency conflict returns to the affected decision before the plan is declared ready.
+- `/plan-ceo-review` follows ordered phases and carries every existing approval through scope changes, including reviews with no new approach choice. It saves the complete question, option facts, and source references, then verifies the actual outgoing question against those saved fields and sends it unchanged. It applies file permissions consistently to plans, reports, tasks, and review metadata. When writes are forbidden, it carries complete review inputs in chat and labels them not persisted. A failed save stops completion. Unavailable reviewers and missing scores remain unavailable instead of inheriting a prior score.
+- Design skills save mockups, previews, and approved designs under the configured state directory, and later steps discover them there. CEO plan discovery also follows the configured state directory in design input detection and prior-plan context.
+- `/autoplan` loads each review's complete instructions, waits for asynchronous reviewers, and sends the current amended plan to spec reviewers. Each phase reloads its closing steps and verifies the full current plan before announcing completion; amendment checkpoints stay separate from reviewer inputs. Native review drivers acknowledge current questions and permissions promptly, reject stale frames and late completions, and recognize the offered manual handoff.
+- `/office-hours` preserves structured review evidence through completion, keeps supported handoff content when replacing review sections, and develops distinct builder ideas. `/setup-gbrain` handles fresh state, remote-only sharing declines, and interrupted attempts without leaking fixture state.
+- Terminal sessions drain output before reporting completion. Browser shutdown cleans up only the configured server instance. Pairing fixtures use checked ports and bounded cleanup. Deprecated-flag scans exclude workspace caches before searching and propagate command and filesystem failures.
+- CSO public reports redact repository roots regardless of their path, while private snapshots retain the identity needed for verification. CSO also rejects a remote Docker endpoint with the correct diagnostic even when Docker is not installed.
+
+### Changed
+- CEO, engineering and Autoplan instructions fit their existing prompt-size limits while retaining approval, saved-question verification and report-publication requirements. Engineering uses one section-loading step and one approval check, with explicit rules for independent choices and unchanged question payloads.
+- Review fixtures provide the application context and independent contracts their assertions require, declare supported editing and feedback interfaces, and verify existing rollback behavior. The DX count scenario covers a bounded onboarding decision checkpoint and defers independent roadmap work. Design evaluations submit real board feedback before acknowledging it and grant image reads only inside their owned artifact directory. Sol evaluations generate skills in private storage without replacing checkout caches. Native fixtures match complete permission text and offered handoff choices. Shared helper and source-template dependencies select the affected evaluations; overlay tests distinguish correctness from performance measurements.
+- Contributor instructions require focused reproductions and adjacent checks before paid evaluations, independent scheduling, launcher preflight with executed-case counts, reuse of passing checks with unchanged inputs, and one full free-suite acceptance run after the code is frozen. Recurring parser failures require checking the supported input class against the pinned runtime.
+
 ## [1.87.5.0] - 2026-09-17
 
 **Tests finish sooner without dropping checks.**

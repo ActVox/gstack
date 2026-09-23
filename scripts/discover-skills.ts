@@ -5,26 +5,15 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import type { HostConfig } from './host-config';
 
 const SKIP = new Set(['node_modules', '.git', 'dist']);
 
-export interface SkillGenerationFilter {
-  includeSkills?: readonly string[];
-  skipSkills?: readonly string[];
-}
-
-/** Keep generation and health checks on the same host-specific skill set. */
-export function isSkillGeneratedForHost(
-  skillDir: string,
-  generation: SkillGenerationFilter,
-): boolean {
-  if (generation.includeSkills?.length && !generation.includeSkills.includes(skillDir)) {
-    return false;
-  }
-  if (generation.skipSkills?.includes(skillDir)) {
-    return false;
-  }
-  return true;
+/** The generator and its coverage checks use the same include-minus-skip rule. */
+export function includesSkill(host: HostConfig, skillDir: string): boolean {
+  const { includeSkills, skipSkills } = host.generation;
+  return (!includeSkills?.length || includeSkills.includes(skillDir))
+    && !skipSkills?.includes(skillDir);
 }
 
 function subdirs(root: string): string[] {
