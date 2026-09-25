@@ -4605,7 +4605,7 @@ export async function runPlanSkillObservation(opts: {
     };
     // Entry deadline → boot → owned paste/receipt/ack → slash → observation.
     // Setup consumes the existing case budget; cleanup has its separate grace.
-    await Bun.sleep(Math.min(8000, Math.max(0, deadlineAt - Date.now())));
+    if (!opts.initialPlanContent) await Bun.sleep(Math.min(8000, Math.max(0, deadlineAt - Date.now())));
     if (opts.initialPlanContent) {
       const seed = `Keep this draft plan as context. Briefly acknowledge receipt, then wait for my next message containing a slash command. Do not start the review or call tools yet.\n\n${opts.initialPlanContent}`;
       try {
@@ -4834,7 +4834,7 @@ export const PLAN_SKILL_COUNT_FINALIZE_MS = 10_000;
  * dumps when an assertion fails.
  */
 export interface PlanSkillCountObservation {
-  /** Durable full raw/visible PTY output plus JSON observation, when EVALS_RUN_ID is set. */
+  /** Durable full raw/visible PTY output plus JSON observation, when EVALS_RUN_ID or GSTACK_EVAL_DIR is set. */
   artifactDir?: string;
   artifactError?: string;
   outcome:
@@ -5480,7 +5480,8 @@ export interface PlanSkillFloorObservation {
  * matcher still authenticates the pending question and native menu. */
 export function planFloorDXPane(visible: string, call: NativePlanQuestionCall): string | null {
   if (call.answered || call.failed || call.questions.length !== 1) return null;
-  const text = stripPtyResidue(visible).replace(/\r+\n?/g, '\n');
+  const text = stripPtyResidue(visible).replace(/\r+\n?/g, '\n')
+    .replace(/((?:^|\n)Enter\s+to\s+select\s*·\s*↑\/↓\s+to\s+navigate\s*·\s*)ctrl\+g\s+to\s+edit\s+in[ \t]+[^\s·\x00-\x1f\x7f][^·\x00-\x1f\x7f]*?\s*·\s*(Esc\s+to\s+cancel\s*)$/, '$1$2');
   const headers = [...text.matchAll(/(?:^|\n)[\t ]*[☐□][^\n]*\n/g)];
   const header = headers.at(-1);
   if (!header) return null;
@@ -5541,7 +5542,9 @@ export function planFloorDXReplyInput(visible: string, call: NativePlanQuestionC
   const first = lines.findIndex(line => /^  1\. /.test(line));
   if (first < 0) return null;
   lines[first] = lines[first]!.replace(/^  1\./, '❯ 1.');
-  const pane = planFloorDXPane(lines.join('\n'), call);
+  const pane = planFloorDXPane(lines.map(line => line.replace(
+    /^(Enter to select · ↑\/↓ to navigate · (?:n to add notes · )?)ctrl\+g to edit in [^\x00-\x1f\x7f·]+ · (Esc to cancel)$/,
+    '$1$2')).join('\n'), call);
   if (!pane || compact(pane) !== compact(state.pane)) return null;
   return state.stage === 'paste'
     ? { input: '\x1b[200~' + state.reply + '\x1b[201~', stage: 'submit' }

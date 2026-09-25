@@ -46,9 +46,40 @@ Autoplan resolves each review skill from its own installed host registry.
 existing xterm dependency interprets cursor moves and erases; old menus in the
 raw stream cannot establish a current prompt. Snapshots preserve
 `terminal.raw.log`, `terminal.visible.log`, and `terminal.screen.log` separately.
+Setting `EVALS_RUN_ID` or `GSTACK_EVAL_DIR` retains these snapshots; an output
+directory without a run ID gets a stable, unique local ID for that writer.
 Completed native transcript calls establish question counts and phase coverage.
 Report-aware count tests also require a fresh, complete report and native
 completion evidence before accepting a completion heading.
+
+The periodic first-question matrix uses `test/helpers/auq-native-capture.ts`
+to match the first public `PreToolUse` AskUserQuestion payload to its current
+native display. It grades that question's exact public fields without answering
+it or reading model transcripts. `question_captured` records
+`workflowCompleted: false`. With `GSTACK_EVAL_DIR`, `EVALS_RUN_ID`, or an explicit
+run ID, `native-auq/<run-id>/<test>-<suffix>/capture.json` under the eval directory
+retains the public payload, bounded current viewport, and capture outcome.
+CEO mode selection uses the actual SDK `AskUserQuestion` permission callback
+in `auq-sdk-capture.ts`, with the existing 12-turn and 240-second limits. It
+captures the public question and stops without submitting an answer; its
+`question_captured` outcome also records `workflowCompleted: false`. The retained
+capture survives fixture cleanup. Provider refusals and malformed questions
+remain failures. Section-loading captures retain their noninteractive contract.
+
+Shared-code revalidation fixtures pair public tool calls with their successful
+results to verify that the current trusted start record was inspected before
+completion. A discovered path in tool output counts; a path mentioned only in
+instructions or narration does not. Saved public captures cover absolute and
+relative paths and discovery followed by a read. The revalidation prompt supplies
+the path to the trusted start-record directory and declares the existing turn
+limit. It asks the agent to batch independent reads and retrieve the complete
+final record; every source, approval, persistence, and completion check still applies. The
+path-boundary fixtures use this same execution contract for symlinks, submodules,
+ignored files, index flags, and legacy or filtered evidence. Their skip actor
+accepts an explicit no-change choice; a preservation word inside an option that
+also approves changes cannot authorize edits. Captured native questions exercise
+the actual answer callback, and native turn-limit failures still fail even after
+a question was answered.
 
 The engineering and DX finding fixtures check coverage of their seeded issues
 rather than cap the total number of review questions. Each decision needs a
@@ -68,6 +99,14 @@ The periodic overlay fixtures use a versioned behavior gate with efficacy
 reported separately. See [Overlay benchmark contract v2](OVERLAY_BENCHMARK_CONTRACT.md)
 for exact correctness requirements, retired fanout cases, immutable evidence,
 and the limits of a passing result.
+
+## Coverage ownership
+
+[The test portfolio audit](TEST_PORTFOLIO.md) separates deterministic harness
+checks, prompt judges, live first-question captures, completed workflows and
+platform integrations. Shared setup is reusable; evidence with different
+scenario or independent-trial requirements is not. It records the preserved
+coverage and measured component savings from the test-speed refactor.
 
 ## Runners: how the suites execute (2026-08 overhaul)
 
@@ -122,7 +161,9 @@ load-sensitive on a busy dev box, runs only in CI or on explicit opt-in
 
 **Free suite (`bun run test:free`).** `scripts/test-free-shards.ts` runs N
 concurrent shard processes (serial within each) with strict-output
-classification per shard. Full-suite shards are packed by RECORDED PER-FILE
+classification per shard. Local defaults use the available CPU affinity,
+floored at one and capped at six; `GSTACK_FREE_JOBS` remains an explicit override.
+This does not change the separate CI machine count. Full-suite shards are packed by RECORDED PER-FILE
 DURATIONS (LPT, `packShardsByDuration`) when the committed seed
 `scripts/free-test-durations.json` exists — refresh it occasionally with
 `bun run test:free --record-durations` (each file timed in its own child;
@@ -159,8 +200,8 @@ board actor submits feedback before acknowledging it. The final proof uses
 the full native question, not the truncated diagnostic snippet, and proposal
 text mentioning "no UI scope" is not treated as an exit verdict. Unknown-command
 failures must name the invoked slash command; a child tool rejecting `--help`
-is not a skill registration failure. Periodic seeded-finding classifiers are
-unchanged.
+is not a skill registration failure. Periodic seeded-finding classifiers
+separately verify fixture-owned findings.
 
 **Paid suite (sharded runner, local AND CI).** `scripts/test-paid-shards.ts`
 is the single selection engine: 1 file per shard, `EVALS_JOBS` shard
