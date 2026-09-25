@@ -15,7 +15,7 @@ import { nativeCookieEnvironment, NATIVE_COOKIE_NODE_SCRIPT, superviseNativeCook
 import { decodeNativeCommandLine } from './fixtures/native-cookie-process-observer';
 import { createFixtureDeleteLease, FixtureDeleteError } from './fixtures/native-cookie-delete-lease';
 
-const root = mkdtempSync(path.join(tmpdir(), 'cookie-job-'));
+const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'cookie-job-')));
 const resolvedRoot = realpathSync(root);
 const initialRootState = lstatSync(root, { bigint: true });
 const fixtureChildren = new Set<ChildProcess>();

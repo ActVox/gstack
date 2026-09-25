@@ -42,6 +42,10 @@ function sourceReadTrace(result: any, fixture: SharedLibsFixture, sources: strin
   }
   if (!returned.length) return reads.join('\n');
   const repo = fs.realpathSync(fixture.repo);
+  const readResolvesTo = (read: string, resolved: string): boolean => {
+    try { return fs.realpathSync(path.resolve(repo, read)) === resolved; }
+    catch { return false; }
+  };
   for (const source of sources) {
     let resolved: string;
     try { resolved = fs.realpathSync(path.resolve(repo, source)); }
@@ -53,7 +57,7 @@ function sourceReadTrace(result: any, fixture: SharedLibsFixture, sources: strin
     if (!contents) continue;
     const spellings = [relative, resolved].map(value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
     const namedPath = new RegExp(`(?:^|[\\s"'=;])(?:\\./)?(?:${spellings.join('|')})(?=$|[\\s"';|)])`);
-    if (returned.some(({ tool, read, text }) => (tool === 'Read' ? path.resolve(repo, read) === resolved : namedPath.test(read))
+    if (returned.some(({ tool, read, text }) => (tool === 'Read' ? readResolvesTo(read, resolved) : namedPath.test(read))
       && text.includes(contents))) reads.push(source);
   }
   return reads.join('\n');

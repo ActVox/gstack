@@ -16,11 +16,12 @@ import { workflowJudgeDependencies } from './helpers/workflow-judge-cache';
 const ROOT = path.resolve(import.meta.dir, '..');
 
 function runnerDependencies(root: string, entries: string[]): string[] {
+  const canonicalRoot = fs.realpathSync(root);
   const seen = new Set<string>();
   const parser = new Bun.Transpiler({ loader: 'tsx' });
   const visit = (file: string) => {
     file = fs.realpathSync(file);
-    const relative = path.relative(root, file).split(path.sep).join('/');
+    const relative = path.relative(canonicalRoot, file).split(path.sep).join('/');
     if (relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('Dependency outside checkout');
     if (seen.has(relative)) return;
     seen.add(relative);
