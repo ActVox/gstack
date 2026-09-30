@@ -35,6 +35,12 @@ function collectPins(): Pin[] {
     const source = fs.readFileSync(path.join(WORKFLOWS_DIR, name), 'utf-8');
     const lines = source.split('\n');
     for (let i = 0; i < lines.length; i++) {
+      // Runtime seals must agree with setup-bun too; stale equality checks
+      // otherwise reject the correctly installed version before smoke runs.
+      const runtimeCheck = lines[i].match(/\btest\s+"\$\((?:bun|bunx)\s+--version\)"\s+=\s+["']?([\w.]+)["']?/);
+      if (runtimeCheck) {
+        pins.push({ surface: `${name}:${i + 1} (runtime check)`, version: runtimeCheck[1] });
+      }
       if (!/uses:\s*oven-sh\/setup-bun@/.test(lines[i])) continue;
       // A pinned stanza is `with:` + `bun-version: <v>` within the next few
       // lines; an unpinned setup-bun is itself drift (installs latest).
