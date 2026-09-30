@@ -27,8 +27,14 @@ function fixture() {
 
 test('the committed approval names precisely the historical reviewed request, not the current generated workflow', () => {
   const f = fixture();
+  const current = buildCookieWorkflowJudgeInput(ROOT);
   expect(buildCookieWorkflowJudgeInput(f.root).sha256).toBe(f.approval.prompt_sha256);
-  expect(buildCookieWorkflowJudgeInput(ROOT).sha256).not.toBe(f.approval.prompt_sha256);
+  expect(current.sha256).not.toBe(f.approval.prompt_sha256);
+  expect(current.prompt).toContain('bash "$tmpfile" "bun-v$BUN_VERSION"');
+  expect(f.entry.prompt).toContain('BUN_VERSION="1.3.10"');
+  expect(approvedCookieWorkflowSource(current.prompt)).toBe(f.entry.prompt!);
+  expect(approvedCookieWorkflowSource(f.entry.prompt!)).toBe(f.entry.prompt!);
+  expect(getCookieWorkflowManualReview(ROOT, { ...f.request, prompt: current.prompt }, f.refusal)).toBeNull();
   expect(manualReviewProblem(f.entry, ROOT)).toBe('Manual review does not match current source and approval');
   expect(f.approval.thresholds).toEqual(COOKIE_WORKFLOW_JUDGE.thresholds);
   expect(isManualReviewEntry(f.entry)).toBe(true);

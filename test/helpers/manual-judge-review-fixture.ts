@@ -14,14 +14,44 @@ const LATER_BROWSER_EDITS: Array<[string, string]> = [
   [' Opera and Opera GX are Windows-only and read from `%APPDATA%\\Opera Software\\Opera Stable` or `Opera GX Stable`, in `Default` or `Profile N` directories; legacy root-level layouts, Opera side profiles and portable or relocated installs are not detected. Opera has no native extraction, so its App-Bound cookies (if any) need manual sign-in.', ''],
 ];
 
+// Exact installer text in the historical approval. Fixture data only: never
+// execute it or substitute it into current workflow/approval admission.
+// The live generated docs now use the verified Bun 1.4.2 installer.
+const APPROVED_BUN_INSTALL = `   if ! command -v bun >/dev/null 2>&1; then
+     BUN_VERSION="1.3.10"
+     BUN_INSTALL_SHA="bab8acfb046aac8c72407bdcce903957665d655d7acaa3e11c7c4616beae68dd"
+     tmpfile=$(mktemp)
+     curl -fsSL "https://bun.sh/install" -o "$tmpfile"
+     # shasum is macOS/perl; coreutils-only Linux ships sha256sum instead —
+     # resolve whichever exists so the verify never fails on a missing tool.
+     if command -v sha256sum >/dev/null 2>&1; then
+       actual_sha=$(sha256sum "$tmpfile" | awk '{print $1}')
+     else
+       actual_sha=$(shasum -a 256 "$tmpfile" | awk '{print $1}')
+     fi
+     if [ "$actual_sha" != "$BUN_INSTALL_SHA" ]; then
+       echo "ERROR: bun install script checksum mismatch" >&2
+       echo "  expected: $BUN_INSTALL_SHA" >&2
+       echo "  got:      $actual_sha" >&2
+       rm "$tmpfile"; exit 1
+     fi
+     BUN_VERSION="$BUN_VERSION" bash "$tmpfile"
+     rm "$tmpfile"
+   fi`;
+
 export function approvedCookieWorkflowSource(source: string): string {
   let removedLines = 0;
+  let removedSkillLines = 0;
   let historical = source
-    .replace('sha256sum < "$tmpfile" | awk \'{print $(1)}\'', 'sha256sum "$tmpfile" | awk \'{print $1}\'')
-    .replace('shasum -a 256 < "$tmpfile" | awk \'{print $(1)}\'', 'shasum -a 256 "$tmpfile" | awk \'{print $1}\'')
+    .replace(/^   if ! command -v bun >\/dev\/null 2>&1; then\n[\s\S]*?^   fi$/m, block => {
+      removedSkillLines = block.split('\n').length - APPROVED_BUN_INSTALL.split('\n').length;
+      return APPROVED_BUN_INSTALL;
+    })
     .replace(LATER_BROWSER_BLOCK, block => { removedLines = block.split('\n').length - 1; return ''; });
   for (const [later, earlier] of LATER_BROWSER_EDITS) historical = historical.replace(later, earlier);
-  return historical.replace(/(--- BEGIN FILE "BROWSER\.md" \(lines \d+-)(\d+)(; section\) ---)/, (_, head, end, tail) => `${head}${Number(end) - removedLines}${tail}`);
+  return historical
+    .replace(/(--- BEGIN FILE "setup-browser-cookies\/SKILL\.md" \(lines \d+-)(\d+)(; entrypoint\) ---)/, (_, head, end, tail) => `${head}${Number(end) - removedSkillLines}${tail}`)
+    .replace(/(--- BEGIN FILE "BROWSER\.md" \(lines \d+-)(\d+)(; section\) ---)/, (_, head, end, tail) => `${head}${Number(end) - removedLines}${tail}`);
 }
 
 export function manualReviewFixture(root = resolve(import.meta.dir, '../..')): EvalTestEntry {
