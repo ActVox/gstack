@@ -87,6 +87,7 @@ export type { Model } from '../models';
 export interface TemplateContext {
   instructionProfile?: 'standard' | 'lean';
   runtimeRoot?: string;
+  /** Absolute document path with forward slashes on every platform. */
   sectionRoot?: string;
   skillName: string;
   tmplPath: string;

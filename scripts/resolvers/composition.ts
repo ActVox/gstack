@@ -96,8 +96,9 @@ export function generateAutoplanReviewFile(ctx: TemplateContext, args?: string[]
     return `\`methodologyPath\` from \`bun "<SNAPSHOT_TOOL>" methodology ${phase} "<REVIEW_SKILL>" "<RESTORE_PATH>"\``;
   }
   if (ctx.instructionProfile === 'lean' && ctx.sectionRoot) {
-    const registry = path.dirname(path.dirname(ctx.sectionRoot));
-    return `\`${path.join(registry, ctx.host === 'claude' ? skill : `gstack-${skill}`, 'SKILL.md')}\``;
+    const registry = path.posix.dirname(path.posix.dirname(ctx.sectionRoot));
+    // Preserve the double leading slash of a Windows network share.
+    return `\`${registry}/${ctx.host === 'claude' ? skill : `gstack-${skill}`}/SKILL.md\``;
   }
   if (ctx.host === 'claude') return `\`${ctx.paths.skillRoot}/${skill}/SKILL.md\``;
 

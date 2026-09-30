@@ -7,11 +7,27 @@ import * as path from 'path';
 
 import { prepareMethodology } from '../bin/gstack-autoplan-snapshot';
 import { runGeneration } from '../scripts/gen-skill-docs';
+import { generateAutoplanReviewFile } from '../scripts/resolvers/composition';
+import { HOST_PATHS } from '../scripts/resolvers/types';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 
 describe('optional lean instruction profile', () => {
+  test('review references preserve Windows drive and network registry roots', () => {
+    for (const registry of ['C:/Users/test/skills', '//server/share/skills']) {
+      for (const host of ['codex', 'claude'] as const) {
+        const skillName = host === 'claude' ? 'plan-ceo-review' : 'gstack-plan-ceo-review';
+        const reference = generateAutoplanReviewFile({
+          instructionProfile: 'lean', host, paths: HOST_PATHS[host],
+          skillName: 'autoplan', tmplPath: path.join(ROOT, 'autoplan/SKILL.md.tmpl'),
+          sectionRoot: `${registry}/${host === 'claude' ? 'autoplan' : 'gstack-autoplan'}/sections`,
+        }, ['plan-ceo-review']);
+        expect(reference).toBe(`\`${registry}/${skillName}/SKILL.md\``);
+      }
+    }
+  });
+
   for (const host of ['codex', 'claude']) {
     test(`${host}: isolated output keeps supporting sections usable`, () => {
       const out = fs.mkdtempSync(path.join(os.tmpdir(), `gstack-lean-${host}-`));
@@ -39,7 +55,10 @@ describe('optional lean instruction profile', () => {
         const links = [...ship.matchAll(/\]\(([^)]+\/sections\/[^)]+\.md)\)/g)].map(m => m[1]);
         expect(links.length).toBeGreaterThan(0);
         for (const link of links) {
-          expect(link.startsWith(out)).toBe(true);
+          expect(link).not.toContain('\\');
+          const relative = path.relative(out, link);
+          expect(path.isAbsolute(relative)).toBe(false);
+          expect(relative.split(path.sep)[0]).not.toBe('..');
           expect(fs.existsSync(link), link).toBe(true);
           expect(fs.readFileSync(link, 'utf8')).not.toMatch(/\{\{[A-Z_]+/);
         }
@@ -47,7 +66,7 @@ describe('optional lean instruction profile', () => {
         // to missing sidecar files or the source checkout's full instructions.
         const autoplan = fs.readFileSync(skill('autoplan'), 'utf8');
         for (const name of ['office-hours', 'plan-ceo-review', 'plan-eng-review']) {
-          expect(autoplan).toContain(skill(name));
+          expect(autoplan).toContain(skill(name).split(path.sep).join('/'));
           expect(fs.existsSync(skill(name))).toBe(true);
         }
         const restore = path.join(out, 'restore.md');

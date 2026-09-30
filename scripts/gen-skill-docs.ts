@@ -28,6 +28,10 @@ import type { HostConfig } from './host-config';
 const ROOT = path.resolve(import.meta.dir, '..');
 import { ALL_MODEL_NAMES, resolveModel, type Model } from './models';
 
+// References embedded in Markdown and Bash use forward slashes on Windows too.
+// Keep native paths for filesystem operations and physical isolation checks.
+const documentPath = (file: string): string => file.split(path.sep).join('/');
+
 type HostArg = Host | 'all';
 
 /** Internal render settings. Inputs always come from ROOT; output routing and
@@ -706,10 +710,10 @@ function buildContext(
   return {
     skillName, tmplPath, benefitsFrom, host, paths: HOST_PATHS[host],
     instructionProfile: options.instructionProfile,
-    runtimeRoot: ROOT,
-    sectionRoot: path.join(options.contentLinkRoot || options.outputRoot,
+    runtimeRoot: documentPath(ROOT),
+    sectionRoot: documentPath(path.join(options.contentLinkRoot || options.outputRoot,
       host === 'claude' ? path.relative(ROOT, path.dirname(tmplPath))
-        : externalSkillName(path.relative(ROOT, path.dirname(tmplPath)), skillName), 'sections'),
+        : externalSkillName(path.relative(ROOT, path.dirname(tmplPath)), skillName), 'sections')),
     preambleTier, model: options.model ?? getHostConfig(host).defaultModel, interactive, explainLevel: options.explainLevel,
   };
 }
@@ -779,19 +783,21 @@ function processExternalHost(
 function rewriteLeanPaths(content: string, host: Host, options: RenderOptions): string {
   if (options.instructionProfile !== 'lean') return content;
   const linkRoot = options.contentLinkRoot || options.outputRoot;
+  // Claude's section-base rewrite has already inserted this native root.
+  content = content.replaceAll(`${linkRoot}/`, `${documentPath(linkRoot)}/`);
   for (const tmpl of discoverTemplates(ROOT)) {
     const sourcePath = path.join(ROOT, tmpl.tmpl);
     const dir = path.dirname(tmpl.tmpl);
     if (dir === '.') continue;
     const name = extractNameAndDescription(fs.readFileSync(sourcePath, 'utf8')).name;
-    const outputDir = path.join(linkRoot, host === 'claude' ? dir : externalSkillName(dir, name));
-    for (const prefix of ['~/.claude/skills/gstack', '$GSTACK_ROOT', ROOT]) {
+    const outputDir = documentPath(path.join(linkRoot, host === 'claude' ? dir : externalSkillName(dir, name)));
+    for (const prefix of ['~/.claude/skills/gstack', '$GSTACK_ROOT', ROOT, documentPath(ROOT)]) {
       content = content.replaceAll(`${prefix}/${dir}/SKILL.md`, `${outputDir}/SKILL.md`);
       content = content.replaceAll(`${prefix}/${dir}/sections/`, `${outputDir}/sections/`);
     }
     content = content.replaceAll(`~/.claude/skills/${dir}/SKILL.md`, `${outputDir}/SKILL.md`);
   }
-  return content.replaceAll('~/.claude/skills/gstack/', `${ROOT}/`);
+  return content.replaceAll('~/.claude/skills/gstack/', `${documentPath(ROOT)}/`);
 }
 
 function processTemplate(tmplPath: string, host: Host, options: RenderOptions): { outputPath: string; content: string; symlinkLoop?: boolean; metadata?: { outputPath: string; content: string } } {
