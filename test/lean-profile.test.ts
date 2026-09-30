@@ -23,6 +23,9 @@ describe('optional lean instruction profile', () => {
         expect(hash(source)).toBe(before);
         const skill = (name: string) => path.join(out, host === 'codex' ? `gstack-${name}` : name, 'SKILL.md');
         const ship = fs.readFileSync(skill('ship'), 'utf8');
+        const pdf = fs.readFileSync(skill('make-pdf'), 'utf8');
+        expect(pdf).toContain('P=');
+        expect(pdf).toContain('MAKE_PDF_READY');
         expect(ship).not.toMatch(/\{\{[A-Z_]+/);
         const links = [...ship.matchAll(/\]\(([^)]+\/sections\/[^)]+\.md)\)/g)].map(m => m[1]);
         expect(links.length).toBeGreaterThan(0);

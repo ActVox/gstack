@@ -66,7 +66,11 @@ export { generateTestFailureTriage } from './preamble/generate-test-failure-tria
 // (`preamble-tier: N`). Every template that resolves {{PREAMBLE}} must
 // declare it — there is no default.
 export function generatePreamble(ctx: TemplateContext): string {
-  if (ctx.instructionProfile === 'lean') return generateLeanPreamble(ctx);
+  if (ctx.instructionProfile === 'lean') {
+    return [generateLeanPreamble(ctx),
+      ...(ctx.skillName === 'make-pdf' ? [generateMakePdfSetup(ctx)] : []),
+    ].join('\n\n');
+  }
   const tier = ctx.preambleTier;
   if (tier === undefined) {
     throw new Error(
