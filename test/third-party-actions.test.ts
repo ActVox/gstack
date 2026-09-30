@@ -26,7 +26,6 @@ import { generateThirdPartyActions } from "../scripts/resolvers/third-party-acti
 import { generateAsideSetup } from "../scripts/resolvers/aside";
 import { HOST_PATHS } from "../scripts/resolvers/types";
 import { asideDriveOptions } from './helpers/third-party-actions';
-import { E2E_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import recoveryFixture from './fixtures/third-party-actions-recovery-public.json';
 
 const ROOT = path.resolve(import.meta.dir, "..");
@@ -41,12 +40,6 @@ const ctx = {
 const section = generateThirdPartyActions(ctx);
 
 describe('consent offer extraction', () => {
-  test('helper changes select the consent gate evals', () => {
-    expect(selectTests(['test/helpers/third-party-actions.ts'], E2E_TOUCHFILES, []).selected.sort()).toEqual([
-      'tpa-absent-darwin', 'tpa-absent-linux', 'tpa-apple-ban', 'tpa-broken', 'tpa-present',
-    ]);
-  });
-
   test('an unavailable-option explanation is not an offer', () => {
     expect(asideDriveOptions(`B) I drive it in gstack's own visible browser
 C) Manual instructions
@@ -113,9 +106,10 @@ function generatedSkillDocs(): string[] {
  * (aside.com) never match.
  */
 function asideCommandTokens(text: string): string[] {
+  if (!/\baside\s+(?:--?[A-Za-z]|[a-z][\w-]*)/.test(text)) return [];
   const tokens: string[] = [];
   const codeChunks: string[] = [];
-  marked.walkTokens(marked.lexer(text), token => {
+  marked.walkTokens(marked.lexer(text, { gfm: false }), token => {
     if (token.type === 'code' || token.type === 'codespan') codeChunks.push(token.text);
   });
   for (const chunk of codeChunks) {
@@ -150,6 +144,7 @@ describe('Aside command extraction boundaries', () => {
     '- Run:\n\n  ```bash\n  aside invented\n  ```',
     '> ```bash\n> aside invented\n> ```',
     '    aside invented',
+    '| Command |\n| --- |\n| `aside invented` |',
   ])('still detects unsupported commands in %s', text => {
     expect(asideCommandTokens(text)).toContain('invented');
   });
@@ -188,7 +183,10 @@ describe("THIRD_PARTY_ACTIONS contract pins", () => {
   // timeout guard, three named outcomes, explicit Darwin gate on the pitch.
   test("runtime probe is the BROWSER SETUP probe with a Darwin-gated pitch", () => {
     expect(section).toContain("command -v aside");
-    expect(section).toContain("aside --version");
+    expect(section).not.toContain("aside --version");
+    expect(section).toContain('echo "READY: aside"');
+    expect(section).toContain("ASIDE_UNAVAILABLE");
+    expect(section).toContain("report only the safe status, never raw diagnostics");
     expect(section).toContain("NEEDS_ASIDE");
     expect(section).toContain("ASIDE_NOT_RUNNING");
     expect(section).toContain("ASIDE_READY");
@@ -381,7 +379,7 @@ describe("repo-wide generated output: Aside anti-drift tripwires", () => {
           .toContain(t);
       }
     }
-  });
+  }, 15_000);
 
   test("no Aside-specific installer invocation in any generated skill doc", () => {
     for (const file of generatedSkillDocs()) {

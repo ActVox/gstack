@@ -1,0 +1,61 @@
+---
+name: plan-ceo-review
+preamble-tier: 3
+interactive: true
+version: 1.0.0
+description: |
+  Review product direction and scope for a proposed feature or project.
+benefits-from: [office-hours]
+allowed-tools:
+  - Read
+  - Grep
+  - Glob
+  - Bash
+  - AskUserQuestion
+  - WebSearch
+triggers:
+  - think bigger
+  - expand scope
+  - strategy review
+  - rethink this plan
+gbrain:
+  schema: 1
+  context_queries:
+    - id: prior-ceo-plans
+      kind: filesystem
+      glob: "~/.gstack/projects/{repo_slug}/ceo-plans/*.md"
+      sort: mtime_desc
+      limit: 5
+      render_as: "## Prior CEO plans for this project"
+    - id: recent-design-docs
+      kind: filesystem
+      glob: "~/.gstack/projects/{repo_slug}/*-design-*.md"
+      sort: mtime_desc
+      limit: 3
+      render_as: "## Recent design docs for this project"
+    - id: recent-reviews
+      kind: list
+      filter:
+        type: timeline
+        tags_contains: "repo:{repo_slug}"
+        content_contains: "plan-ceo-review"
+      sort: updated_at_desc
+      limit: 5
+      render_as: "## Recent CEO review activity"
+---
+
+{{PREAMBLE}}
+
+# Product plan review
+
+Establish the proposal, intended outcome, constraints, and requested depth from the conversation and relevant project context. Read the specific files needed to resolve uncertainty. Ask only for missing decisions that materially affect the review; do not require an intake interview when the answer is already available.
+
+Use the requested expansion, selective expansion, hold-scope, or reduction mode. Default to evaluating the current scope. Present scope additions as options; do not silently enlarge the implementation.
+
+Assess user problem, observed demand, alternatives, differentiation, outcome metrics, scope, and failure modes. Focus on the risks and decisions that matter to this proposal. For each actionable issue, explain the consequence, recommend an option, and describe a verification or acceptance criterion. Avoid a fixed number of questions, findings, alternatives, or review rounds.
+
+For a detailed review of this domain, use the relevant portions of the supporting guidance: {{SECTION:review-sections}} Its exhaustive checklists are reference material; the current scope and unresolved decisions determine what needs examination.
+
+Produce a usable revised plan or prioritized findings with decisions, dependencies, acceptance criteria, and remaining uncertainties. If the user asked for a review, finish at that artifact. If implementation is also authorized, carry the accepted work through the requested endpoint without an artificial review pause. Do not publish the plan or create external issues unless that is within the request.
+
+{{SECTION_INDEX:plan-ceo-review}}

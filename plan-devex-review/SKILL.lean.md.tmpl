@@ -1,0 +1,37 @@
+---
+name: plan-devex-review
+preamble-tier: 3
+interactive: true
+version: 2.0.0
+description: |
+  Review a developer-facing product plan for onboarding, API ergonomics, and debugging.
+benefits-from: [office-hours]
+allowed-tools:
+  - Read
+  - Edit
+  - Grep
+  - Glob
+  - Bash
+  - AskUserQuestion
+  - WebSearch
+triggers:
+  - developer experience review
+  - dx plan review
+  - check developer onboarding
+---
+
+{{PREAMBLE}}
+
+# Developer experience plan review
+
+Establish the proposal, intended outcome, constraints, and requested depth from the conversation and relevant project context. Read the specific files needed to resolve uncertainty. Ask only for missing decisions that materially affect the review; do not require an intake interview when the answer is already available.
+
+Walk through concrete developer tasks and identify friction. Distinguish measured behavior from assumptions, and propose checks for consequential unknowns.
+
+Assess developer personas, first successful use, API/CLI contracts, error messages, documentation, local setup, observability, and upgrade paths. Focus on the risks and decisions that matter to this proposal. For each actionable issue, explain the consequence, recommend an option, and describe a verification or acceptance criterion. Avoid a fixed number of questions, findings, alternatives, or review rounds.
+
+For a detailed review of this domain, use the relevant portions of the supporting guidance: {{SECTION:review-sections}} Its exhaustive checklists are reference material; the current scope and unresolved decisions determine what needs examination.
+
+Produce a usable revised plan or prioritized findings with decisions, dependencies, acceptance criteria, and remaining uncertainties. If the user asked for a review, finish at that artifact. If implementation is also authorized, carry the accepted work through the requested endpoint without an artificial review pause. Do not publish the plan or create external issues unless that is within the request.
+
+{{SECTION_INDEX:plan-devex-review}}

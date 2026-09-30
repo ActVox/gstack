@@ -85,6 +85,9 @@ import type { Model } from '../models';
 export type { Model } from '../models';
 
 export interface TemplateContext {
+  instructionProfile?: 'standard' | 'lean';
+  runtimeRoot?: string;
+  sectionRoot?: string;
   skillName: string;
   tmplPath: string;
   benefitsFrom?: string[];

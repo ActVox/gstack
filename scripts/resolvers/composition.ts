@@ -95,6 +95,10 @@ export function generateAutoplanReviewFile(ctx: TemplateContext, args?: string[]
     const phase = skill === 'plan-devex-review' ? 'dx' : skill.split('-')[1]!;
     return `\`methodologyPath\` from \`bun "<SNAPSHOT_TOOL>" methodology ${phase} "<REVIEW_SKILL>" "<RESTORE_PATH>"\``;
   }
+  if (ctx.instructionProfile === 'lean' && ctx.sectionRoot) {
+    const registry = path.dirname(path.dirname(ctx.sectionRoot));
+    return `\`${path.join(registry, ctx.host === 'claude' ? skill : `gstack-${skill}`, 'SKILL.md')}\``;
+  }
   if (ctx.host === 'claude') return `\`${ctx.paths.skillRoot}/${skill}/SKILL.md\``;
 
   const host = getHostConfig(ctx.host);

@@ -1,0 +1,36 @@
+---
+name: review
+preamble-tier: 4
+version: 1.0.0
+description: |
+  Review a proposed diff for correctness, security, and release blockers.
+allowed-tools:
+  - Bash
+  - Read
+  - Edit
+  - Write
+  - Grep
+  - Glob
+  - Agent
+  - AskUserQuestion
+  - WebSearch
+triggers:
+  - review this pr
+  - code review
+  - check my diff
+  - pre-landing review
+---
+
+{{PREAMBLE}}
+
+# Diff review
+
+Establish the requested comparison (commit, branch, merge base, or working changes). Inspect the diff and the code needed to assess its effects. If the base is unclear and cannot be inferred safely, ask for it. Do not modify files when the request is review-only; proposed fixes belong in findings unless implementation is also authorized.
+
+Use [the review checklist](~/GitHub/gstack/review/checklist.md) for concrete SQL, security, LLM trust-boundary, and correctness checks. Follow changed data and control flow beyond the diff when needed to demonstrate a defect. Prioritize actionable bugs introduced by the change, with a realistic trigger and consequence; distinguish evidence from uncertainty. Avoid speculative findings and style churn.
+
+Run focused checks when they can confirm an issue. Reuse existing results when applicable. Browser evidence is relevant to changed app behavior, not every review. If a task-specific independent review is valuable, use available review capabilities within the user's scope; a fixed reviewer count is not required.
+
+For an existing PR with Greptile feedback, use [triage guidance](~/GitHub/gstack/review/greptile-triage.md). For frontend visual issues, consult [the design checklist](~/GitHub/gstack/review/design-checklist.md). Load these only when applicable. A read-only review does not authorize posting comments or resolving remote threads.
+
+Return findings ordered by severity with file/line pointers, the failing scenario, and a concise fix direction. State checks performed and any evidence gaps. If no actionable issue is found, say so without claiming that untested behavior is verified.
