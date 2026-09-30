@@ -151,6 +151,29 @@ function rewriteSectionBase(content: string, linkRoot: string | null): string {
   );
 }
 
+/** Resolve existing ancestors too, so a not-yet-created output cannot hide
+ * inside the source checkout through an install or parent-directory symlink. */
+function assertLeanOutputIsolation(outputPath: string, sourceRoot: string): void {
+  let ancestor = path.resolve(outputPath);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      fs.lstatSync(ancestor);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missing.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+  const physicalPath = path.join(fs.realpathSync(ancestor), ...missing);
+  if (physicalPath === sourceRoot || physicalPath.startsWith(`${sourceRoot}${path.sep}`)) {
+    throw new Error('--profile lean requires --out-dir outside the source checkout (including symlink targets)');
+  }
+}
+
 // HostPaths, HOST_PATHS, and TemplateContext imported from ./resolvers/types (line 7-8)
 // Design constants (AI_SLOP_BLACKLIST, OPENAI_HARD_REJECTIONS, OPENAI_LITMUS_CHECKS)
 // live in ./resolvers/constants and are consumed by resolvers directly.
@@ -928,8 +951,15 @@ function processSectionTemplate(
  * successful external host -----------------> normal only: prune retired caches
  */
 export async function runGeneration(settings: GenerationOptions = {}): Promise<GenerationResult> {
-  if (settings.instructionProfile === 'lean' && (!settings.outputRoot || path.resolve(settings.outputRoot) === ROOT)) {
-    throw new Error('--profile lean requires --out-dir to preserve the source checkout');
+  const leanSourceRoot = settings.instructionProfile === 'lean' ? fs.realpathSync(ROOT) : null;
+  if (leanSourceRoot) {
+    if (settings.host === 'all') {
+      throw new Error('--profile lean requires a single --host and a separate --out-dir for each host');
+    }
+    if (!settings.outputRoot) {
+      throw new Error('--profile lean requires --out-dir to preserve the source checkout');
+    }
+    assertLeanOutputIsolation(settings.outputRoot, leanSourceRoot);
   }
   const options: RenderOptions = {
     instructionProfile: settings.instructionProfile ?? 'standard',
@@ -952,6 +982,8 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
     const relativePath = rel(outputPath);
     artifacts.push({ relativePath, kind, ...(host ? { host } : {}) });
     try {
+      // A previously rendered output may contain links back into the source.
+      if (leanSourceRoot) assertLeanOutputIsolation(outputPath, leanSourceRoot);
       if (settings.dryRun) {
         let existing: string | undefined;
         try {

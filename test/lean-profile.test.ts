@@ -6,6 +6,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { prepareMethodology } from '../bin/gstack-autoplan-snapshot';
+import { runGeneration } from '../scripts/gen-skill-docs';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const hash = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -24,8 +25,16 @@ describe('optional lean instruction profile', () => {
         const skill = (name: string) => path.join(out, host === 'codex' ? `gstack-${name}` : name, 'SKILL.md');
         const ship = fs.readFileSync(skill('ship'), 'utf8');
         const pdf = fs.readFileSync(skill('make-pdf'), 'utf8');
-        expect(pdf).toContain('P=');
-        expect(pdf).toContain('MAKE_PDF_READY');
+        const pdfSetup = pdf.match(/## MAKE-PDF SETUP[^\n]*\n\n```bash\n([\s\S]*?)\n```/)?.[1];
+        expect(pdfSetup).toBeDefined();
+        const pdfBinary = path.join(out, 'fixture-pdf');
+        fs.writeFileSync(pdfBinary, '#!/bin/sh\nprintf "LEAN_PDF_CALLED:%s:%s\\n" "$1" "$2"\n', { mode: 0o755 });
+        const pdfRun = spawnSync('bash', ['-c', `${pdfSetup}\n"$P" generate fixture.md`], {
+          cwd: out, env: { ...process.env, MAKE_PDF_BIN: pdfBinary }, encoding: 'utf8', timeout: 10_000,
+        });
+        expect(pdfRun.status, pdfRun.stderr).toBe(0);
+        expect(pdfRun.stdout).toContain(`MAKE_PDF_READY: ${pdfBinary}`);
+        expect(pdfRun.stdout).toContain('LEAN_PDF_CALLED:generate:fixture.md');
         expect(ship).not.toMatch(/\{\{[A-Z_]+/);
         const links = [...ship.matchAll(/\]\(([^)]+\/sections\/[^)]+\.md)\)/g)].map(m => m[1]);
         expect(links.length).toBeGreaterThan(0);
@@ -64,5 +73,55 @@ describe('optional lean instruction profile', () => {
     expect(run.status).not.toBe(0);
     expect(run.stderr).toContain('requires --out-dir');
     expect(hash(source)).toBe(before);
+  });
+
+  test('lean rejects all-host generation before creating overlapping output', async () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-lean-all-'));
+    try {
+      const run = spawnSync('bun', ['run', 'scripts/gen-skill-docs.ts', '--host', 'all',
+        '--profile', 'lean', '--out-dir', out], { cwd: ROOT, encoding: 'utf8', timeout: 30_000 });
+      expect(run.status).not.toBe(0);
+      expect(run.stderr).toContain('requires a single --host');
+      await expect(runGeneration({ host: 'all', instructionProfile: 'lean', outputRoot: out }))
+        .rejects.toThrow('requires a single --host');
+      expect(fs.readdirSync(out)).toEqual([]);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  });
+
+  test('lean rejects source aliases and descendants before rendering', async () => {
+    const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-lean-alias-'));
+    const alias = path.join(temp, 'source');
+    const source = path.join(ROOT, 'ship/SKILL.md');
+    const before = hash(source);
+    try {
+      fs.symlinkSync(ROOT, alias, 'junction');
+      for (const outputRoot of [ROOT, path.join(ROOT, 'ship'), alias, path.join(alias, 'new-render', 'nested')]) {
+        // Dry-run makes this regression safe even if the guard is removed.
+        await expect(runGeneration({ host: 'claude', instructionProfile: 'lean', outputRoot, dryRun: true }))
+          .rejects.toThrow('outside the source checkout');
+      }
+      expect(hash(source)).toBe(before);
+      expect(fs.existsSync(path.join(ROOT, 'new-render'))).toBe(false);
+    } finally {
+      fs.rmSync(temp, { recursive: true, force: true });
+    }
+  });
+
+  test('lean rejects a source link within an otherwise isolated output', async () => {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-lean-linked-file-'));
+    const source = path.join(ROOT, 'ship/SKILL.md');
+    const before = hash(source);
+    try {
+      fs.symlinkSync(path.dirname(source), path.join(out, 'ship'), 'junction');
+      const result = await runGeneration({ host: 'claude', instructionProfile: 'lean', outputRoot: out, dryRun: true });
+      expect(result.exitCode).toBe(1);
+      expect(result.diagnostics.some(d => d.kind === 'error' && d.relativePath === 'ship/SKILL.md'
+        && d.message.includes('outside the source checkout'))).toBe(true);
+      expect(hash(source)).toBe(before);
+    } finally {
+      fs.rmSync(out, { recursive: true, force: true });
+    }
   });
 });
