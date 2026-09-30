@@ -1,5 +1,7 @@
 # Contributing to gstack
 
+For the ActVox fork release and cross-host workflow, follow [ActVox maintenance](docs/actvox-maintenance.md).
+
 Thanks for wanting to make gstack better. Whether you're fixing a typo in a skill prompt or building an entirely new workflow, this guide will get you up and running fast.
 
 ## Quick start
