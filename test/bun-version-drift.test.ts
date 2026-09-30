@@ -26,11 +26,21 @@ interface Pin {
 function collectPins(): Pin[] {
   const pins: Pin[] = [];
 
+  const mise = fs.readFileSync(path.join(ROOT, '.mise.toml'), 'utf-8');
+  const misePin = mise.match(/^bun\s*=\s*["']([\d.]+)["']/m);
+  pins.push({ surface: '.mise.toml', version: misePin?.[1] ?? '<no pinned Bun runtime>' });
+
   for (const name of fs.readdirSync(WORKFLOWS_DIR).sort()) {
     if (!/\.ya?ml$/.test(name)) continue;
     const source = fs.readFileSync(path.join(WORKFLOWS_DIR, name), 'utf-8');
     const lines = source.split('\n');
     for (let i = 0; i < lines.length; i++) {
+      // Runtime seals must agree with setup-bun too; stale equality checks
+      // otherwise reject the correctly installed version before smoke runs.
+      const runtimeCheck = lines[i].match(/\btest\s+"\$\((?:bun|bunx)\s+--version\)"\s+=\s+["']?([\w.]+)["']?/);
+      if (runtimeCheck) {
+        pins.push({ surface: `${name}:${i + 1} (runtime check)`, version: runtimeCheck[1] });
+      }
       if (!/uses:\s*oven-sh\/setup-bun@/.test(lines[i])) continue;
       // A pinned stanza is `with:` + `bun-version: <v>` within the next few
       // lines; an unpinned setup-bun is itself drift (installs latest).
@@ -57,6 +67,31 @@ function collectPins(): Pin[] {
     surface: '.gitlab-ci.yml',
     version: gitlabPin ? gitlabPin[1] : '<no BUN_VERSION>',
   });
+
+  for (const bootstrapPath of ['scripts/ubicloud/setup-free-suite.sh', 'setup', 'scripts/resolvers/browse.ts']) {
+    const bootstrap = fs.readFileSync(path.join(ROOT, bootstrapPath), 'utf-8');
+    const bootstrapPin = bootstrap.match(/^\s*BUN_VERSION=["']?([\d.]+)["']?$/m);
+    pins.push({ surface: bootstrapPath, version: bootstrapPin?.[1] ?? '<no BUN_VERSION>' });
+  }
+
+  // Native qualification must test the same runtime CI installs. These are
+  // input requirements only; changing a pin never grants qualification credit.
+  for (const [name, count] of [
+    ['.github/scripts/run-dia-native-qualification.ts', 2],
+    ['.github/scripts/qualify-dia-macos.ts', 3],
+    ['.github/scripts/dia-launch-driver.mjs', 3],
+    ['browse/test/cookie-import-native-qualification.ts', 1],
+  ] as const) {
+    const source = fs.readFileSync(path.join(ROOT, name), 'utf-8');
+    const checks = [...source.matchAll(/(?:\bBun\.version|\bprocess\.versions\.bun|\bplatform\?\.bun)\s*!==\s*'([\d.]+)'|\bruntime\s*===\s*'bun'\s*\?\s*'([\d.]+)'/g)];
+    if (checks.length !== count) {
+      pins.push({ surface: name, version: `<expected ${count} native runtime pins; found ${checks.length}>` });
+    }
+    for (const check of checks) {
+      const line = source.slice(0, check.index).split('\n').length;
+      pins.push({ surface: `${name}:${line}`, version: check[1] ?? check[2] });
+    }
+  }
 
   return pins;
 }

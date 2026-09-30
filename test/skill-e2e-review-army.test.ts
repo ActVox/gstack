@@ -14,9 +14,9 @@ import * as path from 'path';
 import * as os from 'os';
 
 const evalCollector = createEvalCollector('e2e-review-army');
-// Let consensus capture cleanup and assertions settle before Bun retries or
+// Let capture cleanup and assertions settle before Bun retries or
 // removes its shared fixture. This adds no model work time.
-const CONSENSUS_FINALIZE_MS = SESSION_DRAIN_GRACE_MS + 5_000;
+const CAPTURE_FINALIZE_MS = SESSION_DRAIN_GRACE_MS + 5_000;
 
 // Helper: create a git repo with a feature branch
 function setupRepo(prefix: string): { dir: string; run: (cmd: string, args: string[]) => void } {
@@ -146,6 +146,8 @@ Write your findings to ${dir}/review-output.md`,
 
 // --- Review Army: N+1 Performance ---
 
+let nPlusOneCaptureSequence = 0;
+
 describeIfSelected('Review Army: N+1 Performance', ['review-army-perf-n-plus-one'], () => {
   let dir: string;
 
@@ -181,21 +183,30 @@ Run Step 4 (Critical pass) then Step 4.5 (Review Army).
 The base branch is main. This is a Ruby backend file, so Performance specialist should activate.
 
 For the specialist dispatch, read review-specialists/performance.md and apply it against the diff.
+The Performance focus does not waive the skill's conditional Red Team dispatch. If a specialist
+produces a CRITICAL finding, dispatch a separate foreground Red Team subagent and merge its findings.
 
-Write your findings to ${dir}/review-output.md`,
+Write all required review outputs to ${dir}/review-output.md. After saving the report,
+finish with a brief acknowledgement rather than repeating the findings in the final response.`,
       workingDirectory: dir,
       maxTurns: 20,
       timeout: CAPTURE_MS,
       testName: 'review-army-perf-n-plus-one',
-      runId,
+      runId: `${process.env.EVALS_RUN_ID ?? runId}-review-n-plus-one-${process.pid}-${++nPlusOneCaptureSequence}`,
     });
 
     logCost('/review army n+1', result);
-    recordE2E(evalCollector, '/review army N+1 detection', 'Review Army', result);
-    expect(result.exitReason).toBe('success');
+    let passed = false;
+    try {
+      expect(result.exitReason).toBe('success');
+      expect(result.toolCalls.some(call =>
+        ['Agent', 'Task'].includes(call.tool)
+        && /\bred[ -]team\b/i.test(call.input.description ?? call.input.subagent_type ?? '')
+        && call.input.run_in_background === false,
+      )).toBe(true);
 
-    const outputPath = path.join(dir, 'review-output.md');
-    if (fs.existsSync(outputPath)) {
+      const outputPath = path.join(dir, 'review-output.md');
+      expect(fs.existsSync(outputPath)).toBe(true);
       const content = fs.readFileSync(outputPath, 'utf-8').toLowerCase();
       const hasN1Finding =
         content.includes('n+1') ||
@@ -206,8 +217,11 @@ Write your findings to ${dir}/review-output.md`,
         content.includes('query') ||
         content.includes('loop');
       expect(hasN1Finding).toBe(true);
+      passed = result.browseErrors.length === 0;
+    } finally {
+      recordE2E(evalCollector, '/review army N+1 detection', 'Review Army', result, { passed });
     }
-  }, CAPTURE_MS);
+  }, CAPTURE_MS + CAPTURE_FINALIZE_MS);
 });
 
 // --- Review Army: Delivery Audit ---
@@ -367,12 +381,13 @@ end
   afterAll(() => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch {} });
 
   testConcurrentIfSelected('review-army-quality-score', async () => {
+    for (const artifact of ['review-output.md', 'merged-review.json']) fs.rmSync(path.join(dir, artifact), { force: true });
     const before = ['user_controller.rb', 'number_parser.rb'].map(file => fs.readFileSync(path.join(dir, file), 'utf8'));
     const result = await runSkillTest({
       prompt: `Replay the completed specialist results in specialist-findings.jsonl through the actual Collect and merge instructions in review-merge.md. Read user_controller.rb and number_parser.rb to verify these findings against the source.
 This capture covers only the merge, classification, and scoring stage: do not dispatch additional reviewers, discover unrelated findings, or enter Fix-First. Do not edit application source.
 Write the standard merged findings report to ${dir}/review-output.md.
-Also write ${dir}/merged-review.json as one JSON object with findings (all final merged finding records, including optional advice), critical_count, informational_count, issues_found (defect count), and quality_score. Preserve each finding's final severity, category, and advisory classification in that artifact.`,
+Also write ${dir}/merged-review.json as one JSON object with findings (all final merged finding records, including optional advice), critical_count, informational_count, issues_found (defect count), and quality_score. Preserve each finding's final severity, category, and advisory classification in that artifact, and give each finding record a specialists array naming every specialist source that reported it (an array even when a single specialist did).`,
       workingDirectory: dir,
       maxTurns: 15,
       timeout: JUDGE_MS,
@@ -392,10 +407,12 @@ Also write ${dir}/merged-review.json as one JSON object with findings (all final
       expect(merged).toMatchObject({ critical_count: 1, informational_count: 0, issues_found: 1, quality_score: 8 });
       expect(merged.findings).toHaveLength(2);
       const defect = merged.findings.find((finding: any) => finding.category === 'injection');
-      expect(defect).toMatchObject({ severity: 'CRITICAL', specialist: 'security' });
+      expect(defect).toMatchObject({ severity: 'CRITICAL' });
+      expect(defect.specialists).toEqual(['security']);
       expect(defect.advisory).not.toBe(true);
       const advice = merged.findings.find((finding: any) => finding.category === 'stdlib-wrapper');
-      expect(advice).toMatchObject({ severity: 'INFORMATIONAL', advisory: true, specialist: 'simplification' });
+      expect(advice).toMatchObject({ severity: 'INFORMATIONAL', advisory: true });
+      expect(advice.specialists).toEqual(['simplification']);
       expect(content).toMatch(/SPECIALIST REVIEW:\s*1 findings?\s*\(1 critical, 0 informational\)/i);
       expect(content).toMatch(/PR Quality Score:\s*8(?:\.0)?\/10/i);
       expect(content).toContain('[ADVISORY]');
@@ -637,7 +654,7 @@ Write findings to ${dir}/review-output.md`,
       recordE2E(evalCollector, '/review army consensus', 'Review Army', result, { passed });
     }
     // The runner can drain stderr for 5s after exit; reserve 1s for assertions/recording.
-  }, CAPTURE_MS + CONSENSUS_FINALIZE_MS);
+  }, CAPTURE_MS + CAPTURE_FINALIZE_MS);
 });
 
 // --- Review Army: Simplification specialist (activation) ---

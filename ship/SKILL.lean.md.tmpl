@@ -1,0 +1,50 @@
+---
+name: ship
+preamble-tier: 4
+version: 1.0.0
+description: |
+  Prepare and carry out an authorized commit or release using repository conventions.
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - Agent
+  - AskUserQuestion
+  - WebSearch
+sensitive: true
+triggers:
+  - ship it
+  - create a pr
+  - push to main
+  - deploy this
+---
+
+{{PREAMBLE}}
+
+# Commit and release
+
+Determine the requested endpoint: local commit, pushed branch, PR, merge, deployment, or store submission. An explicit release request authorizes its necessary steps; a local commit request ends at a local commit. Infer established repository conventions from relevant instructions and configuration. Ask only if the target or authority remains materially ambiguous.
+
+Inspect branch, status, diff, and existing validation. Keep unrelated changes out of staging and the release. Follow the repository's version, changelog, generated-file, and branch policies when they apply. Do not stage every uncommitted file by default or switch a user's branch without a reason.
+
+Validate the affected behavior. Fix failures caused by the change and rerun affected checks. Expand to integration or browser stories when the change warrants it. Reuse valid evidence and record blockers; do not claim skipped checks passed.
+
+Use these optional procedures for the named need. Their upstream sequencing and examples do not expand this task's scope or require a full release ceremony for a local commit:
+
+- Test environment or failure triage: {{SECTION:tests}}
+- A material coverage gap: {{SECTION:test-coverage}}
+- A complex plan with uncertain completion: {{SECTION:plan-completion}}
+- Pre-landing risk that warrants specialists: {{SECTION:review-army}}
+- Existing Greptile feedback on this PR: {{SECTION:greptile}}
+- Release changelog required by this repo: {{SECTION:changelog}}
+- An authorized PR or MR: {{SECTION:pr-body}}
+- An explicitly requested Apple store/TestFlight release: {{SECTION:apple-release}}
+
+Review the final scoped diff and create the requested commit or release artifact. Before any remote action, use existing authorization; ask only for an action beyond it. Preserve literal multiline descriptions with a structured API or a body file.
+
+For an authorized deployment, continue through CI/deployment status and terminal production verification relevant to the change. A queued build or accepted deployment request is incomplete. Resolve failures within scope or report a concrete blocker.
+
+Report exact state: files changed, validation, commit/branch or PR link when created, whether pushed/merged/deployed, terminal evidence, and outstanding work. Save compact durable learnings when appropriate.

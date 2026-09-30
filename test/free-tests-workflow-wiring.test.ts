@@ -50,9 +50,10 @@ describe('free-tests workflow wiring', () => {
     expect(suite.needs).toBe('free-plan');
     expect(suite.strategy.matrix).toBe('${{ fromJSON(needs.free-plan.outputs.matrix) }}');
     expect(suite.strategy['fail-fast']).toBe(false);
-    // ActVox runs the upstream matrix on GitHub-hosted runners, not Ubicloud.
-    // Preserve all 20 receipts while serializing their smaller runner substrate.
-    expect(suite.strategy['max-parallel']).toBe(1);
+    // Independent GitHub-hosted VMs can run concurrently while each VM
+    // serializes its own tests and preserves every shard receipt.
+    expect(suite.strategy['max-parallel']).toBe(4);
+    expect(suite.steps.find((step: any) => step.name === 'Run free suite').env.GSTACK_FREE_JOBS).toBe('1');
     expect(suite.steps.find((step: any) => step.name === 'Run free suite').run).toContain('--ci-run');
     expect(suite.steps.find((step: any) => step.name === 'Upload strict shard result').if).toBe('always()');
     expect(aggregate.if).toBe('always()');
@@ -78,6 +79,8 @@ describe('free-tests workflow wiring', () => {
     const upload = steps.find((step: any) => step.with?.name === 'free-test-shard-logs-${{ matrix.shard }}');
     expect(probe.if).toBe('always()');
     expect(upload.if).toBe("failure() || steps.flake_spool.outputs.present == 'true'");
+    expect(upload.with.path).toBe('.context/free-test-logs/gstack-free-test-*.log');
+    expect(upload.with['include-hidden-files']).toBe(true);
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'free spool '));
     const output = path.join(directory, 'step-output');
     const ledger = path.join(directory, 'flake-ledger.jsonl');

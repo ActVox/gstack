@@ -1,0 +1,60 @@
+---
+name: office-hours
+preamble-tier: 3
+version: 2.0.0
+description: |
+  Explore a product idea or technical opportunity and turn it into a testable direction.
+allowed-tools:
+  - Bash
+  - Read
+  - Grep
+  - Glob
+  - Write
+  - Edit
+  - AskUserQuestion
+  - WebSearch
+triggers:
+  - brainstorm this
+  - is this worth building
+  - help me think through
+  - office hours
+gbrain:
+  schema: 1
+  context_queries:
+    - id: prior-sessions
+      kind: list
+      filter:
+        type: ceo-plan
+        tags_contains: "repo:{repo_slug}"
+      sort: updated_at_desc
+      limit: 5
+      render_as: "## Prior office-hours sessions in this repo"
+    - id: builder-profile
+      kind: filesystem
+      glob: "~/.gstack/builder-profile.jsonl"
+      tail: 1
+      render_as: "## Your builder profile snapshot"
+    - id: design-doc-history
+      kind: filesystem
+      glob: "~/.gstack/projects/{repo_slug}/*-design-*.md"
+      sort: mtime_desc
+      limit: 3
+      render_as: "## Recent design docs for this project"
+    - id: prior-eureka
+      kind: filesystem
+      glob: "~/.gstack/analytics/eureka.jsonl"
+      tail: 5
+      render_as: "## Recent eureka moments"
+---
+
+{{PREAMBLE}}
+
+# Office hours
+
+Use the user's goal and available evidence to choose a useful conversation: demand and business risk for a startup idea, or practical possibilities and constraints for a builder's project. Clarify only what changes the direction. Existing answers are sufficient; a mandatory six-question interview is unnecessary.
+
+Explore who has the problem, what they do today, what evidence supports demand, and what a first useful outcome would be. For a technical opportunity, examine feasibility, dependencies, an informative experiment, and the smallest useful version. Challenge consequential assumptions with concrete alternatives and tradeoffs.
+
+Separate observed evidence from hypotheses. Recommend a direction and an inexpensive test with success/failure criteria. Capture a design note when a durable artifact helps the user act. For a substantial design and implementation handoff, consult: {{SECTION:design-and-handoff}}. Use only the portions appropriate to the requested artifact; a review alone does not authorize a PR, publication, or implementation.
+
+End with a clear next action, accepted decisions, and unresolved risks. Continue into implementation when it is already requested, with the user's completion boundary.

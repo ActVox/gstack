@@ -41,7 +41,7 @@ Seeded planning sessions also receive an isolated runtime home through
 to the working tree under test. Explicit per-test home overrides remain intact.
 Autoplan resolves each review skill from its own installed host registry.
 
-**Interactive planning evidence.** Finding-count and autoplan-chain drivers use
+**Interactive planning evidence.** Native plan-review count drivers use
 `observeScreen: true` and await `currentScreen()` before choosing an input. The
 existing xterm dependency interprets cursor moves and erases; old menus in the
 raw stream cannot establish a current prompt. Snapshots preserve
@@ -127,6 +127,21 @@ on a Mac they drive Aside and on Linux CI they drive the built browse binary,
 skipping only when neither exists. The `$B`-driven E2E cases and `browse/test/`
 run on every platform as before, so Linux CI proves the fallback engine live.
 
+**Bootstrap dependency retention is opt-in qualification, not the behavior test.**
+`qa-bootstrap` still runs its original unpinned Vitest installation and assertions
+on macOS and Linux, including documented unsharded commands. Only a Linux paid
+shard runner issues the owned retention scope: it binds each actual fixture and
+native lifetime, retains locks, package manifests and the installed file/link
+inventory, and acknowledges capture before deleting the fixture. The outer
+runner also captures evidence when a callback is killed. Incomplete capture
+fails qualification and preserves the source fixture as well as partial evidence.
+Other platforms explicitly report retention as unavailable and still execute the
+native behavior test. A run without the runner-issued scope earns no retained
+dependency qualification credit; candidate acceptance requiring that evidence
+must use the Linux sharded path and verify every attempt's complete capture,
+acknowledgment and cleanup fallback. A passing unsharded or macOS behavior test
+does not substitute for that evidence.
+
 **The renderer picks the same way, so the render gates are engine-agnostic.**
 `/make-pdf`, `/diagram`, and design previews print and screenshot their local
 HTML through `lib/aside-render.ts` / `bin/gstack-render.ts`, which render in
@@ -161,23 +176,51 @@ load-sensitive on a busy dev box, runs only in CI or on explicit opt-in
 
 **Free suite (`bun run test:free`).** `scripts/test-free-shards.ts` runs N
 concurrent shard processes (serial within each) with strict-output
-classification per shard. Local defaults use the available CPU affinity,
-floored at one and capped at six; `GSTACK_FREE_JOBS` remains an explicit override.
+classification per shard. Local defaults use the available CPU affinity
+(which Bun also bounds by a container's cgroup CPU quota), floored at one and
+capped at 16 on Linux and six on macOS and Windows; `GSTACK_FREE_JOBS` remains
+an explicit override.
 This does not change the separate CI machine count. Full-suite shards are packed by RECORDED PER-FILE
 DURATIONS (LPT, `packShardsByDuration`) when the committed seed
-`scripts/free-test-durations.json` exists — refresh it occasionally with
-`bun run test:free --record-durations` (each file timed in its own child;
-CI never records). Missing seed → silent hash-shard fallback; corrupt seed →
-one warning + fallback; unknown files get 75th-percentile pessimism. Packed
+`scripts/free-test-durations.json` exists — refresh it with
+`bun run test:ubicloud --record-durations`, which times each file in its own
+child on a VM with the CI lane's environment and copies the seed back (CI never
+records; a seed recorded where browser or display tests skip underestimates
+them). Missing seed → silent hash-shard fallback; corrupt seed → one warning +
+fallback; unknown files get 75th-percentile pessimism, and both full-suite and
+`--ci-plan` runs name them on stderr so a new slow file cannot silently become
+the long pole. Packed
 shards get duration-aware walls (`max(base, predicted × 3, files × 5s)`). The
 legacy `--shards N --shard i` path keeps stable hash indices. Required CI uses
-one duration-packed `--ci-plan`, 20 isolated `--ci-run` machines, and a
-`--ci-verify` aggregate. `TREE_MUTATING` is EMPTY:
-`gen-skill-docs.ts` has a `main()` guard (imports never regenerate; pinned by
-`test/gen-skill-docs-import-purity.test.ts`) and `--out-dir` renders every
-host, so all former mutators render into mkdtemps and the trailing serial
-shard is gone. The map remains a mechanism — a test that genuinely must write
-shared artifacts in place earns a reasoned entry and is serialized again.
+one duration-packed `--ci-plan`, 20 ordinary `--ci-run` shards plus a separate
+exclusive-fixture shard, and a `--ci-verify` aggregate. CI shards still run on
+independent machines without ordering unrelated jobs. The public
+`TREE_MUTATING` map now classifies exclusive host-state fixtures; its sole
+entry is `test/bootstrap-retention.test.ts`, whose same-UID nondumpable actors
+affect host-wide procfs permission checks. Locally, this file runs only after
+all parallel shards settle, and cancellation prevents that final phase from
+starting. No selected files, retries, budgets, or receipt requirements are
+removed. Former generator mutators still render into private output directories;
+this serial phase protects process visibility, not in-place doc generation.
+
+Full child output is retained in private files under `.context/free-test-logs/`,
+outside each shard's temporary cleanup directory. The runner prints the path at
+launch and completion. Losing the log fails the run even when the child exits
+successfully. A redirected log directory is rejected before launching a child.
+On failure, read that log first: the recovery message distinguishes incomplete
+capture, unconfirmed cleanup, deadline expiry and a test/module failure. Fix the
+demonstrated cause before rerunning. A focused `bun test` command is offered only
+when every failure is attributable to existing selected files; it proves that
+repair, not completion of the original selection. Preserve failed attempts when
+sharing results, and inspect logs for private data before sharing them.
+
+Before publication, classify new deterministic regressions for quick feedback.
+Refresh the timing seed with the existing recorder on fixed inputs; do not edit
+source while tests run. Critical boundary controls belong in `QUICK_CORE` when
+their feedback cost is justified. Other measured files qualify at two seconds
+or less; slow and unmeasured files remain outside quick, not outside full tests.
+Report cold setup separately from warm execution, while retaining failed-attempt,
+retry and cleanup time in the total cost.
 
 **PTY fixture timing.** Plan-count sessions wake on terminal output or exit,
 with at least 250ms between expensive observations and a 2s fallback for
@@ -224,6 +267,21 @@ key must name a living paid test (`test/touchfiles.test.ts`'s reverse
 invariant), and `git show <sha>:path` fixtures are banned — vendor the bytes
 instead (`test/git-ref-fixture-tripwire.test.ts`).
 
+Functional QA and documentation acceptance require an explicit `EVALS_RUN_ID`;
+`GSTACK_EVAL_DIR` alone does not satisfy their evidence-ownership guard. For each
+local invocation, supply a fresh ID to the documented detached runner:
+
+```bash
+EVALS_RUN_ID="local-$(bun -e 'console.log(crypto.randomUUID())')" bun run eval:bg:pr
+```
+
+Neither package scripts nor `gstack-detach` invent this identity. CI's PR/manual
+slices, periodic slices and weekly gate census supply an ID bound to the workflow
+run, attempt, job and slice. Existing slice artifacts retain per-shard snapshots;
+separate always-run `native-captures-<EVALS_RUN_ID>` artifacts retain project/legacy
+`e2e-runs` and `evals/qa-callers` evidence for 90 days. These diagnostic artifacts
+are not collector results and do not establish that an unfinished test passed.
+
 **Fast PR profile and evidence reuse.** `test:pr` selects the changed cases in
 `scripts/test-pr-profile.ts` plus every changed quality judge. `--profile full`
 retains the broad census; no case IDs or tier assignments are removed. The plan
@@ -240,8 +298,9 @@ with matching before/after inputs. The audited workflow-judge adapter hashes the
 actual expanded prompt, source/fixture/rubric/runner closure, installed SDK,
 model parameters and runtime. Missing/unknown inputs force execution. Receipts
 are scoped to the same repository and PR, expire after 24 hours, and contain
-public scores and provenance rather than prompts or secrets. Only the 14 cases
-using `runWorkflowJudge` are eligible; the other 11 quality cases remain fresh.
+public scores and provenance rather than prompts or secrets. Of the 17 cases
+using `runWorkflowJudge`, 16 are eligible; the cookie workflow's custom input
+does not match the cache adapter and stays fresh, as do the other 11 quality cases.
 CI supplies the scoped cache/runtime configuration; local runs are fresh by
 default. Cached scores must
 pass current assertions; reused records retain their original source and time
@@ -256,7 +315,7 @@ serially. Plans and receipts bind the source revision, complete inventory and
 strict outcomes; missing, duplicate or mismatched receipts fail the required
 aggregate. The existing maximum five-file flaky retry allowance applies across
 the entire lane, not separately to every machine. Refresh the full timing list
-with `bun run test:free --record-durations`. Profiling records failures faithfully
+with `bun run test:ubicloud --record-durations`. Profiling records failures faithfully
 and is separate from final release acceptance.
 
 **CI planner/executor/report.** `--emit-plan <path> --slices K` computes
@@ -264,7 +323,13 @@ selection + the slice plan ONCE (killing per-slice selector divergence);
 `--plan <path> --slice i` executors consume the manifest and write
 slice-result artifacts; `--report <dir>` reconciles them FAIL-CLOSED (a slice
 whose artifact never landed, or a planned shard nobody reported, is a
-failure). Under `EVALS_ALL` the hollow-shard guard marks exit-0 shards with
+failure). Slices start from the supervision baseline (registered long files
+spread by budget, the rest round-robin), then are re-packed by the recorded
+wall times in `scripts/paid-test-durations.json`: a file moves or swaps out of
+the heaviest slice only if no slice's worst-case wall (`paidShardWallUpperBoundMs`
+for 1–4 workers) rises above the baseline's maximum, so CI timeout coverage is
+never weakened. Refresh the seed from a downloaded report directory with
+`--report <dir> --write-durations`. Under `EVALS_ALL` the hollow-shard guard marks exit-0 shards with
 ZERO executed tests `passed-empty` (a failure) — census-health, not just
 test runs. evals.yml runs the sliced gate lane per PR — the ONLY paid lane
 since the legacy 17-row matrix (22.6 min/$21 per PR serialized ahead of the
@@ -288,61 +353,59 @@ archaeology.
 `test/helpers/eval-budgets.ts` (JUDGE/CAPTURE/CAPTURE_LONG/PTY/PTY_LONG);
 `test/eval-budgets-policy.test.ts` pins that every tier fits the shard wall
 minus overhead and ratchets raw literals. Budget above the wall is fiction.
-The registered four-phase exception is `AUTOPLAN_CHAIN_BUDGET` for
-`test/skill-e2e-autoplan-chain.test.ts`: 80 minutes of work (four `PTY_LONG`
-allocations), an 84-minute session watchdog, an 85-minute Bun test deadline,
-and a 172-minute supervised shard wall. The unchanged retry count of one
-permits two 85-minute attempts plus two minutes for cleanup. This is a
-**specified allocation for the stronger four-phase contract**, not a measured
-calibration or statistical upper bound. The historical 900-second failures
-remain failures. Models, fixtures, phase assertions and production review
-caller timeouts are unchanged; this explicitly changes eval latency/cost policy.
+No paid test may exceed the ordinary tiers.
 
-The Autoplan chain explicitly enables native `PreToolUse` approval for edits to
-its owned temporary review artifacts. Approval starts with the `/autoplan`
-command and requires the exact parent session, prior successful file history,
-and a current request digest. Other recorder callers remain observational.
-A rejected artifact edit fails the test instead of falling through to terminal
-permission input. Approval itself supplies no edit success or phase credit:
-the native tool result and all four completed review phases are still required.
-
-`FINDING_RETRY_BUDGETS` also registers six finding files. Each retains its
-25-minute case deadline and one retry: the two-case CEO finding-count file has
-a 102-minute shard wall, and the five single-case files have 52-minute walls,
-including two minutes for cleanup. No per-case budget grows. Overlay wrappers
+`FINDING_RETRY_BUDGETS` also registers the CEO split-overflow and Eng
+multi-finding batching files. Each retains its 25-minute case deadline and one
+retry in a 52-minute shard wall, including two minutes for cleanup. No per-case budget grows. Overlay wrappers
 have a 1,830-second minimum shard wall and run without Bun retries; see the
 [overlay contract](OVERLAY_BENCHMARK_CONTRACT.md) for their unchanged work budget.
 
-The quality file reserves 6,400 seconds for all 25 cases and their existing
-retry, plus cleanup. Each still has 120 seconds of model work. Its 14 workflow
+The quality file reserves 7,180 seconds for all 28 cases and their existing
+retry, plus cleanup. Each still has 120 seconds of model work. Its 17 workflow
 judges own their deadline and abort signal, with five seconds for terminal
 recording inside a ten-second Bun grace; the other 11 retain their existing
 120-second Bun timeout. Late responses cannot create records or cache passes.
 
+The ship documentation file reserves 10,920 seconds for five 600-second cases and
+eight 300-second fault cases, each with one retry, plus cleanup. The standalone
+documentation child retains its 600-second case. The five review/ship explorer
+cases reserve 3,270 seconds including their existing retry and finalization grace.
+These are whole-file supervision limits, not additional model work per case.
+
+The shared-library path file reserves 3,720 seconds for its three serial
+600-second cases, each with one retry, plus 120 seconds for cleanup. Its
+registered budget keeps the file in its own shard and binds the expected wall
+to both the saved plan and the execution receipt; missing or stale budget
+records fail reconciliation. Case deadlines, model budgets and retries do not grow.
+
 `resolvePaidShardBudget(files, overrideMs?)` is the canonical per-job resolver.
-Autoplan, each registered finding file, and each overlay wrapper require their
+Each registered finding file and each overlay wrapper requires its
 own shard, even with `--files-per-shard` above one. Mixed or multi-file overlay
 jobs are rejected so ordinary files retain their configured retries. An explicit
 CLI `--timeout`, `EVALS_SHARD_TIMEOUT_MS`, or API `timeoutMs` still wins for these
 policies, including a lower cap; overlay overrides below their minimum are rejected.
 Planner entries and execution results record the effective wall,
 its source and policy identifier. Custom drivers must resolve each job instead
-of passing their ordinary 1800-second default as an explicit Autoplan cap;
+of passing their ordinary 1800-second default as an explicit cap;
 their outer controller/detach wall must also cover the allocated work and cleanup.
-`eval:bg:pr` and `eval:bg:periodic` have 72000/66000-second outer caps; the PR
+The current paid census has 105 files: 47 gate-tier and 71 periodic-tier.
+`eval:bg:pr` and `eval:bg:periodic` have 92820/67380-second outer caps; the PR
 wrapper covers a full-gate fallback at its default two workers. The broad gate
-wrapper reserves 33600 seconds, and release reserves 100000 seconds for both
+wrapper reserves 49320 seconds, and release reserves 116700 seconds for both
 tiers. Legacy monolithic
 `eval:bg`/`eval:bg:all` retain their shorter 5400/7200-second caps and do not
-promise two complete Autoplan attempts; use the sharded periodic path for this policy.
+promise every registered retry; use the sharded periodic path for this policy.
 
-Periodic CI plans `--slices 8 --autoplan-slice`: the eighth runs only Autoplan.
-When overlays are selected, the seventh is reserved for their serial wrappers;
-registered finding files are distributed across the remaining ordinary slices
-by their supervised walls. Each slice job has a 355-minute cap; Autoplan retains
-its 172-minute shard wall. Reconciliation rejects missing, duplicated or misplaced
+Periodic CI plans `--slices 7`. When overlays are selected, the seventh is
+reserved for their serial wrappers; registered finding files are distributed
+across the remaining ordinary slices by their supervised walls. Each slice job
+has a 360-minute cap. Reconciliation rejects missing, duplicated or misplaced
 registered work and absent budget records. The weekly gate census has a
-350-minute cap and PR slices have a 220-minute cap. Free supervision tests
+352-minute cap across seven single-worker slices with at most four running at
+once. Its longest current work wall is 272 minutes. PR slices retain seven
+two-worker slices with a 265-minute cap for their 212-minute work wall plus
+setup. Free supervision tests
 verify these bounds against the complete current census, configured retries,
 and setup reserve. Ordinary paid tiers and the default 1800-second
 shard wall remain unchanged; the registered and overlay policies above supply
@@ -388,6 +451,39 @@ against a temp `GSTACK_INSTALL_DIR` / `GSTACK_SKILLS_DIR`, and
 `freeze/bin/check-freeze.sh` with JSON payloads on stdin (including the
 `GSTACK_HOME` state-root parity against `bin/gstack-paths`).
 
+## Ubicloud VMs (`bun run test:ubicloud`)
+
+`bun run test:ubicloud [test:free args]` runs the free suite on an ephemeral
+Ubicloud VM instead of the local machine. It is the fast path from small dev
+boxes, containers, and cloud sandboxes, and the way to record the duration seed
+in the CI lane's environment. It needs `UBICLOUD_API_KEY` (a project token from
+the Ubicloud console) plus `bash`, `curl`, `python3`, `ssh`, `ssh-keygen`, and
+`tar` locally.
+
+`scripts/ubicloud/ubi-runner.sh` creates the VM (`UBI_SIZE`, default
+`standard-16`; `UBI_LOCATION`, default `eu-central-h1`) and streams the
+checkout to it: tracked files, untracked files that are not ignored, and
+`.git`, so uncommitted edits are tested. It then runs
+`scripts/ubicloud/setup-free-suite.sh`, which mirrors the `free-suite` CI job
+(same Bun pin, Playwright Chromium with its setuid sandbox helper, Xvfb,
+poppler, emoji fonts, generated host outputs, gate binaries, and the CSO
+helper), and runs `xvfb-run -a bun run test:free` with `GSTACK_EXPECT_BINARIES=1`
+and `GSTACK_FREE_RETRY_FLAKY=1`. Shard logs are copied to
+`.context/ubicloud/<timestamp>/`, and the VM is destroyed on every exit path.
+The exit status is the suite's.
+
+A stock Ubuntu 24.04 VM differs from a GitHub-hosted runner in three ways that
+the scripts correct: the login umask is `002` (group-writable directories fail
+the CSO private-state checks), AppArmor blocks the unprivileged user
+namespaces Chromium's sandbox needs, and `clang` and `python3-venv` are absent
+(required by the Dia readiness and Python runner tests).
+
+VMs are named `ubirun-<epoch>-<hex>`. Every new VM first destroys `ubirun-*`
+VMs older than `UBI_GC_HOURS` (default 12), so an interrupted client cannot
+leak one for long. For other commands, use the runner directly:
+`scripts/ubicloud/ubi-runner.sh run --setup <script> -- '<command>'`, or its
+`up` / `ssh` / `sync` / `pull` / `down` steps (`--help` lists them).
+
 ## Cloud sandboxes (Vercel / Conductor cloud workspaces)
 
 Syscall-supervised sandboxes need environment setup before `bun run test` can
@@ -408,7 +504,7 @@ Two runner knobs exist for these environments (both no-ops unless set):
 serial mega-shard and 6-way sharding both saturate the per-process syscall
 supervisor), and `GSTACK_FREE_RETRY_FLAKY=1` re-runs attributed failures once
 serially, downgrading a clean retry to a loud FLAKY-PASS (capped at 5 files so
-a broken tree can't masquerade as flaky). The required CI free lane sets the
-retry knob too, appending every flaky pass to the JSONL ledger it uploads
+a broken tree can't masquerade as flaky). The required CI free lane and the
+Windows lane set the retry knob too, appending every flaky pass to the JSONL ledger it uploads
 (`GSTACK_FLAKE_LEDGER`) — a flaky pass never reds the lane, but it never
 disappears either.

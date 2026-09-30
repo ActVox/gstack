@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { buildRunManifest, collectPaidTestFiles, type PaidRunManifest, type SliceResult } from '../scripts/test-paid-shards';
 import { STRICT_RETRY_CASE_BUDGETS } from './helpers/eval-budgets';
-import { manualReviewFixture } from './helpers/manual-judge-review-fixture';
+import { approvedCookieWorkflowSource, manualReviewFixture } from './helpers/manual-judge-review-fixture';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 type Step = { uses?: string; run?: string; if?: string; with?: Record<string, unknown> };
@@ -76,9 +76,16 @@ describe('paid CI coordination stays off the eval image', () => {
       expect(checkout.with?.['persist-credentials']).toBe(false);
       if (name === 'evals.yml') expect(checkout.with?.['fetch-depth']).toBe(0);
       const setup = planner.steps.find(step => step.uses?.startsWith('oven-sh/setup-bun@'))!;
-      expect(setup.with?.['bun-version']).toBe('1.4.0');
+      expect(setup.with?.['bun-version']).toBe('1.4.2');
       expect(JSON.stringify(planner)).not.toMatch(/secrets\.|restore-deps|bun install|bun run build/);
       expect(planner.steps.find(step => step.run?.includes('--emit-plan'))?.run).toContain('bun --no-install run');
+    });
+
+    test(`${name}: cancel-in-progress can stop every job (no job-level always())`, () => {
+      for (const [id, job] of Object.entries(jobs)) {
+        const condition = String((job as { if?: unknown }).if ?? '');
+        expect(`${id}: ${condition}`).not.toMatch(/(^|[^!])always\(\)/);
+      }
     });
 
     test(`${name}: executors still require both prerequisites and consume the image`, () => {
@@ -86,7 +93,7 @@ describe('paid CI coordination stays off the eval image', () => {
       expect(executor.needs).toEqual(['build-image', 'plan-slices']);
       expect(JSON.stringify(executor.container)).toContain('needs.build-image.outputs.image-tag');
       if (name === 'evals.yml') {
-        expect(executor.if).toBe("vars.ENABLE_PAID_EVALS == 'true' && always() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success'");
+        expect(executor.if).toBe("${{ vars.ENABLE_PAID_EVALS == 'true' && !cancelled() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success' }}");
       } else {
         expect(executor.if).toBe("vars.ENABLE_PAID_EVALS == 'true'");
       }
@@ -99,9 +106,7 @@ describe('paid CI coordination stays off the eval image', () => {
       expect(report.container).toBeUndefined();
       expect(report.needs).toContain('plan-slices');
       expect(report.needs).toContain('eval-slices');
-      expect(report.if).toBe(name === 'evals.yml'
-        ? "vars.ENABLE_PAID_EVALS == 'true' && always() && needs.plan-slices.result == 'success'"
-        : "always() && vars.ENABLE_PAID_EVALS == 'true' && needs.plan-slices.result == 'success'");
+      expect(report.if).toBe("${{ vars.ENABLE_PAID_EVALS == 'true' && !cancelled() && needs.plan-slices.result == 'success' }}");
       expect(JSON.stringify(report.steps)).not.toMatch(/restore-deps|bun install/);
       expect(report.steps.find(step => step.run?.includes('--report'))?.run).toContain('bun --no-install run');
       if (name === 'evals.yml') expect(report.permissions).toEqual({ contents: 'read' });
@@ -116,8 +121,17 @@ describe('paid CI coordination stays off the eval image', () => {
         '/home/runner/.cache/gstack-paid-shard-*.log',
         '/tmp/gstack-paid-shard-*.log',
       ]);
-      expect(Object.values(jobs).flatMap(job => job.steps).filter(step => step.with?.['include-hidden-files']))
-        .toEqual([logs]);
+      const hiddenUploads = Object.values(jobs).flatMap(job => job.steps).filter(step => step.with?.['include-hidden-files']);
+      const captures = hiddenUploads.filter(step => step.with?.name === 'native-captures-${{ env.EVALS_RUN_ID }}');
+      expect(captures).toHaveLength(name === 'evals.yml' ? 1 : 2);
+      for (const capture of captures) {
+        expect(capture.if).toBe('always()');
+        expect(String(capture.with?.path).trim().split('\n')).toEqual([
+          '~/.gstack/projects/*/e2e-runs', '~/.gstack/projects/*/evals/qa-callers',
+          '~/.gstack-dev/e2e-runs', '~/.gstack-dev/evals/qa-callers',
+        ]);
+      }
+      expect(hiddenUploads.filter(step => !captures.includes(step))).toEqual([logs]);
     });
   }
 
@@ -184,18 +198,14 @@ describe('dependency-free CI planner and report execution', () => {
   for (const tier of ['gate', 'periodic'] as const) {
     test(`${tier}: host planner preserves the complete manifest and report fails closed`, () => {
       const sliceCount = tier === 'gate' ? 6 : 7;
-      const dedicatedAutoplanSlice = tier === 'periodic';
       const reportDir = path.join(fixture, tier);
       const manifestPath = path.join(reportDir, 'manifest.json');
-      const planned = run([
-        '--emit-plan', manifestPath, '--slices', String(sliceCount),
-        ...(dedicatedAutoplanSlice ? ['--autoplan-slice'] : []),
-      ], tier);
+      const planned = run(['--emit-plan', manifestPath, '--slices', String(sliceCount)], tier);
       expect(planned.error).toBeUndefined();
       expect(planned.status, planned.stderr).toBe(0);
       const manifest: PaidRunManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
       expect(manifest).toEqual(buildRunManifest({
-        tier, sliceCount, dedicatedAutoplanSlice, evalsAll: true, env: { EVALS_ALL: '1' },
+        tier, sliceCount, evalsAll: true, env: { EVALS_ALL: '1' },
       }));
       expect(manifest.entries.filter(entry => entry.status === 'planned').length).toBeGreaterThan(0);
       expect(fs.existsSync(path.join(fixture, 'node_modules'))).toBe(false);
@@ -249,6 +259,11 @@ describe('dependency-free CI planner and report execution', () => {
   }
 
   test('report verifies every manual claim against current source, preserves attempts, and never masks a failed shard', () => {
+    const skillPath = path.join(fixture, 'setup-browser-cookies/SKILL.md');
+    const currentSkill = fs.readFileSync(skillPath, 'utf8');
+    fs.writeFileSync(skillPath, approvedCookieWorkflowSource(currentSkill));
+    const approvedBrowserPath = path.join(fixture, 'BROWSER.md');
+    fs.writeFileSync(approvedBrowserPath, approvedCookieWorkflowSource(fs.readFileSync(approvedBrowserPath, 'utf8')));
     const reportDir = path.join(fixture, 'manual-report');
     const manifestPath = path.join(reportDir, 'manifest.json');
     const planned = run(['--emit-plan', manifestPath, '--slices', '1'], 'gate');
@@ -265,7 +280,7 @@ describe('dependency-free CI planner and report execution', () => {
     const slicePath = path.join(reportDir, 'slice-1.json');
     const collectorPath = path.join(reportDir, 'judge-results.json');
     const summaryPath = path.join(reportDir, 'collector-outcomes.json');
-    const receipt = manualReviewFixture(ROOT);
+    const receipt = manualReviewFixture(fixture);
     const write = (tests: unknown[]) => fs.writeFileSync(collectorPath, JSON.stringify({
       total_tests: tests.length, tier: 'llm-judge', shard: 1, total_cost_usd: 0,
       tests, flaky_retries: [{ name: receipt.name, attempts: tests.length }],
@@ -313,6 +328,12 @@ describe('dependency-free CI planner and report execution', () => {
       manual_accepted: 1, attempts: 2, total: 2, flaky: 1 });
     expect(summary.files[0]).toMatchObject({ file: 'judge-results.json', total: 2, manual_accepted: 1, passed: 1 });
     expect(JSON.parse(fs.readFileSync(collectorPath, 'utf8')).tests[0]).toEqual(receipt);
+
+    fs.writeFileSync(skillPath, currentSkill);
+    const obsoleteApproval = run(['--report', reportDir], 'gate');
+    expect(obsoleteApproval.status).toBe(1);
+    expect(obsoleteApproval.stderr).toContain('does not match current source and approval');
+    fs.writeFileSync(skillPath, approvedCookieWorkflowSource(currentSkill));
 
     const browserPath = path.join(fixture, 'BROWSER.md');
     const browserSource = fs.readFileSync(browserPath, 'utf8');

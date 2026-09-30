@@ -77,10 +77,10 @@ jobs:
       # Registry cache export needs a docker-container builder — the default
       # `docker` driver hard-errors on cache-to (first live run of the trio).
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .github/docker
           file: .github/docker/Dockerfile.ci
@@ -135,13 +135,13 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
       - name: Emit run manifest
         if: github.event_name != 'workflow_dispatch' || inputs.validation_phase == 'all'
         env:
           EVALS_ALL: ${{ (github.event_name == 'workflow_dispatch' && inputs.evals_all) && '1' || '' }}
-        run: EVALS_TIER=gate bun --no-install run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/paid-plan/manifest.json --slices 6
+        run: EVALS_TIER=gate bun --no-install run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/paid-plan/manifest.json --slices 7
 
       - name: Emit validation-phase manifest
         if: github.event_name == 'workflow_dispatch' && inputs.validation_phase != 'all'
@@ -178,15 +178,20 @@ jobs:
   eval-slices:
     runs-on: ubuntu-latest
     needs: [build-image, plan-slices]
-    if: vars.ENABLE_PAID_EVALS == 'true' && always() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success'
+    env:
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-eval-slices-${{ matrix.slice }}
+    # !cancelled(), not always(): still runs when build-image was skipped
+    # (image already published), but a newer push's cancel-in-progress stops
+    # it instead of letting a superseded run finish its paid slices first.
+    if: ${{ vars.ENABLE_PAID_EVALS == 'true' && !cancelled() && needs.build-image.result == 'success' && needs.plan-slices.result == 'success' }}
     # Aggregate spawn-concurrency budget: 6 slices x EVALS_JOBS=2 x
     # EVALS_CONCURRENCY=2 = 24 concurrent tests lane-wide (the old matrix's
     # 40-way per row queued claude session STARTUP behind 39 siblings and ate
     # per-test budgets — the documented timeout-flake family). Tune with
     # parity data before raising.
-    # The complete gate census needs at most 201 minutes per slice; keep
+    # The complete gate census needs at most 242 minutes per slice; keep
     # 20 minutes for setup/upload without preempting configured retries.
-    timeout-minutes: 221
+    timeout-minutes: 265
     permissions:
       contents: read
       packages: read
@@ -198,8 +203,9 @@ jobs:
       options: --user runner
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix:
-        slice: [1, 2, 3, 4, 5, 6]
+        slice: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -248,7 +254,7 @@ jobs:
           key: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slice }}
           restore-keys: eval-input-v1-${{ github.repository_id }}-pr-${{ github.event.pull_request.number }}-
 
-      - name: Run slice ${{ matrix.slice }}/6
+      - name: Run slice ${{ matrix.slice }}/7
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -294,6 +300,20 @@ jobs:
           path: /tmp/paid-slice-results
           retention-days: 90
 
+      - name: Upload native capture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-captures-${{ env.EVALS_RUN_ID }}
+          include-hidden-files: true
+          path: |
+            ~/.gstack/projects/*/e2e-runs
+            ~/.gstack/projects/*/evals/qa-callers
+            ~/.gstack-dev/e2e-runs
+            ~/.gstack-dev/evals/qa-callers
+          if-no-files-found: ignore
+          retention-days: 90
+
       # The spooled per-shard full logs — a red weekly/PR lane three weeks
       # later needs more than a summary line.
       - name: Upload shard logs on failure
@@ -314,9 +334,10 @@ jobs:
   slices-report:
     runs-on: ubuntu-latest
     needs: [plan-slices, eval-slices]
-    # always(): the report must run (and FAIL) when an executor died — a
-    # missing slice artifact reading as green is the class this lane kills.
-    if: vars.ENABLE_PAID_EVALS == 'true' && always() && needs.plan-slices.result == 'success'
+    # !cancelled(): the report must run (and FAIL) when an executor died — a
+    # missing slice artifact reading as green is the class this lane kills —
+    # but a run superseded by a newer push stops here.
+    if: ${{ vars.ENABLE_PAID_EVALS == 'true' && !cancelled() && needs.plan-slices.result == 'success' }}
     timeout-minutes: 5
     # contents:read ONLY — this job executes the PR-authored reconcile
     # runner from the PR checkout, so it
@@ -337,7 +358,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -382,7 +403,7 @@ jobs:
   slices-comment:
     runs-on: ubuntu-latest
     needs: slices-report
-    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.slices-report.result != 'skipped'
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.slices-report.result != 'skipped' }}
     timeout-minutes: 5
     permissions:
       pull-requests: write

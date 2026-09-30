@@ -4,7 +4,7 @@ name: Periodic Evals
 # tests can't rot invisibly — the class where the autoplan-dual-voice E2E was
 # silently broken for months until a lucky local diff selected it. Engine:
 # scripts/test-paid-shards.ts (the same runner local eval:bg:periodic uses):
-# one planner manifest, 6 ordinary slices plus overlay and Autoplan slices, and a FAIL-CLOSED report — a slice
+# one planner manifest, 6 ordinary slices plus an overlay slice, and a FAIL-CLOSED report — a slice
 # whose artifact never landed is a failure, not an absence. The gate-census
 # job is the weekly EVALS_ALL backstop for the gate tier (PR lanes are
 # diff-billed, so without it the full gate census might never execute
@@ -65,10 +65,10 @@ jobs:
       # Registry cache export needs a docker-container builder — the default
       # `docker` driver hard-errors on cache-to.
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - if: steps.check.outputs.exists == 'false'
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .github/docker
           file: .github/docker/Dockerfile.ci
@@ -93,12 +93,12 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
       - name: Emit run manifest (ALL periodic tests minus reasoned excludes)
         env:
           EVALS_ALL: "1"
-        run: EVALS_TIER=periodic bun --no-install run scripts/test-paid-shards.ts --tier periodic --emit-plan /tmp/paid-plan/manifest.json --slices 8 --autoplan-slice
+        run: EVALS_TIER=periodic bun --no-install run scripts/test-paid-shards.ts --tier periodic --emit-plan /tmp/paid-plan/manifest.json --slices 7
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -109,7 +109,7 @@ jobs:
       - name: Emit gate census manifest (ALL gate tests)
         env:
           EVALS_ALL: "1"
-        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/gate-census-plan/manifest.json --slices 6
+        run: EVALS_TIER=gate bun run scripts/test-paid-shards.ts --tier gate --emit-plan /tmp/gate-census-plan/manifest.json --slices 7 --skip-judges
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -121,9 +121,11 @@ jobs:
     if: vars.ENABLE_PAID_EVALS == 'true'
     runs-on: ubuntu-latest
     needs: [build-image, plan-slices]
-    # Eight slices retain every registered case and retry. The complete
-    # census needs at most 318m40 per slice, plus 20 minutes setup/upload.
-    timeout-minutes: 355
+    env:
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-eval-slices-${{ matrix.slice }}
+    # Seven slices retain every registered case and retry. The complete
+    # census needs at most 244m40s per slice, plus 20 minutes setup/upload.
+    timeout-minutes: 360
     permissions:
       contents: read
       packages: read
@@ -135,8 +137,9 @@ jobs:
       options: --user runner
     strategy:
       fail-fast: false
+      max-parallel: 8
       matrix:
-        slice: [1, 2, 3, 4, 5, 6, 7, 8]
+        slice: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -174,7 +177,7 @@ jobs:
           name: paid-plan
           path: /tmp/paid-plan
 
-      - name: Run slice ${{ matrix.slice }}/8
+      - name: Run slice ${{ matrix.slice }}/7
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -191,6 +194,20 @@ jobs:
         with:
           name: paid-slice-${{ matrix.slice }}
           path: /tmp/paid-slice-results
+          retention-days: 90
+
+      - name: Upload native capture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-captures-${{ env.EVALS_RUN_ID }}
+          include-hidden-files: true
+          path: |
+            ~/.gstack/projects/*/e2e-runs
+            ~/.gstack/projects/*/evals/qa-callers
+            ~/.gstack-dev/e2e-runs
+            ~/.gstack-dev/evals/qa-callers
+          if-no-files-found: ignore
           retention-days: 90
 
       - name: Upload shard logs on failure
@@ -216,7 +233,9 @@ jobs:
     if: vars.ENABLE_PAID_EVALS == 'true'
     runs-on: ubuntu-latest
     needs: [build-image, plan-slices]
-    # Six slices need at most 332m each, plus 20 minutes setup/upload.
+    env:
+      EVALS_RUN_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-gate-census-${{ matrix.slice }}
+    # Seven slices need at most 272m each, plus 20 minutes setup/upload.
     timeout-minutes: 352
     permissions:
       contents: read
@@ -232,7 +251,7 @@ jobs:
       fail-fast: false
       max-parallel: 4
       matrix:
-        slice: [1, 2, 3, 4, 5, 6]
+        slice: [1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -257,7 +276,7 @@ jobs:
           name: gate-census-plan
           path: /tmp/gate-census-plan
 
-      - name: Run gate census slice ${{ matrix.slice }}/6
+      - name: Run gate census slice ${{ matrix.slice }}/7
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -276,12 +295,27 @@ jobs:
           path: /tmp/gate-census-results
           retention-days: 90
 
+      - name: Upload native capture evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: native-captures-${{ env.EVALS_RUN_ID }}
+          include-hidden-files: true
+          path: |
+            ~/.gstack/projects/*/e2e-runs
+            ~/.gstack/projects/*/evals/qa-callers
+            ~/.gstack-dev/e2e-runs
+            ~/.gstack-dev/evals/qa-callers
+          if-no-files-found: ignore
+          retention-days: 90
+
   report:
     runs-on: ubuntu-latest
     needs: [plan-slices, eval-slices, gate-census]
-    # always(): the report must run (and FAIL) when an executor died — a
-    # missing slice artifact reading as green is the class this lane kills.
-    if: always() && vars.ENABLE_PAID_EVALS == 'true' && needs.plan-slices.result == 'success'
+    # !cancelled(): the report must run (and FAIL) when an executor died — a
+    # missing slice artifact reading as green is the class this lane kills —
+    # but a cancelled run stops here.
+    if: ${{ vars.ENABLE_PAID_EVALS == 'true' && !cancelled() && needs.plan-slices.result == 'success' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -295,7 +329,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:

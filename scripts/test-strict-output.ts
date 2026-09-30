@@ -17,7 +17,7 @@ import * as path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const ANSI_ESCAPE = /\u001B\[[0-?]*[ -/]*[@-~]/g;
-const BUN_FAIL_RESULT = /^\(fail\) .+ \[(?:\d+(?:\.\d+)?)(?:ns|us|µs|ms|s)\]$/;
+const BUN_FAIL_RESULT = /^(?:\(fail\)|✗) (.+) \[(?:\d+(?:\.\d+)?)(?:ns|us|µs|ms|s)\]$/;
 const BUN_BETWEEN_TESTS_ERROR = '# Unhandled error between tests';
 const BUN_TERMINAL_SUMMARY = /^Ran (\d+) tests? across (\d+) files?\. \[(?:\d+(?:\.\d+)?)(?:ns|us|µs|ms|s)\]$/;
 // The counts block bun prints just before the terminal summary (" 1 pass",
@@ -29,6 +29,7 @@ const BUN_TERMINAL_SUMMARY = /^Ran (\d+) tests? across (\d+) files?\. \[(?:\d+(?
 // summary — see the last-summary-anchoring TODO in the audit).
 const BUN_SKIP_COUNT = /^\s*(\d+) skip$/;
 const BUN_PASS_COUNT = /^\s*(\d+) pass$/;
+const BUN_FAIL_COUNT = /^\s*(\d+) fail$/;
 
 export type BunTestOutputFinding = 'failed-test' | 'unhandled-between-tests';
 
@@ -206,9 +207,13 @@ export function stripAnsiLine(rawLine: string): string {
 
 export function classifyBunTestOutputLine(rawLine: string): BunTestOutputFinding | null {
   const line = stripAnsiLine(rawLine);
-  if (BUN_FAIL_RESULT.test(line)) return 'failed-test';
+  if (parseBunFailureResult(line) !== null) return 'failed-test';
   if (line === BUN_BETWEEN_TESTS_ERROR) return 'unhandled-between-tests';
   return null;
+}
+
+export function parseBunFailureResult(rawLine: string): string | null {
+  return BUN_FAIL_RESULT.exec(stripAnsiLine(rawLine))?.[1] ?? null;
 }
 
 export function parseBunTerminalSummaryLine(rawLine: string): number | null {
@@ -233,6 +238,30 @@ export function parseBunTerminalSummary(rawLine: string): { tests: number; files
  */
 export type ClassifierOrigin = 'stdout' | 'stderr';
 
+export class BunFailureSummaryParser {
+  private readonly pending: Partial<Record<ClassifierOrigin, { failures: number | null }>> = {};
+
+  consume(rawLine: string, origin: ClassifierOrigin): number | null {
+    const line = stripAnsiLine(rawLine);
+    if (BUN_PASS_COUNT.test(line)) {
+      this.pending[origin] = { failures: null };
+      return null;
+    }
+    const pending = this.pending[origin];
+    if (!pending) return null;
+    const fail = BUN_FAIL_COUNT.exec(line);
+    if (fail) {
+      pending.failures = Math.max(pending.failures ?? 0, Number.parseInt(fail[1], 10));
+      return null;
+    }
+    if (parseBunTerminalSummary(line) !== null) {
+      delete this.pending[origin];
+      return pending.failures;
+    }
+    return null;
+  }
+}
+
 export class BunTestOutputClassifier {
   private readonly decoders: Record<ClassifierOrigin, StringDecoder> = {
     stdout: new StringDecoder('utf8'),
@@ -240,6 +269,8 @@ export class BunTestOutputClassifier {
   };
   private pending: Record<ClassifierOrigin, string> = { stdout: '', stderr: '' };
   private failedTests = 0;
+  private reportedFailedTests = 0;
+  private readonly failureSummary = new BunFailureSummaryParser();
   private unhandledBetweenTests = 0;
   private terminalFileCounts: number[] = [];
   private terminalTestCounts: number[] = [];
@@ -256,7 +287,7 @@ export class BunTestOutputClassifier {
   end(): BunTestOutputSummary {
     for (const origin of ['stdout', 'stderr'] as const) {
       this.pending[origin] += this.decoders[origin].end();
-      if (this.pending[origin].length > 0) this.classify(this.pending[origin]);
+      if (this.pending[origin].length > 0) this.classify(this.pending[origin], origin);
       this.pending[origin] = '';
     }
     return this.summary();
@@ -264,7 +295,7 @@ export class BunTestOutputClassifier {
 
   summary(): BunTestOutputSummary {
     return {
-      failedTests: this.failedTests,
+      failedTests: Math.max(this.failedTests, this.reportedFailedTests),
       unhandledBetweenTests: this.unhandledBetweenTests,
       terminalFileCounts: [...this.terminalFileCounts],
       terminalTestCounts: [...this.terminalTestCounts],
@@ -276,13 +307,13 @@ export class BunTestOutputClassifier {
   private consumeCompleteLines(origin: ClassifierOrigin): void {
     let newline = this.pending[origin].indexOf('\n');
     while (newline !== -1) {
-      this.classify(this.pending[origin].slice(0, newline));
+      this.classify(this.pending[origin].slice(0, newline), origin);
       this.pending[origin] = this.pending[origin].slice(newline + 1);
       newline = this.pending[origin].indexOf('\n');
     }
   }
 
-  private classify(line: string): void {
+  private classify(line: string, origin: ClassifierOrigin): void {
     const finding = classifyBunTestOutputLine(line);
     if (finding === 'failed-test') this.failedTests += 1;
     if (finding === 'unhandled-between-tests') this.unhandledBetweenTests += 1;
@@ -291,6 +322,8 @@ export class BunTestOutputClassifier {
     if (skip !== null) this.skippedTests += Number.parseInt(skip[1], 10);
     const pass = BUN_PASS_COUNT.exec(stripped);
     if (pass !== null) this.passedTests += Number.parseInt(pass[1], 10);
+    const fail = this.failureSummary.consume(stripped, origin);
+    if (fail !== null) this.reportedFailedTests = Math.max(this.reportedFailedTests, fail);
     const terminal = parseBunTerminalSummary(line);
     if (terminal !== null) {
       this.terminalFileCounts.push(terminal.files);
@@ -356,22 +389,29 @@ export interface RunShardChildOptions {
   env: NodeJS.ProcessEnv;
   /** External wall-clock deadline; on expiry the child's process GROUP is SIGKILLed. */
   timeoutMs: number;
+  deadlineMs?: number;
   /**
    * Hook the freshly-spawned child's stdout/stderr. Stream POLICY (classifier
    * tees, log spooling, console forwarding, reporters) is entirely the
-   * caller's. Runs synchronously right after spawn; the returned promises are
-   * awaited AFTER the child closes, so trailing output is fully drained
-   * before the caller reads its classifier/reporter state.
+   * caller's. Runs synchronously right after spawn; child close and every
+   * returned promise must settle within the same deadline. A wall-expired
+   * return reports incomplete capture instead of treating the prefix as final.
    */
   hookStreams: (child: ChildProcess) => Array<Promise<void>>;
 }
 
 export interface ShardChildResult {
   exitCode: number | null;
-  /** True when the wall timer fired and SIGKILLed the group. */
+  /** True when the shared deadline expired; no further child work is allowed. */
   timedOut: boolean;
   /** The child's pid — the process-GROUP id on POSIX (detached spawn). */
   groupPid: number | null;
+  incompleteCapture?: {
+    childClosed: boolean;
+    pendingStreams: number;
+    failedStreams: number;
+    deadlineMs: number;
+  };
 }
 
 /**
@@ -385,7 +425,7 @@ export interface ShardChildResult {
  *   - arm an EXTERNAL wall-clock timer that SIGKILLs the group — a spinning
  *     child main thread never fires its own in-process timer,
  *   - in EVERY exit path: disarm the timer, detach the signal forwarder, and
- *     reap group survivors with SIGKILL.
+ *     signal group survivors with SIGKILL.
  *
  * Caller-side cleanup that must run even on a spawn failure (log streams,
  * reporters, temp dirs) belongs in the caller's own try/finally around this
@@ -393,6 +433,12 @@ export interface ShardChildResult {
  * preserving the runners' existing could-not-run handling.
  */
 export async function runShardChild(options: RunShardChildOptions): Promise<ShardChildResult> {
+  const deadlineMs = Math.min(options.deadlineMs ?? Infinity, Date.now() + options.timeoutMs);
+  if (!Number.isFinite(deadlineMs)) throw new Error('Shard deadline must be finite');
+  if (deadlineMs <= Date.now()) {
+    return { exitCode: null, timedOut: true, groupPid: null,
+      incompleteCapture: { childClosed: false, pendingStreams: 0, failedStreams: 0, deadlineMs } };
+  }
   const child = spawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env,
@@ -410,31 +456,73 @@ export async function runShardChild(options: RunShardChildOptions): Promise<Shar
   });
 
   let timedOut = false;
+  let childClosed = false;
+  let pendingStreams = 0;
+  let failedStreams = 0;
+  let exitCode: number | null = null;
+  let failed = false;
+  let firstError: unknown;
+  const rememberError = (error: unknown) => {
+    if (failed) return;
+    failed = true;
+    firstError = error;
+  };
+  const kill = () => {
+    try { killProcessGroup(child, 'SIGKILL'); }
+    catch (error) { rememberError(error); }
+  };
+  let close!: () => void;
+  const closed = new Promise<void>(resolve => { close = resolve; });
+  const onExit = (code: number | null) => { exitCode = code; };
+  const onClose = (code: number | null) => { exitCode = code; childClosed = true; close(); };
+  child.once('exit', onExit);
+  child.once('close', onClose);
+  child.on('error', rememberError);
+  let expire!: () => void;
+  const expired = new Promise<void>(resolve => { expire = resolve; });
   const killTimer = setTimeout(() => {
     timedOut = true;
-    killProcessGroup(child, 'SIGKILL');
-  }, options.timeoutMs);
+    kill();
+    expire();
+  }, Math.max(0, deadlineMs - Date.now()));
 
-  let exitCode: number | null = null;
   try {
-    const streams = options.hookStreams(child);
-    // Observe failures now; a pipe can reject before the child closes. Keep
-    // that first error until close so final process-group cleanup still runs.
-    const drainage = Promise.all(streams).then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    );
-    exitCode = await new Promise<number | null>((resolve, reject) => {
-      child.once('error', reject);
-      child.once('close', (code) => resolve(code));
-    });
-    const captured = await drainage;
-    if (!captured.ok) throw captured.error;
+    let streams: Array<Promise<void>> = [];
+    try { streams = options.hookStreams(child); }
+    catch (error) {
+      rememberError(error);
+      kill();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    }
+    pendingStreams = streams.length;
+    const drainage = Promise.all(streams.map(stream => Promise.resolve(stream).then(
+      () => { pendingStreams -= 1; },
+      (error: unknown) => { pendingStreams -= 1; failedStreams += 1; rememberError(error); },
+    )));
+    await Promise.race([Promise.all([closed, drainage]), expired]);
+    if (Date.now() >= deadlineMs) timedOut = true;
   } finally {
     clearTimeout(killTimer);
     forwarding.dispose();
-    // Reap survivors of this shard even on the clean path.
-    killProcessGroup(child, 'SIGKILL');
+    kill();
+    child.off('exit', onExit);
+    child.off('close', onClose);
+    if (!childClosed || pendingStreams > 0) {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.unref();
+    }
   }
-  return { exitCode, timedOut, groupPid };
+  const result: ShardChildResult = { exitCode, timedOut, groupPid };
+  if (!childClosed || pendingStreams > 0 || failedStreams > 0) {
+    result.incompleteCapture = { childClosed, pendingStreams, failedStreams, deadlineMs };
+  }
+  if (failed) {
+    if (firstError instanceof Error && Object.isExtensible(firstError)) {
+      Reflect.defineProperty(firstError, 'shardResult', { value: result, configurable: true });
+    }
+    throw firstError;
+  }
+  return result;
 }

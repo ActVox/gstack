@@ -19,7 +19,13 @@ import {
   applyHollowShardGuard,
   buildPaidShardArgs,
   buildRunManifest,
+  loadPaidTestDurations,
+  mergePaidTestDurations,
+  paidShardWallUpperBoundMs,
+  parseCliOptions,
   parseRunManifest,
+  resolvePaidShardBudget,
+  SUPERVISED_WORKER_COUNTS,
   retriesForFiles,
   RETRY_OVERRIDES,
   summarize,
@@ -99,7 +105,138 @@ describe('run manifest (planner)', () => {
   });
 });
 
+describe('recorded-duration slice packing', () => {
+  const recorded = loadPaidTestDurations();
+  const lanes = (manifest: PaidRunManifest) => {
+    const planned = manifest.entries.filter(e => e.status === 'planned');
+    return Array.from({ length: manifest.sliceCount }, (_, i) => planned.filter(e => e.slice === i + 1).map(e => e.file));
+  };
+  const plans = [
+    { tier: 'gate' as const, sliceCount: 6 },
+    { tier: 'gate' as const, sliceCount: 7 },
+    { tier: 'periodic' as const, sliceCount: 7 },
+  ];
+
+  test('the committed seed records real wall times for the fast PR profile', () => {
+    expect(Object.keys(recorded).length).toBeGreaterThanOrEqual(30);
+    expect(Object.values(recorded).every(ms => Number.isInteger(ms) && ms >= 1_000)).toBe(true);
+  });
+
+  for (const plan of plans) {
+    test(`${plan.tier} x${plan.sliceCount}: no slice's worst-case wall exceeds the supervised baseline's for any worker count`, () => {
+      const env = { EVALS_ALL: '1' };
+      const packed = lanes(buildRunManifest({ ...plan, evalsAll: true, env }));
+      const baseline = lanes(buildRunManifest({ ...plan, evalsAll: true, env, durations: {} }));
+      expect(packed.flat().sort()).toEqual(baseline.flat().sort());
+      for (const jobs of SUPERVISED_WORKER_COUNTS) {
+        const bound = (files: string[]) => paidShardWallUpperBoundMs([...files].sort(), jobs);
+        expect(Math.max(...packed.map(bound))).toBeLessThanOrEqual(Math.max(...baseline.map(bound)));
+      }
+      // Same estimate the planner packs by: recorded time, else the 75th percentile of recorded files.
+      const known = baseline.flat().map(file => recorded[file]).filter(ms => ms !== undefined).sort((x, y) => x - y);
+      const fallback = known[Math.min(known.length - 1, Math.floor(known.length * 0.75))];
+      const load = (files: string[]) => files.reduce((sum, file) => sum + (recorded[file] ?? fallback), 0);
+      expect(Math.max(...packed.map(load))).toBeLessThanOrEqual(Math.max(...baseline.map(load)));
+    });
+  }
+
+  test('the PR-profile file set spreads recorded time instead of stacking it', () => {
+    const env = { EVALS_ALL: '1' };
+    const discovered = Object.keys(recorded);
+    const load = (files: string[]) => files.reduce((sum, file) => sum + recorded[file], 0);
+    const packed = lanes(buildRunManifest({ tier: 'gate', sliceCount: 6, evalsAll: true, env, discovered })).map(load);
+    const baseline = lanes(buildRunManifest({ tier: 'gate', sliceCount: 6, evalsAll: true, env, discovered, durations: {} })).map(load);
+    expect(Math.max(...packed)).toBeLessThan(Math.max(...baseline));
+    expect(buildRunManifest({ tier: 'gate', sliceCount: 6, evalsAll: true, env, discovered: [...discovered].reverse() }).entries)
+      .toEqual(buildRunManifest({ tier: 'gate', sliceCount: 6, evalsAll: true, env, discovered }).entries);
+  });
+
+  test('report durations merge only executed single-file outcomes', () => {
+    const outcome = (files: string[], elapsedMs: number, over: Partial<ShardOutcome> = {}) =>
+      ({ files, status: 'passed', exitCode: 0, elapsedMs, executedTests: 2, skippedTests: 0, ...over }) as SliceResult['outcomes'][number];
+    const merged = mergePaidTestDurations({ 'test/b.test.ts': 5_000, 'test/a.test.ts': 9_000 }, [{
+      sliceIndex: 1,
+      outcomes: [
+        outcome(['test/a.test.ts'], 42_000),
+        outcome(['test/c.test.ts'], 500),
+        outcome(['test/d.test.ts', 'test/e.test.ts'], 60_000),
+        outcome(['test/f.test.ts'], 30_000, { executedTests: 2, skippedTests: 2 }),
+        outcome(['test/g.test.ts'], 70_000, { status: 'failed', exitCode: 1 }),
+      ],
+    } as SliceResult]);
+    expect(merged).toEqual({ 'test/a.test.ts': 42_000, 'test/b.test.ts': 5_000, 'test/g.test.ts': 70_000 });
+    expect(Object.keys(merged)).toEqual(['test/a.test.ts', 'test/b.test.ts', 'test/g.test.ts']);
+    expect(() => parseCliOptions(['--write-durations'], {})).toThrow('--write-durations requires --report');
+    expect(parseCliOptions(['--report', '/tmp/r', '--write-durations'], {}).writeDurations).toBe(true);
+  });
+});
+
 describe('manifest executor scope', () => {
+  test('list-only validates and prints the selected manifest slice without launching tests or writing results', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'paid-manifest-list-'));
+    try {
+      const receipt = path.join(dir, 'launched.json');
+      const file = path.join(dir, 'skill-e2e-list-probe.test.ts');
+      fs.writeFileSync(file, `import { test } from 'bun:test';
+import { writeFileSync } from 'node:fs';
+test('local launch sentinel', () => writeFileSync(${JSON.stringify(receipt)}, 'true'));`);
+      const manifest: PaidRunManifest = {
+        version: 1, tier: 'gate', evalsAll: true, sliceCount: 3, selectionReason: 'local list-only fixture',
+        entries: [
+          { file, slice: 1, status: 'planned' },
+          { file: 'test/skill-e2e-plan.test.ts', slice: 2, status: 'planned',
+            budget: resolvePaidShardBudget(['test/skill-e2e-plan.test.ts']) },
+        ],
+      };
+      const manifestPath = path.join(dir, 'manifest.json');
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      const evalDir = path.join(dir, 'evals');
+      const env = {
+        PATH: path.dirname(process.execPath),
+        ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
+        HOME: dir, TMPDIR: dir, TEMP: dir, TMP: dir,
+        EVALS_PREFLIGHT_OK: '1', GSTACK_CLAUDE_CLI_VERSION: 'free-fixture', GSTACK_EVAL_DIR: evalDir,
+      };
+      const run = (args: string[], disablePreflightTools = false) => {
+        const result = spawnSync(process.execPath, [path.join(ROOT, 'scripts/test-paid-shards.ts'),
+          '--plan', manifestPath, '--list', ...args], { cwd: ROOT,
+          env: disablePreflightTools ? { ...env, PATH: dir, EVALS_PREFLIGHT_OK: '' } : env,
+          encoding: 'utf8', timeout: 10_000 });
+        expect(result.error).toBeUndefined();
+        expect(fs.existsSync(receipt)).toBe(false);
+        expect(fs.existsSync(evalDir)).toBe(false);
+        return result;
+      };
+      const selected = run(['--slice', '1', '--jobs', '1', '--timeout', '5']);
+      expect(selected.status, selected.stderr).toBe(0);
+      expect(selected.stdout).toContain('slice 1/3: 1 shard(s)');
+      expect(selected.stdout).toContain(`${file} wall=5000ms source=explicit policy=none`);
+      expect(selected.stdout).not.toContain('skill-e2e-plan.test.ts');
+      const noPreflight = run(['--slice', '1'], true);
+      expect(noPreflight.status, noPreflight.stderr).toBe(0);
+      expect(noPreflight.stdout).toContain(file);
+      const registered = run(['--slice', '2']);
+      expect(registered.status, registered.stderr).toBe(0);
+      expect(registered.stdout).toContain('skill-e2e-plan.test.ts');
+      expect(registered.stdout).toContain('source=registered policy=skill-e2e-plan-existing-retry-v1');
+      const empty = run(['--slice', '3']);
+      expect(empty.status, empty.stderr).toBe(0);
+      expect(empty.stdout).toContain('slice 3/3: 0 shard(s)');
+      for (const [args, error] of [
+        [['--slice', '4'], 'exceeds manifest sliceCount'],
+        [['--slice', '1', '--tier', 'periodic'], 'refusing a cross-tier run'],
+        [[], '--plan and --slice must be used together'],
+      ] as const) {
+        const invalid = run([...args]);
+        expect(invalid.status).toBe(1);
+        expect(invalid.stderr).toContain(error);
+      }
+      expect(fs.readFileSync(manifestPath, 'utf8')).toBe(JSON.stringify(manifest));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test('a conflicting inherited carve scope cannot suppress a planned case; direct Bun stays scoped', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'paid-manifest-scope-'));
     const fixtureRoot = path.join(dir, 'fixture');
@@ -261,7 +398,7 @@ describe('hollow-shard guard', () => {
 
 describe('retry parity', () => {
   test('registered native workflows preserve main retry policy while overlay attempts stay isolated', () => {
-    const native = 'test/skill-e2e-autoplan-chain.test.ts';
+    const native = 'test/skill-e2e-plan-ceo-split-overflow.test.ts';
     expect(retriesForFiles([native])).toBe(1);
     expect(retriesForFiles([native.replaceAll('/', '\\')])).toBe(1);
     expect(buildPaidShardArgs([native], 1_800_000, 2, retriesForFiles([native])).join(' ')).toContain('--retry 1');

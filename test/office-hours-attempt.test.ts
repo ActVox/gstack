@@ -1,5 +1,6 @@
 /** Free recording fixtures; every runner and judge below is synthetic. */
 import { describe, expect, spyOn, test } from 'bun:test';
+import { resolveEvalModel } from '../lib/eval-model';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -344,11 +345,14 @@ describe('Office Hours real session runner with fake processes', () => {
       // Wait synchronously until the child has written and exited, preventing Bun
       // from dispatching its stdout/exit callbacks before cancellation.
       const completed = path.join(dir, 'completed');
+      // The marker precedes `exit 7`; seeing it alone can race with SIGKILL.
+      const exited = () => fs.existsSync(completed)
+        && !running(Number(fs.readFileSync(path.join(dir, 'parent.pid'), 'utf8')));
       const waitDeadline = Date.now() + 2_000;
-      while (!fs.existsSync(completed) && Date.now() < waitDeadline) {
+      while (!exited() && Date.now() < waitDeadline) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
       }
-      expect(fs.existsSync(completed)).toBe(true);
+      expect(exited()).toBe(true);
       controller.abort();
       const captured = await pending;
       expect(captured.exitReason).toBe('exit_code_7');
@@ -688,7 +692,8 @@ describe('Plan format actual capture and judge lifecycle', () => {
         expect(output).not.toContain('Unhandled error between tests');
         const starts = events.filter(event => event.kind === 'start');
         expect(starts.map(({ timeout, maxTurns, model }) => ({ timeout, maxTurns, model })))
-          .toEqual([1, 2].map(() => ({ timeout: 300, maxTurns: 10, model: 'claude-opus-4-7' })));
+          .toEqual([1, 2].map(() => ({ timeout: 300, maxTurns: 10,
+            model: file.includes('plan-prosons') ? 'claude-opus-4-7' : resolveEvalModel('capture') })));
         expect(events.filter(event => event.kind === 'ready').map(event => event.fixtureExists)).toEqual([true, true]);
         expect(entries).toHaveLength(2);
         expect(entries.map(entry => entry.attempt)).toEqual([1, 2]);

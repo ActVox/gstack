@@ -10,6 +10,8 @@
  */
 
 import { discoverTemplates, discoverSectionTemplates, includesSkill } from './discover-skills';
+import { externalSkillName, extractNameAndDescription } from './external-skill-names';
+export { extractNameAndDescription } from './external-skill-names';
 import { generateLlmsTxt } from './gen-llms-txt';
 import { generateAgentsDigest, DIGEST_RELPATH, DIGEST_BYTE_BUDGET } from './gen-agents-digest';
 import { generateDesignChecklistMd } from './resolvers/design-checklist';
@@ -19,17 +21,23 @@ import * as path from 'path';
 import type { Host, TemplateContext } from './resolvers/types';
 import { HOST_PATHS } from './resolvers/types';
 import { RESOLVERS } from './resolvers/index';
+import { usesLazySections } from './resolvers/sections';
 import { ALL_HOST_NAMES, resolveHostArg, getHostConfig } from '../hosts/index';
 import type { HostConfig } from './host-config';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 import { ALL_MODEL_NAMES, resolveModel, type Model } from './models';
 
+// References embedded in Markdown and Bash use forward slashes on Windows too.
+// Keep native paths for filesystem operations and physical isolation checks.
+const documentPath = (file: string): string => file.split(path.sep).join('/');
+
 type HostArg = Host | 'all';
 
 /** Internal render settings. Inputs always come from ROOT; output routing and
  * content links are separate so checks can render canonical bytes into scratch. */
 export interface GenerationOptions {
+  instructionProfile?: 'standard' | 'lean';
   host?: HostArg;
   dryRun?: boolean;
   outputRoot?: string;
@@ -42,6 +50,7 @@ export interface GenerationOptions {
 }
 
 interface RenderOptions {
+  instructionProfile: 'standard' | 'lean';
   outputRoot: string;
   contentLinkRoot: string | null;
   model: Model | null;
@@ -115,12 +124,19 @@ function parseGenerationArgs(args: string[]): GenerationOptions {
   if (explainLevel !== 'default' && explainLevel !== 'terse') {
     throw new Error(`Unknown explain level: ${explainLevel}. Use 'default' or 'terse'.`);
   }
+  const instructionProfile = value('--profile') ?? 'standard';
+  if (instructionProfile !== 'standard' && instructionProfile !== 'lean') {
+    throw new Error('Unknown instruction profile. Use standard or lean.');
+  }
   const outDir = value('--out-dir');
+  if (instructionProfile === 'lean' && !outDir) {
+    throw new Error('--profile lean requires --out-dir to preserve the source checkout');
+  }
   const linkRoot = value('--link-root');
   // Swap-in callers use --link-root for the FINAL serving path (#2692).
   // Direct --out-dir callers retain their existing links into the render.
   return {
-    host, model, catalogMode, explainLevel,
+    host, model, catalogMode, explainLevel, instructionProfile,
     dryRun: args.includes('--dry-run'),
     respectDetection: args.includes('--respect-detection'),
     outputRoot: outDir === undefined ? ROOT : path.resolve(outDir),
@@ -139,62 +155,34 @@ function rewriteSectionBase(content: string, linkRoot: string | null): string {
   );
 }
 
+/** Resolve existing ancestors too, so a not-yet-created output cannot hide
+ * inside the source checkout through an install or parent-directory symlink. */
+function assertLeanOutputIsolation(outputPath: string, sourceRoot: string): void {
+  let ancestor = path.resolve(outputPath);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      fs.lstatSync(ancestor);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missing.unshift(path.basename(ancestor));
+      ancestor = parent;
+    }
+  }
+  const physicalPath = path.join(fs.realpathSync(ancestor), ...missing);
+  if (physicalPath === sourceRoot || physicalPath.startsWith(`${sourceRoot}${path.sep}`)) {
+    throw new Error('--profile lean requires --out-dir outside the source checkout (including symlink targets)');
+  }
+}
+
 // HostPaths, HOST_PATHS, and TemplateContext imported from ./resolvers/types (line 7-8)
 // Design constants (AI_SLOP_BLACKLIST, OPENAI_HARD_REJECTIONS, OPENAI_LITMUS_CHECKS)
 // live in ./resolvers/constants and are consumed by resolvers directly.
 
 // ─── External Host Helpers ───────────────────────────────────
-
-// Canonical implementation (the codex-helpers.ts shadow copy was deleted —
-// it was imported, immediately shadowed by this declaration, and stale)
-// Accepts optional frontmatter name to support directory/invocation name divergence
-function externalSkillName(skillDir: string, frontmatterName?: string): string {
-  // Root skill (skillDir === '' or '.') always maps to 'gstack' regardless of frontmatter
-  if (skillDir === '.' || skillDir === '') return 'gstack';
-  // Use frontmatter name when it differs from directory name (e.g., run-tests/ with name: test)
-  const baseName = frontmatterName && frontmatterName !== skillDir ? frontmatterName : skillDir;
-  // Don't double-prefix: gstack-upgrade → gstack-upgrade (not gstack-gstack-upgrade)
-  if (baseName.startsWith('gstack-')) return baseName;
-  return `gstack-${baseName}`;
-}
-
-export function extractNameAndDescription(content: string): { name: string; description: string } {
-  const fmStart = content.indexOf('---\n');
-  if (fmStart !== 0) return { name: '', description: '' };
-  const fmEnd = content.indexOf('\n---', fmStart + 4);
-  if (fmEnd === -1) return { name: '', description: '' };
-
-  const frontmatter = content.slice(fmStart + 4, fmEnd);
-  const nameMatch = frontmatter.match(/^name:\s*(.+)$/m);
-  const name = nameMatch ? nameMatch[1].trim() : '';
-
-  let description = '';
-  const lines = frontmatter.split('\n');
-  let inDescription = false;
-  const descLines: string[] = [];
-  for (const line of lines) {
-    if (line.match(/^description:\s*\|?\s*$/)) {
-      inDescription = true;
-      continue;
-    }
-    if (line.match(/^description:\s*\S/)) {
-      description = line.replace(/^description:\s*/, '').trim();
-      break;
-    }
-    if (inDescription) {
-      if (line === '' || line.match(/^\s/)) {
-        descLines.push(line.replace(/^  /, ''));
-      } else {
-        break;
-      }
-    }
-  }
-  if (descLines.length > 0) {
-    description = descLines.join('\n').trim();
-  }
-
-  return { name, description };
-}
 
 // ─── Voice Trigger Processing ────────────────────────────────
 
@@ -721,6 +709,11 @@ function buildContext(
   const interactive = interactiveMatch ? interactiveMatch[1] === 'true' : undefined;
   return {
     skillName, tmplPath, benefitsFrom, host, paths: HOST_PATHS[host],
+    instructionProfile: options.instructionProfile,
+    runtimeRoot: documentPath(ROOT),
+    sectionRoot: documentPath(path.join(options.contentLinkRoot || options.outputRoot,
+      host === 'claude' ? path.relative(ROOT, path.dirname(tmplPath))
+        : externalSkillName(path.relative(ROOT, path.dirname(tmplPath)), skillName), 'sections')),
     preambleTier, model: options.model ?? getHostConfig(host).defaultModel, interactive, explainLevel: options.explainLevel,
   };
 }
@@ -743,7 +736,9 @@ function processExternalHost(
 
   const name = externalSkillName(skillDir === '.' ? '' : skillDir, frontmatterName);
   // --out-dir mirrors the host tree (outputs only; inputs read from ROOT).
-  const outputDir = path.join(options.outputRoot, hostConfig.hostSubdir, 'skills', name);
+  const outputDir = options.instructionProfile === 'lean'
+    ? path.join(options.outputRoot, name)
+    : path.join(options.outputRoot, hostConfig.hostSubdir, 'skills', name);
   const outputPath = path.join(outputDir, 'SKILL.md');
 
   // Guard against symlink loops
@@ -784,6 +779,27 @@ function processExternalHost(
   return { content: result, outputPath, symlinkLoop, metadata };
 }
 
+/** Keep profile-to-profile references separate from runtime helpers. */
+function rewriteLeanPaths(content: string, host: Host, options: RenderOptions): string {
+  if (options.instructionProfile !== 'lean') return content;
+  const linkRoot = options.contentLinkRoot || options.outputRoot;
+  // Claude's section-base rewrite has already inserted this native root.
+  content = content.replaceAll(`${linkRoot}/`, `${documentPath(linkRoot)}/`);
+  for (const tmpl of discoverTemplates(ROOT)) {
+    const sourcePath = path.join(ROOT, tmpl.tmpl);
+    const dir = path.dirname(tmpl.tmpl);
+    if (dir === '.') continue;
+    const name = extractNameAndDescription(fs.readFileSync(sourcePath, 'utf8')).name;
+    const outputDir = documentPath(path.join(linkRoot, host === 'claude' ? dir : externalSkillName(dir, name)));
+    for (const prefix of ['~/.claude/skills/gstack', '$GSTACK_ROOT', ROOT, documentPath(ROOT)]) {
+      content = content.replaceAll(`${prefix}/${dir}/SKILL.md`, `${outputDir}/SKILL.md`);
+      content = content.replaceAll(`${prefix}/${dir}/sections/`, `${outputDir}/sections/`);
+    }
+    content = content.replaceAll(`~/.claude/skills/${dir}/SKILL.md`, `${outputDir}/SKILL.md`);
+  }
+  return content.replaceAll('~/.claude/skills/gstack/', `${documentPath(ROOT)}/`);
+}
+
 function processTemplate(tmplPath: string, host: Host, options: RenderOptions): { outputPath: string; content: string; symlinkLoop?: boolean; metadata?: { outputPath: string; content: string } } {
   // Normalize to LF at the entry point. Templates may have CRLF on disk when
   // checked out on Windows with core.autocrlf=true. Downstream regexes
@@ -792,7 +808,9 @@ function processTemplate(tmplPath: string, host: Host, options: RenderOptions): 
   // than CI (Linux, LF) and breaking the Skill Docs Freshness check.
   // (catalogParts left the return type with the proactive-suggestions
   // retirement — merge of the two v1.64 waves.)
-  const tmplContent = fs.readFileSync(tmplPath, 'utf-8').replace(/\r\n/g, '\n');
+  const profileTemplate = tmplPath.replace(/SKILL\.md\.tmpl$/, 'SKILL.lean.md.tmpl');
+  const selectedTemplate = options.instructionProfile === 'lean' && fs.existsSync(profileTemplate) ? profileTemplate : tmplPath;
+  const tmplContent = fs.readFileSync(selectedTemplate, 'utf-8').replace(/\r\n/g, '\n');
   const relTmplPath = path.relative(ROOT, tmplPath);
   let outputPath = tmplPath.replace(/\.tmpl$/, '');
 
@@ -842,7 +860,9 @@ function processTemplate(tmplPath: string, host: Host, options: RenderOptions): 
   }
 
   // Prepend generated header (after frontmatter)
-  const header = GENERATED_HEADER.replace('{{SOURCE}}', path.basename(tmplPath));
+  const header = options.instructionProfile === 'lean'
+    ? `<!-- AUTO-GENERATED from ${path.basename(selectedTemplate)} (lean profile). -->\n<!-- Regenerate with ~/.agent-platform/scripts/refresh.py; do not edit this output. -->\n`
+    : GENERATED_HEADER.replace('{{SOURCE}}', path.basename(tmplPath));
   const fmEnd = content.indexOf('---', content.indexOf('---') + 3);
   if (fmEnd !== -1) {
     const insertAt = content.indexOf('\n', fmEnd) + 1;
@@ -852,7 +872,7 @@ function processTemplate(tmplPath: string, host: Host, options: RenderOptions): 
   }
 
   // Catalog trim (Claude only — external hosts have their own frontmatter shapes)
-  if (host === 'claude' && options.catalogMode === 'trim') {
+  if ((host === 'claude' || options.instructionProfile === 'lean') && options.catalogMode === 'trim') {
     const trimmed = applyCatalogTrim(content, skillName);
     if (trimmed) content = trimmed.content;
   }
@@ -860,6 +880,7 @@ function processTemplate(tmplPath: string, host: Host, options: RenderOptions): 
   // --out-dir: repoint section-base paths to the out-dir (no-op otherwise).
   if (host === 'claude') content = rewriteSectionBase(content, options.contentLinkRoot);
 
+  content = rewriteLeanPaths(content, host, options);
   return { outputPath, content, symlinkLoop, metadata };
 }
 
@@ -914,8 +935,11 @@ function processSectionTemplate(
     outputPath = path.join(options.outputRoot, skillDir, 'sections', fileName);
   } else {
     const externalName = externalSkillName(skillDir, parentName);
-    outputPath = path.join(options.outputRoot, hostConfig.hostSubdir, 'skills', externalName, 'sections', fileName);
+    outputPath = options.instructionProfile === 'lean'
+      ? path.join(options.outputRoot, externalName, 'sections', fileName)
+      : path.join(options.outputRoot, hostConfig.hostSubdir, 'skills', externalName, 'sections', fileName);
   }
+  content = rewriteLeanPaths(content, host, options);
   return { outputPath, content };
 }
 
@@ -933,7 +957,18 @@ function processSectionTemplate(
  * successful external host -----------------> normal only: prune retired caches
  */
 export async function runGeneration(settings: GenerationOptions = {}): Promise<GenerationResult> {
+  const leanSourceRoot = settings.instructionProfile === 'lean' ? fs.realpathSync(ROOT) : null;
+  if (leanSourceRoot) {
+    if (settings.host === 'all') {
+      throw new Error('--profile lean requires a single --host and a separate --out-dir for each host');
+    }
+    if (!settings.outputRoot) {
+      throw new Error('--profile lean requires --out-dir to preserve the source checkout');
+    }
+    assertLeanOutputIsolation(settings.outputRoot, leanSourceRoot);
+  }
   const options: RenderOptions = {
+    instructionProfile: settings.instructionProfile ?? 'standard',
     outputRoot: path.resolve(settings.outputRoot ?? ROOT),
     contentLinkRoot: settings.contentLinkRoot ?? null,
     model: settings.model ?? null,
@@ -953,6 +988,8 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
     const relativePath = rel(outputPath);
     artifacts.push({ relativePath, kind, ...(host ? { host } : {}) });
     try {
+      // A previously rendered output may contain links back into the source.
+      if (leanSourceRoot) assertLeanOutputIsolation(outputPath, leanSourceRoot);
       if (settings.dryRun) {
         let existing: string | undefined;
         try {
@@ -1015,6 +1052,11 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
         }
         emit(result.outputPath, result.content, 'skill', host);
         if (result.metadata) emit(result.metadata.outputPath, result.metadata.content, 'metadata', host);
+        if (skillDir === 'qa') {
+          const report = fs.readFileSync(path.join(ROOT, 'qa', 'templates', 'functional-report-template.md'), 'utf-8');
+          emit(path.join(path.dirname(result.outputPath), 'templates', 'functional-report-template.md'),
+            (host === 'claude' ? '' : GENERATED_HEADER.replace('{{SOURCE}}', 'qa/templates/functional-report-template.md')) + report, 'asset', host);
+        }
         tokenBudget.push({ skill: relativePath, lines: result.content.split('\n').length, tokens: Math.round(result.content.length / 4) });
         const TOKEN_CEILING_BYTES = 160_000;
         if (result.content.length > TOKEN_CEILING_BYTES) {
@@ -1023,9 +1065,8 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
         }
       }
 
-      // Claude carves sections; every external host inlines these templates.
-      for (const section of host === 'claude' ? sections : []) {
-        if (!includesSkill(hostConfig, section.skillDir)) continue;
+      for (const section of sections) {
+        if (!includesSkill(hostConfig, section.skillDir) || (!usesLazySections(host, section.skillDir) && options.instructionProfile !== 'lean')) continue;
         const result = processSectionTemplate(path.join(ROOT, section.tmpl), section.skillDir, host, options);
         emit(result.outputPath, result.content, 'section', host);
         tokenBudget.push({ skill: rel(result.outputPath), lines: result.content.split('\n').length, tokens: Math.round(result.content.length / 4) });
@@ -1051,7 +1092,7 @@ export async function runGeneration(settings: GenerationOptions = {}): Promise<G
       // Only remove generated directories owned by this host; sidecars and user
       // skills survive. Dry runs never create, rewrite, or remove any directory.
       if (!settings.dryRun && host !== 'claude') {
-        const skillsRoot = path.join(options.outputRoot, hostConfig.hostSubdir, 'skills');
+        const skillsRoot = options.instructionProfile === 'lean' ? options.outputRoot : path.join(options.outputRoot, hostConfig.hostSubdir, 'skills');
         let entries: fs.Dirent[] = [];
         try {
           entries = fs.readdirSync(skillsRoot, { withFileTypes: true });

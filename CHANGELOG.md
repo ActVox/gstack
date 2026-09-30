@@ -7,6 +7,203 @@
 - Pinned the fork's CI image to lowercase `ghcr.io/actvox/gstack/ci` so GHCR publication remains valid regardless of repository-name casing.
 - Kept the CI container on Ubuntu's standard package sources because GitHub-hosted runners cannot reach the upstream Hetzner mirror.
 - Added retry handling plus persistent flake-ledger artifact upload to the required free-test lane.
+
+
+## [1.91.10.0] - 2026-09-30
+
+Curated Codex and Claude installations can use the latest GStack workflows while keeping their shorter entrypoints and explicit skill invocation policies. The opt-in lean profile now works with the current generator and loads the full review methodology when an autoplan phase needs it.
+
+- Integrates upstream 1.91.9.0 with the fork's GitHub-hosted CI and disabled-by-default paid evals.
+- Preserves separate generated directories for each host and resolves runtime assets from the selected checkout.
+- Adds review-section indexes to all four lean planning reviews so methodology loading succeeds.
+- Retains PDF setup in the lean profile and refuses output paths that alias the source checkout or mix host layouts.
+- Fixes GBrain MCP discovery when an ancestor project is the filesystem or drive root.
+- Accepts a real registry Unix socket on macOS without resolving the socket leaf itself; symlinked socket leaves remain rejected.
+- Pins local and CI builds to Bun 1.4.2 and retains the browser smoke checks.
+
+## [1.91.9.0] - 2026-09-29
+
+Every gstack workflow that proposes, writes, reviews or ships tests now applies one test value bar: a test earns its place by protecting behavior a real regression would break, and test count is not a goal. `/ship`'s coverage gate counts only tests that clear that bar, and the new `/test-audit` sweeps existing tests for ones that cost more than they protect.
+
+`/ship`'s coverage number can drop for unchanged code, because a path covered only by a smoke test (★) no longer counts. The gate shows both numbers, for example:
+
+```
+Before: Coverage gate: 81%
+After:  Coverage: 58% value-weighted (81% including 4 weakly covered paths)
+```
+
+No action required; the gate still only asks.
+
+### Added
+
+- `/test-audit [path ...] [--since <ref>] [--max-candidates N]` finds low-value, implementation-coupled and duplicate tests and the test-only exports they keep alive. A mechanical pre-filter runs before any model reading, every candidate carries a complete retirement card (what it detects, non-test callers with the search command, stronger remaining proof, history, what retiring it unlocks, validation), and SKILL.md goldens and other contract tests are retained. The report and a JSON sidecar land in `~/.gstack/projects/<slug>/`. Nothing is edited unless you approve a batch; spawned and headless sessions stay report-only.
+- `docs/test-value-bar.md` explains the authoring gate, value and retirement cards, weak paths, the value-weighted (X) and any-test (Y) coverage numbers, base control, the overrides and every degraded-mode message.
+- Optional CLAUDE.md `## Test Coverage` keys: `Generation cap:` (default 5), `Base control:` (`auto` or `off`), `Base control budget:` (seconds, default 90) and `Star rating:` (`auto` or `off`). A `gstack:test-value keep reason="..."` comment makes `/review` and `/test-audit` skip a deliberate test and report the reason.
+
+### Changed
+
+- `/ship` Step 7 extends existing tests before writing new ones and writes at most 5 tests per generation pass (was 20). Each generated test carries a value card header. The parent rejects and removes tests with an incomplete card, a duplicate `protects` or a seam with no non-test caller, and a separate read-only pass rates the tests written in the run. The gate reads the value-weighted `coverage_pct_value`, falls back to `coverage_pct` with an upgrade note when an older skill omits it, and never substitutes 0. In spawned sessions it generates only for true gaps and lists weak paths as proposals.
+- `/ship` regression tests must fail at HEAD before the repair and pass at the base branch in a temporary worktree (Node/Bun), within 90 seconds per test and 3 minutes per run. Other ecosystems record "base control unavailable" with a four-command manual check.
+- The PR body adds `Test value: K tests written, R rejected by the authoring gate, E existing tests extended, W paths weakly covered`, and Step 20 metrics record `coverage_schema: 2`, `coverage_pct_value`, the weak, extended and rejected counts, and regression-proof counts.
+- `/plan-eng-review` and `/plan-ceo-review` state one rule: every behavior tested, no test without a regression it would catch. Test plans carry a value card per critical path and edge case, plus a `## Tests to Retire` section that `/test-audit` reads as seeds.
+- `/review`'s testing specialist reports source-grep tests, test-only exports and other low-value tests in the diff as INFORMATIONAL findings with caller-search evidence, never as auto-deletes, and flags regression tests without red proof. A gap closed only by a low-value test stays a coverage gap at its existing severity.
+- `/qa` and `/qa-only` apply the bar's last two questions before writing or proposing a regression test and record its value card.
+
+### For contributors
+
+- `scripts/resolvers/test-value.ts` owns the shared constants, the `{{TEST_VALUE_BAR:<mode>}}` and `{{TEST_VALUE_MESSAGE:<key>}}` placeholders and per-mode byte ceilings (measured renders plus 15%: plan 1,897, ship 2,742, qa 1,036, audit 3,712 bytes). Adapted from openclaw/openclaw@a214e76 `.agents/skills/test-audit`. The unreachable `review` branch of the coverage audit is deleted.
+- `test/test-value-bar.test.ts` checks each mode's contract text and ceiling, the ship gate's decision rows, the rejected-file removal script in a Git fixture, the static review specialist's sync with the constants, docs anchors and skill registration. Three gate evals in `test/skill-e2e-test-value.test.ts` cover a weak path in `weak_gaps`, low-value review findings with a retained golden, and a report-only `/test-audit`.
+- Budgets moved for the new skill and the embedded bar, each at its measured value with the derivation recorded: catalog 1,171 → 1,194 token-equivalents (`/test-audit` adds 92 bytes), always-on context 6,465 → 6,873 tokens, a new `test-audit` eager ceiling of 10,439 tokens, and carve-guard union ratios for ship (1.322 → 1.397; the lazy Step 7 section grows about 13.6KB), plan-eng-review (1.151 → 1.169) and qa (1.08 → 1.095). The paid census pins count the new gate file.
+- The context-budget and ship golden fixtures are audited free-only PR inputs, so editing them no longer restores every paid gate case.
+- `test/pr-shared-input-selection.test.ts` no longer depends on whether the local `package.json` differs from its merge-base.
+- The catalog estimate in `test/skill-size-budget.test.ts` lists skills from `HEAD`, the same tree it reads, so a staged but uncommitted skill no longer breaks it.
+
+## [1.91.8.0] - 2026-09-29
+
+The test suite is smaller and every remaining test maps to a product contract: 227 fewer test files, about 90,000 fewer lines of tests, helpers and fixtures, and the weekly paid lane drops the five evals that were red eight runs straight. Free tests that only replayed one captured failure are folded into their detector's owner test, and paid eval selection is derived from each eval's own imports instead of hand-copied lists.
+
+| Measure | Before (v1.91.6.0) | After |
+| --- | ---: | ---: |
+| Tracked test files | 1,184 | 957 |
+| Test-file lines (all `*.test.ts`) | 279,640 | 244,504 |
+| `test/` TypeScript lines (tests + helpers) | 274,208 | 227,713 |
+| `test/helpers` lines | 51,390 | 39,427 |
+| `test/fixtures` bytes | 16.3 MB | 9.7 MB |
+| Free suite files / passing tests (Ubicloud standard-16) | 1,065 / 27,331 | 857 / 20,302 |
+| Free suite serial seconds (recorded durations, same machine class) | 1,888 | 1,738 |
+| Paid files / gate-lane files / periodic files | 119 / 58 / 100 | 100 / 42 / 69 |
+| Weekly gate-census files | 58 | 41 (LLM judges run in the periodic and PR lanes) |
+| Weekly periodic shard-minutes spent on files this release removes (09-21 run) | 235 of 462 | 0 |
+
+The table compares v1.91.6.0 with this branch before it merged v1.91.7.0, which adds its own functional-QA and documentation tests. With both, the free suite runs 914 files (2,066 recorded serial seconds), the paid census has 104 files (46 gate, 70 periodic), and the weekly gate census runs 45 files in seven slices. v1.91.7.0's new paid cases follow the same derived-touchfile rule, and its new helper-only tests are listed in the ratchet baseline.
+
+### Removed
+- The never-green finding-count cluster: `skill-e2e-autoplan-chain` and `skill-e2e-plan-{ceo,eng,design,devex}-finding-count`, whose weekly failures were harness and budget failures, never skill behavior (triage in `docs/test-audit-2026-09.md`). No paid eval now proves a live model completes the full `/autoplan` chain or asks one question per finding; both gaps have TODOS entries with re-entry tests. The dedicated eighth periodic slice and `AUTOPLAN_CHAIN_BUDGET` go with them.
+- Paid files that asserted nothing or could not pass: `skill-llm-eval-spec`, `skill-e2e-spec-execute`, `gemini-e2e` (no Gemini CLI in CI), `skill-e2e-ship-idempotency`, `skill-e2e-conductor-prose`, `codex-e2e-plan-format`, `skill-e2e-brain-privacy-gate`, `skill-e2e-opus-47` (its negative routing controls moved into `skill-routing-e2e`) and two duplicate overlay wrappers; `test:gemini` scripts removed.
+- Free tests of dead eval code, product tests that exercised copies of the product, and test-infrastructure dead code.
+
+### Changed
+- Tests that faked the product now drive it: the design `serve()` server, terminal-agent `/internal/grant` and `/internal/revoke` bearer auth, `/health` liveness, and brain-sync consent before egress.
+- Per-incident replay files are folded verbatim into twelve detector owner tests (listed in `docs/TEST_PORTFOLIO.md`), keeping every captured case.
+- Paid touchfiles are derived: `test/touchfiles.test.ts` checks that each case's key covers its eval's static helper/fixture imports and the fixture paths it names, and free `*.test.ts` files are no longer touchfiles, so editing a free test no longer selects paid evals.
+- The paid planner skips a file for a tier lane when every E2E id it registers belongs to the other tier (the hollow shards), and the weekly gate census skips the LLM judges.
+- Seven paid evals that pinned `claude-opus-4-7` or `claude-sonnet-4-6` now capture with the default model from `resolveEvalModel`; all passed on it. Four more (`skill-e2e-design`, `-office-hours-phase4`, `-plan-prosons`, `-plan`) keep `claude-opus-4-7` because six of their cases failed on the default model; TODOS tracks re-pinning them.
+- memory-pipeline, ios-qa, ios-qa-swift-build and plan-tune-cathedral make no model calls and now run in the free suite; CI-unrunnable Codex, Aside, outside-voice and iOS-device files are excluded from the weekly lane with a tracked re-entry condition.
+- The plan-count history PTY test waits for its startup marker instead of a fixed 8-second sleep.
+
+### Fixed
+- The `/plan-design-review` UI-scope gate eval recognizes a Design finding by the review's own issue-numbered options (`1A`, `1B`, …) as well as by UI vocabulary, so a real finding about hierarchy, navigation, state tables or confirmation patterns no longer goes uncounted until the 600-second cap. It timed out on v1.91.7.0 in one of two local runs and on this branch's CI; both fixed runs finished in about 420 seconds.
+- `bun run test:ubicloud` no longer reports `pull failed` when a run leaves no flake ledger in `/tmp`: a retrieval glob that matches nothing is skipped with a note, and the retained shard logs still land in `.context/ubicloud/<timestamp>/free-test-logs/`.
+
+### For contributors
+- When a paid eval fails, fix the product or harness and add the captured case as one row in the detector's owner test; `test/test-of-test-ratchet.test.ts` fails on any new test file that imports only `test/` code and names the owner test to extend. `CONTRIBUTING.md` "Test tiers" has an example.
+- Deleted `test/helpers` modules and where their live cases went:
+  - `autoplan-setup-question`, `ceo-approach-pick`, `ceo-completion-handoff`, `ceo-payment-findings`, `design-artifact-question`, `design-count-fixture`, `design-count-outside`, `design-count-review`, `devex-count-fixture`, `devex-seed-coverage`, `eng-count-question-policy`: consumed only by the retired finding-count evals; runner tests that used them as caller policies now use inline policies, and the omitted-`multiSelect` default moved to `test/plan-review-decisions.test.ts`.
+  - `autoplan-phase-order`, `pty-current-screen`: never wired; the settings-overwrite card assertion moved to `test/helpers/claude-pty-runner.unit.test.ts`.
+  - `ceo-paired-fixture`, `design-ui-scope`, `plan-skill-completion`, `required-reads`, `transcript-section-logger`, `eng-finding-fixture`, `eng-completion-handoff`, `eng-retained-corpus`, `captured-paths`, `gemini-session-runner`: no live cases.
+- `test/helpers/resolve-repo-path.ts` resolves specifiers and path literals for both the ratchet and the touchfile closure check. The full evidence (inventories, selection proof, security mapping, retained false positives) is in `docs/test-audit-2026-09.md`.
+
+## [1.91.7.0] - 2026-09-28
+QA can test APIs, CLIs, jobs, workers and webhooks with the project's own tools,
+without starting a browser. Review and ship now run bounded exploratory checks,
+and every ship audits relevant documentation before final verification and publication.
+
+### Added
+
+- Functional QA checks native outputs and durable effects, including invalid inputs, authorization, cancellation, retries, duplicate delivery, concurrency and recovery. Reports distinguish failures, blocked probes and untested contracts; browser and functional results stay separate.
+- Exploratory QA turns observations into targeted probes and proposed regression tests. Written evidence checkpoints connect each observed result to the next probe and are linked from the final report. Authorized repairs require a reproduced defect, a regression that fails before the repair, and successful regression, original-probe and adjacent-path checks when the native test infrastructure supports them.
+
+### Changed
+
+- `/qa` and `/qa-only` load instructions for the selected surface on each supported host. Functional and report-only runs never bootstrap a framework or inherit browser setup permission; `/qa-only` preserves product code, tests, configuration and Git state.
+- `/review` and `/ship` run bounded exploration even on small non-browser diffs without a plan or server. Required checks remain required when blocked or unfinished, and proposed tests retain the parent's approval gates.
+- Review collects checklist, specialist, QA and adversarial findings before one parent-owned fix phase. Re-review keeps the same three-cycle limit, reruns affected probes and records incomplete coverage honestly.
+- Every ship consumes a completed documentation audit before final checks and publication, including uncommitted changes and existing-PR or repeat runs. Failed, stale or unsettled child results cannot silently become a clean audit; the parent retains release metadata and Git ownership.
+
+### Fixed
+
+- Report-only QA completes its scope and method Reads before setup, and preserves exact public fixture paths in evidence instead of inventing redacted paths. Actual secrets and private payloads remain protected.
+- Ship's workflow quality judge uses a 64k streamed, structured response within its existing deadline; other judges retain their 8k allowance. Cache identity includes the actual cap, transport and response contract, and incomplete or malformed scores remain failures.
+- Repeated QA runs preserve prior reports, baselines and exploration notes. Browser techniques follow the same checkpointed probe order as functional QA, and mixed reports keep each surface's evidence and scores separate.
+- Ship's two-pass test-generation allowance includes the initial attempt, failures and zero-test results. Duplicate design findings share one action while retaining both reviewers' evidence, statistics and the stricter approval requirement.
+- Ship keeps repair and late-change instructions in the steps that own them. Nested repairs preserve their return destination, and release preparation requires matching review records before version or documentation writes.
+- Reusing skipped shared-code advice now relies on executable checks of the captured branch and eligible raw source evidence. Unsupported Git states, transformed paths and records without trusted coverage provenance cannot certify a previous decision.
+- Paid-test `--list` also stays read-only with a saved plan and selected slice: it validates and lists the selected work without API preflight, test launches or result files.
+- Functional-QA test fixtures enforce their declared foreground command boundary before execution, and shared native-event decoding rejects malformed or incomplete evidence while preserving caller-specific handoff rules.
+- Native plan fixtures accept byte-exact seeds inside Claude's paste envelope without accepting fused or changed content. QA fixture completion avoids duplicating its checkpoint ledger, and caller fixtures distinguish absolute deadlines from start times.
+- Free tests retain private full logs, fail when evidence cannot be saved, and give an actionable recovery step. Linux and Windows CI collect the retained logs. Refreshed timings make new fast regressions reachable through the existing quick lane without removing complete-suite coverage.
+- The Ubicloud wrapper retrieves retained free-test logs and any retry ledger before destroying its VM.
+
+## [1.91.6.0] - 2026-09-28
+
+PR eval slices are balanced by how long each eval actually takes, so the slowest slice no longer carries most of the run.
+
+### Changed
+- The paid eval planner re-packs slices using recorded per-file wall times from real CI runs (`scripts/paid-test-durations.json`). It starts from the existing supervised allocation and only moves or swaps a file out of the heaviest slice when no slice's worst-case wall, for 1–4 workers, rises above that allocation's maximum, so CI timeout coverage never gets weaker. Estimated from the recorded times with two workers per slice, the heaviest slice for a typical PR run drops from about 15 minutes to 12 (the length of the single longest eval), and for the full gate census from about 17 minutes to 13.
+- `bun run scripts/test-paid-shards.ts --report <dir> --write-durations` merges a report's executed single-file shard times into the seed. Skipped-only and sub-second shards are ignored.
+
+## [1.91.5.0] - 2026-09-28
+
+The free suite now finishes in about half the time on a 16-core Linux machine, `bun run test:ubicloud` runs it on a fresh 16-vCPU Ubicloud VM from any dev box, container, or cloud sandbox, and re-pushing a PR no longer waits behind the previous commit's eval run.
+
+### Added
+- `bun run test:ubicloud [test:free args]` runs the complete free suite on an ephemeral Ubicloud VM (`UBICLOUD_API_KEY` required; `UBI_SIZE` and `UBI_LOCATION` choose the machine). The VM gets the required CI lane's environment and strictness settings, uncommitted edits are included, shard logs are copied to `.context/ubicloud/`, and the VM is always destroyed afterwards. A full run takes about four and a half minutes end to end, compared with seven and a half minutes of suite time alone on a 4-vCPU machine.
+- `bun run test:ubicloud --record-durations` refreshes `scripts/free-test-durations.json` in that same environment and copies it back.
+- `scripts/ubicloud/ubi-runner.sh` runs any command on a Ubicloud VM (`run`, or `up` / `ssh` / `sync` / `pull` / `down`). It needs only bash, curl, python3, ssh, and tar locally, and it removes its own stale VMs after 12 hours.
+
+### Changed
+- On Linux, `bun run test` now starts one shard per available CPU, up to 16; macOS and Windows keep the limit of six. On a 16-vCPU VM, 16 shards finished the suite in 137 seconds and six shards took 327 seconds.
+- The duration seed is re-recorded with browser, display, and CSO tests actually running, and the slowest test file is split into four files. On a 16-vCPU run, all 16 shards now finish within about 15 seconds of each other, where one shard used to take twice as long as the rest. The 20 CI shards are packed with the same seed.
+- Full-suite and CI planning runs name any test file missing from the duration seed, so a slow new file cannot quietly become the long pole.
+- The Windows CI lane gets the same single serial retry for attributed failures as the required Linux lane, and uploads its flaky passes as a `flake-ledger-windows` artifact. Its process-supervision timing tests pass when run alone but can stall under the lane's two-shard load.
+- A new push to a pull request now cancels the previous commit's paid eval run. The eval slice, report, and comment jobs run unless the workflow is cancelled (`!cancelled()`) instead of unconditionally (`always()`), so they still run when the image build is skipped or a slice fails, but a superseded run no longer finishes (and bills) its slices while the new commit's run waits behind it. A workflow test fails if any eval job goes back to a job-level `always()`.
+- LLM-judge skill quality evals require a clarity score of 3 instead of 4; completeness and actionability bars are unchanged. The cookie setup judge keeps its manually approved thresholds.
+- Two timing-sensitive tests allow for a heavily loaded machine: the terminal-agent startup race waits up to 8 seconds for a cold agent start, and the invalid Retry-After cases accept timer delays below the next 4-second backoff step.
+
+## [1.91.4.0] - 2026-09-28
+
+Windows users can copy signed-in cookies from Opera and Opera GX into gstack's browser. On Windows, where Chrome, Edge and Brave increasingly store App-Bound Encryption cookies that gstack cannot decrypt, Opera and Opera GX still use DPAPI-protected cookies, so they may be the browsers where import keeps working.
+
+### Added
+- `cookie-import-browser opera` and `opera-gx` (also `operagx` and "Opera GX") on Windows, read from `%APPDATA%\Opera Software\Opera Stable` or `Opera GX Stable` in `Default` or `Profile N` directories. Legacy root-level layouts, Opera side profiles and portable installs are not detected. Includes the Opera registry and Roaming-root contribution from @mvanhorn in #2980 (refs #2957).
+
+### Fixed
+- Windows v10 cookies from current Chromium databases decrypted with 32 bytes of hash in front of the value, so imports could report success while the site stayed signed out. The SHA-256(host_key) prefix is now removed when present, for Chrome, Chromium, Edge and Brave as well as Opera.
+- App-Bound Encryption rows in a browser without native extraction keep their receipt (counts and reasons) and name the recovery: `$B handoff`, sign in, `$B resume`. Partial imports warn that the session may not be restored.
+- Missing browsers, missing profiles and ambiguous profile selection now say what was checked and what to run next, including which OS supports a browser and the typeable browser names available on this one. CLI receipts list failure reasons.
+- A relative `APPDATA` no longer redirects the Opera root.
+
+### Changed
+- BROWSER.md has a Windows Opera walkthrough and tables for receipt failure reasons and import error codes; a free test keeps the browser lists in the docs and command reference in step with the registry.
+- A Windows CI test decrypts a host-bound Opera cookie with real DPAPI through the Node server runtime. Real Opera sessions on Windows are still awaiting confirmation from the issue reporter.
+
+## [1.91.2.0] - 2026-09-25
+
+`/sync-gbrain` can check whether the current worktree's pages are readable without writing a probe page or deleting guidance when the answer is uncertain.
+
+### Fixed
+- Readiness now matches the registered source to this worktree before checking its page count, then reads a page from that same source. A foreign pin, failed read, invalid count, or unavailable service stays `unknown` and preserves existing guidance; a verified empty source can still offer reindexing.
+- The Windows readiness fixture invokes the same Bun-backed `gbrain` command through a `.cmd` shim and preserves the inherited PATH spelling and separator.
+- Importing terminal-agent helpers no longer boots the CLI or installs global process handlers; direct launches still enforce their startup-record check.
+- The developer-experience question-floor check recognizes a grounded target choice by its structure rather than one phrasing, without accepting unrelated answers.
+- Engineering review follows its preparation and complexity-gate paths in order, keeps each decision and required report write verifiable, and never enables calibration write-back without its explicit gate.
+
+### Changed
+- The PR evaluation plan includes source-scoped readiness coverage and the resulting judge and supervision budgets without reducing individual test timeouts, retries, or concurrency.
+
+## [1.91.1.0] - 2026-09-25
+
+### Fixed
+
+- Find Impeccable installed through the Claude Code plugin marketplace, including a trusted custom `CLAUDE_CONFIG_DIR`. Preserve traditional skill installs and the existing explicit-engine, PATH and standalone-cache priority.
+- Select plugin versions deterministically with strict semver ordering and support for hash-named versions. Keep a selected installation's launcher, engine and engine version together instead of borrowing an older plugin's engine.
+- Use the same strict ordering for the standalone engine cache, retaining its semver-only policy and precedence. Do not follow cache directory symlinks or repository configuration links into unrelated filesystem trees.
+- Preserve repository and symlink execution boundaries, sanitize discovery diagnostics, and quote or suppress launcher hints when a filename cannot be represented safely. Discovery never downloads or runs a launcher; engine compatibility warnings and install consent remain unchanged.
+- Compare canonical HOME paths at the trust boundary, so home-directory aliases and dotfiles repositories do not hide user-installed engines or admit private home files as scan targets.
+- Add plugin discovery, handoff, malformed-version and adversarial-path regressions, plus Windows-safe discovery cases selected by the native Windows test lane.
+
+Includes the plugin-cache discovery contribution from @SomSamantray in #2976.
+
 ## [1.90.2.0] - 2026-09-24
 
 **Spend less time waiting for tests.**

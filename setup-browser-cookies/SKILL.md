@@ -176,25 +176,28 @@ If `NEEDS_SETUP`:
 3. If `bun` is not installed:
    ```bash
    if ! command -v bun >/dev/null 2>&1; then
-     BUN_VERSION="1.3.10"
-     BUN_INSTALL_SHA="bab8acfb046aac8c72407bdcce903957665d655d7acaa3e11c7c4616beae68dd"
-     tmpfile=$(mktemp)
-     curl -fsSL "https://bun.sh/install" -o "$tmpfile"
-     # shasum is macOS/perl; coreutils-only Linux ships sha256sum instead —
-     # resolve whichever exists so the verify never fails on a missing tool.
-     if command -v sha256sum >/dev/null 2>&1; then
-       actual_sha=$(sha256sum "$tmpfile" | awk '{print $1}')
-     else
-       actual_sha=$(shasum -a 256 "$tmpfile" | awk '{print $1}')
-     fi
-     if [ "$actual_sha" != "$BUN_INSTALL_SHA" ]; then
-       echo "ERROR: bun install script checksum mismatch" >&2
-       echo "  expected: $BUN_INSTALL_SHA" >&2
-       echo "  got:      $actual_sha" >&2
-       rm "$tmpfile"; exit 1
-     fi
-     BUN_VERSION="$BUN_VERSION" bash "$tmpfile"
-     rm "$tmpfile"
+     (
+       set -eu
+       BUN_VERSION="1.4.2"
+       BUN_INSTALL_SHA="04882bf41679d49d9af108657a1e5515bf04fdf2940d12c0d0b1e5d79dc53be8"
+       tmpfile=$(mktemp)
+       trap 'rm -f "$tmpfile"' EXIT
+       curl -fsSL "https://raw.githubusercontent.com/oven-sh/bun/744846f844374847c902b5e7fd59b4342a51ef99/src/runtime/cli/install.sh" -o "$tmpfile"
+       # shasum is macOS/perl; coreutils-only Linux ships sha256sum instead —
+       # resolve whichever exists so the verify never fails on a missing tool.
+       if command -v sha256sum >/dev/null 2>&1; then
+         actual_sha=$(sha256sum < "$tmpfile" | awk '{print $(1)}')
+       else
+         actual_sha=$(shasum -a 256 < "$tmpfile" | awk '{print $(1)}')
+       fi
+       if [ "$actual_sha" != "$BUN_INSTALL_SHA" ]; then
+         echo "ERROR: bun install script checksum mismatch" >&2
+         echo "  expected: $BUN_INSTALL_SHA" >&2
+         echo "  got:      $actual_sha" >&2
+         exit 1
+       fi
+       bash "$tmpfile" "bun-v$BUN_VERSION"
+     )
    fi
    ```
 
