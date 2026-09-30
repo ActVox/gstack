@@ -68,10 +68,11 @@ function collectPins(): Pin[] {
     version: gitlabPin ? gitlabPin[1] : '<no BUN_VERSION>',
   });
 
-  const bootstrapPath = 'scripts/ubicloud/setup-free-suite.sh';
-  const bootstrap = fs.readFileSync(path.join(ROOT, bootstrapPath), 'utf-8');
-  const bootstrapPin = bootstrap.match(/^BUN_VERSION=["']?([\d.]+)["']?$/m);
-  pins.push({ surface: bootstrapPath, version: bootstrapPin?.[1] ?? '<no BUN_VERSION>' });
+  for (const bootstrapPath of ['scripts/ubicloud/setup-free-suite.sh', 'setup', 'scripts/resolvers/browse.ts']) {
+    const bootstrap = fs.readFileSync(path.join(ROOT, bootstrapPath), 'utf-8');
+    const bootstrapPin = bootstrap.match(/^\s*BUN_VERSION=["']?([\d.]+)["']?$/m);
+    pins.push({ surface: bootstrapPath, version: bootstrapPin?.[1] ?? '<no BUN_VERSION>' });
+  }
 
   // Native qualification must test the same runtime CI installs. These are
   // input requirements only; changing a pin never grants qualification credit.

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -48,9 +48,65 @@ function skill(host: string, name: string) {
   return readFileSync(join(rendered, host === 'claude' ? name : `.agents/skills/${name.startsWith('gstack-') ? name : `gstack-${name}`}`, 'SKILL.md'), 'utf8');
 }
 
+function exerciseInstaller(snippet: string) {
+  const installerUrl = 'https://raw.githubusercontent.com/oven-sh/bun/744846f844374847c902b5e7fd59b4342a51ef99/src/runtime/cli/install.sh';
+  const installerHash = '04882bf41679d49d9af108657a1e5515bf04fdf2940d12c0d0b1e5d79dc53be8';
+  expect(snippet).toContain(installerUrl);
+  expect(snippet).toContain(`BUN_INSTALL_SHA="${installerHash}"`);
+  const seed = '#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$FIXTURE_ARGS"\n[ "$FIXTURE_MODE" != installer-failure ] || exit 29\n';
+  const seedHash = createHash('sha256').update(seed).digest('hex');
+  for (const hashTool of ['sha256sum', 'shasum']) for (const mode of ['success', 'mismatch', 'download-failure', 'installer-failure']) {
+    const directory = mkdtempSync(join(root, 'installer-'));
+    const seedPath = join(directory, 'seed');
+    const argsPath = join(directory, 'args');
+    const tempPath = join(directory, 'download');
+    writeFileSync(seedPath, seed + (mode === 'mismatch' ? '# corrupted download\n' : ''));
+    const prelude = `${process.platform === 'win32' ? windowsShasumShim : ''}
+command() {
+  if [ "$*" = '-v bun' ]; then return 1; fi
+  if [ "$*" = '-v sha256sum' ] && [ "$FIXTURE_HASH_TOOL" = shasum ]; then return 1; fi
+  builtin command "$@"
+}
+mktemp() { printf '%s' "$FIXTURE_TEMP"; }
+curl() {
+  [ "$*" = "-fsSL ${installerUrl} -o $FIXTURE_TEMP" ] || return 98
+  [ "$FIXTURE_MODE" != download-failure ] || return 22
+  cp "$FIXTURE_SEED" "$FIXTURE_TEMP"
+}
+`;
+    const result = run(prelude + snippet.replace(installerHash, seedHash), {
+      FIXTURE_SEED: seedPath.replaceAll('\\', '/'), FIXTURE_ARGS: argsPath.replaceAll('\\', '/'),
+      FIXTURE_TEMP: tempPath.replaceAll('\\', '/'), FIXTURE_MODE: mode, FIXTURE_HASH_TOOL: hashTool,
+    });
+    expect(result.status, `${hashTool}/${mode}: ${result.stderr}`).toBe(
+      mode === 'success' ? 0 : mode === 'mismatch' ? 1 : mode === 'download-failure' ? 22 : 29);
+    expect(existsSync(tempPath)).toBe(false);
+    if (mode === 'success' || mode === 'installer-failure') {
+      expect(readFileSync(argsPath, 'utf8')).toBe('bun-v1.4.2\n');
+    } else {
+      expect(existsSync(argsPath)).toBe(false);
+      if (mode === 'mismatch') expect(result.stderr).toContain('checksum mismatch');
+    }
+  }
+}
+
+test('setup emits a pinned, checksum-enforced installer with cleanup and failure propagation', () => {
+  const result = run('command() { return 1; }; source "$SETUP_SCRIPT"', {
+    SETUP_SCRIPT: join(import.meta.dir, '..', 'setup').replaceAll('\\', '/'),
+  });
+  expect(result.status).toBe(1);
+  const snippet = result.stderr.split('Install with checksum verification:\n')[1];
+  expect(snippet).toBeDefined();
+  exerciseInstaller(snippet);
+});
+
 for (const host of ['claude', 'codex'] as const) for (const args of [[], tenArguments]) {
   const apply = (s: string) => host === 'claude' ? substitute(s, args) : s;
   const label = `${host}/${args.length} arguments`;
+  test(`${label}: rendered installer pins the runtime and fails closed before execution`, () => {
+    const snippet = skill(host, 'open-gstack-browser').match(/```bash\n(\s*if ! command -v bun[\s\S]*?)```/)![1];
+    exerciseInstaller(apply(snippet));
+  });
   test(`${label}: exact rendered literals survive host expansion`, () => {
     const setup = skill(host, 'open-gstack-browser');
     const actual = {
