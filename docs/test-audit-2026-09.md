@@ -47,7 +47,7 @@ No artifact shows a product failure, so C3's issue is not opened; C0-kept TODO e
 
 ## Security mapping (F)
 
-| design/test/serve.test.ts mirror 'path traversal protection' (5) | design/test/serve.test.ts real serve() reload confinement | removing startsWith(allowedDir) guard in design/src/serve.ts → test 1 fails | 
+| design/test/serve.test.ts mirror 'path traversal protection' (5) | design/test/serve.test.ts real serve() reload confinement | removing startsWith(allowedDir) guard in design/src/serve.ts → test 1 fails |
 | browse/test/terminal-agent-internal-handler.test.ts 1–3 (internalHandler/route source greps; auth gate for grant+revoke) | browse/test/terminal-agent-integration.test.ts "/internal/grant and /internal/revoke bearer auth" (no/wrong/valid × grant/revoke + state effect) | revoke route rewritten without internalHandler (no bearer check) → "revoke: no token…" and "unauthenticated revoke…" fail |
 | server-security-surface "/health carries no security field and server.ts does not import getStatus" (#2557) | extension-token "GET /health is liveness-only" (real /health body, default + headed/pinned-origin) | injecting `security: 'protected'` into the /health body → 2 fail |
 | server-security-surface "security.ts no longer exports the unfed status surface" | same /health body check: the only consumer of getStatus was /health.security; an unused export has no user-visible effect | (covered by the row above) |
