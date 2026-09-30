@@ -68,6 +68,30 @@ function collectPins(): Pin[] {
     version: gitlabPin ? gitlabPin[1] : '<no BUN_VERSION>',
   });
 
+  const bootstrapPath = 'scripts/ubicloud/setup-free-suite.sh';
+  const bootstrap = fs.readFileSync(path.join(ROOT, bootstrapPath), 'utf-8');
+  const bootstrapPin = bootstrap.match(/^BUN_VERSION=["']?([\d.]+)["']?$/m);
+  pins.push({ surface: bootstrapPath, version: bootstrapPin?.[1] ?? '<no BUN_VERSION>' });
+
+  // Native qualification must test the same runtime CI installs. These are
+  // input requirements only; changing a pin never grants qualification credit.
+  for (const [name, count] of [
+    ['.github/scripts/run-dia-native-qualification.ts', 2],
+    ['.github/scripts/qualify-dia-macos.ts', 3],
+    ['.github/scripts/dia-launch-driver.mjs', 3],
+    ['browse/test/cookie-import-native-qualification.ts', 1],
+  ] as const) {
+    const source = fs.readFileSync(path.join(ROOT, name), 'utf-8');
+    const checks = [...source.matchAll(/(?:\bBun\.version|\bprocess\.versions\.bun|\bplatform\?\.bun)\s*!==\s*'([\d.]+)'|\bruntime\s*===\s*'bun'\s*\?\s*'([\d.]+)'/g)];
+    if (checks.length !== count) {
+      pins.push({ surface: name, version: `<expected ${count} native runtime pins; found ${checks.length}>` });
+    }
+    for (const check of checks) {
+      const line = source.slice(0, check.index).split('\n').length;
+      pins.push({ surface: `${name}:${line}`, version: check[1] ?? check[2] });
+    }
+  }
+
   return pins;
 }
 
