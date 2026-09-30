@@ -26,6 +26,10 @@ interface Pin {
 function collectPins(): Pin[] {
   const pins: Pin[] = [];
 
+  const mise = fs.readFileSync(path.join(ROOT, '.mise.toml'), 'utf-8');
+  const misePin = mise.match(/^bun\s*=\s*["']([\d.]+)["']/m);
+  pins.push({ surface: '.mise.toml', version: misePin?.[1] ?? '<no pinned Bun runtime>' });
+
   for (const name of fs.readdirSync(WORKFLOWS_DIR).sort()) {
     if (!/\.ya?ml$/.test(name)) continue;
     const source = fs.readFileSync(path.join(WORKFLOWS_DIR, name), 'utf-8');

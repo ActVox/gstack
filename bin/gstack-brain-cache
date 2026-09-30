@@ -188,8 +188,10 @@ function resolveGbrainMcpEntry(
       if (!val || typeof val !== 'object') continue;
       const entry = val.mcpServers?.gbrain;
       if (!entry || typeof entry !== 'object') continue;
-      const isAncestor =
-        cwd === key || cwd.startsWith(`${key}/`) || cwd.startsWith(`${key}\\`);
+      // Match the classifier and skill-start: roots already carry a separator.
+      const isAncestor = cwd === key
+        || cwd.startsWith(key.endsWith('/') ? key : `${key}/`)
+        || cwd.startsWith(key.endsWith('\\') ? key : `${key}\\`);
       if (!isAncestor) continue;
       if (!best || key.length > best.key.length) best = { key, entry };
     }

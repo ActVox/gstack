@@ -16,8 +16,10 @@ Curated Codex and Claude installations can use the latest GStack workflows while
 - Integrates upstream 1.91.9.0 with the fork's GitHub-hosted CI and disabled-by-default paid evals.
 - Preserves separate generated directories for each host and resolves runtime assets from the selected checkout.
 - Adds review-section indexes to all four lean planning reviews so methodology loading succeeds.
+- Retains PDF setup in the lean profile and refuses output paths that alias the source checkout or mix host layouts.
+- Fixes GBrain MCP discovery when an ancestor project is the filesystem or drive root.
 - Accepts a real registry Unix socket on macOS without resolving the socket leaf itself; symlinked socket leaves remain rejected.
-- Pins the build runtime to Bun 1.4.2 and retains the browser smoke checks.
+- Pins local and CI builds to Bun 1.4.2 and retains the browser smoke checks.
 
 ## [1.91.9.0] - 2026-09-29
 

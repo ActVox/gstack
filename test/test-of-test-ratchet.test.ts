@@ -101,6 +101,7 @@ const BASELINE = [
   'test/explain-level-config.test.ts',
   'test/extension-pty-inject-invariant.test.ts',
   'test/founder-resources-optout.test.ts',
+  'test/fork-ci-runner-policy.test.ts', // exercises deployed workflow YAML and the CI Dockerfile; neither is a TypeScript import target
   'test/free-tests-workflow-wiring.test.ts',
   'test/gbrain-lib-validate-varname.test.ts',
   'test/gbrain-lib-verify.test.ts',

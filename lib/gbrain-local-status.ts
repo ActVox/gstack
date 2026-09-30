@@ -220,8 +220,10 @@ export function hasRemoteOnlyGbrainMcp(
       if (!proj || typeof proj !== "object") continue;
       const entries = gbrainEntries((proj as { mcpServers?: unknown }).mcpServers);
       if (Object.keys(entries).length === 0) continue;
-      const isAncestor =
-        cwd === key || cwd.startsWith(`${key}/`) || cwd.startsWith(`${key}\\`);
+      // Filesystem roots already end in a separator; do not turn / into //.
+      const isAncestor = cwd === key
+        || cwd.startsWith(key.endsWith('/') ? key : `${key}/`)
+        || cwd.startsWith(key.endsWith('\\') ? key : `${key}\\`);
       if (!isAncestor) continue;
       if (bestKey === null || key.length > bestKey.length) {
         bestKey = key;

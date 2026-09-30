@@ -345,11 +345,14 @@ describe('Office Hours real session runner with fake processes', () => {
       // Wait synchronously until the child has written and exited, preventing Bun
       // from dispatching its stdout/exit callbacks before cancellation.
       const completed = path.join(dir, 'completed');
+      // The marker precedes `exit 7`; seeing it alone can race with SIGKILL.
+      const exited = () => fs.existsSync(completed)
+        && !running(Number(fs.readFileSync(path.join(dir, 'parent.pid'), 'utf8')));
       const waitDeadline = Date.now() + 2_000;
-      while (!fs.existsSync(completed) && Date.now() < waitDeadline) {
+      while (!exited() && Date.now() < waitDeadline) {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
       }
-      expect(fs.existsSync(completed)).toBe(true);
+      expect(exited()).toBe(true);
       controller.abort();
       const captured = await pending;
       expect(captured.exitReason).toBe('exit_code_7');
