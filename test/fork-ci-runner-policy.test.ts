@@ -34,8 +34,21 @@ describe('ActVox CI runner policy', () => {
     expect(source).not.toContain('mirror.hetzner.com');
   });
 
+  test('the periodic re-dispatch job can only follow a paid report', () => {
+    // Upstream's wiring test pins this job's exact `if`, so the fork does not add
+    // its own ENABLE_PAID_EVALS clause. A skipped `report` leaves its output
+    // empty, which keeps the job from ever dispatching another paid run.
+    const source = fs.readFileSync(path.join(WORKFLOWS, 'evals-periodic.yml'), 'utf8');
+    const body = source.split('\n  redispatch:\n')[1]!.split(/^  [a-zA-Z0-9_-]+:\n/m)[0]!;
+    expect(body).toContain('needs: report');
+    expect(body).toContain("needs.report.outputs.redispatch == 'true'");
+    expect(body).toContain('runs-on: ubuntu-latest');
+    const report = source.split('\n  report:\n')[1]!.split(/^  [a-zA-Z0-9_-]+:\n/m)[0]!;
+    expect(report).toContain("vars.ENABLE_PAID_EVALS == 'true'");
+  });
+
   test('paid eval jobs stay disabled until ActVox explicitly provisions credentials', () => {
-    for (const name of ['evals.yml', 'evals-periodic.yml']) {
+    for (const name of ['evals.yml', 'evals-periodic.yml', 'evals-marathon.yml']) {
       const source = fs.readFileSync(path.join(WORKFLOWS, name), 'utf8');
       const jobStarts = [...source.matchAll(/^  (build-image|evals|plan-slices|eval-slices|gate-census|report|slices-report):\n/gm)];
       expect(jobStarts.length, `${name}: paid job census unexpectedly empty`).toBeGreaterThan(0);

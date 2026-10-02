@@ -4,8 +4,13 @@ import { createHash } from 'crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { detectEndpointHash } from '../bin/gstack-brain-cache';
 import { hasRemoteOnlyGbrainMcp } from '../lib/gbrain-local-status';
+
+// bin/gstack-brain-cache has no extension, so a literal specifier cannot be typed
+// by tsc and would add a new test-typecheck diagnostic; resolve it by path instead.
+const { detectEndpointHash } = await import(join(import.meta.dir, '..', 'bin', 'gstack-brain-cache')) as {
+  detectEndpointHash: (claudeJsonPath?: string, cwd?: string) => string;
+};
 
 const REMOTE = { type: 'http', url: 'https://brain.example.invalid/mcp' };
 const LOCAL = { type: 'stdio', command: 'gbrain' };
