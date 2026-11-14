@@ -23,6 +23,7 @@ import * as path from 'path';
 import type { ParityBaseline, SkillBaselineEntry } from './capture-parity-baseline';
 import { captureBaseline } from './capture-parity-baseline';
 import { CARVE_GUARDS } from './carve-guards';
+import { ledgerFailure, readSizeLedger } from './size-ledger';
 
 export interface ParityInvariant {
   skill: string;
@@ -50,6 +51,8 @@ export interface ParityInvariant {
   sectioned?: boolean;
   /** Max bytes for the always-loaded skeleton SKILL.md (carved skills only). */
   maxSkeletonBytes?: number;
+  /** Size ledger directory (test/helpers/size-ledger.ts): union bytes must equal its total; replaces maxSizeRatio. */
+  sizeLedger?: string;
 }
 
 export interface ParityCheckResult {
@@ -121,7 +124,10 @@ export function checkSkillParity(
   }
 
   // SIZE checks (union bytes for carved skills, skeleton bytes for monoliths)
-  if (invariant.maxSizeRatio !== undefined && baseline) {
+  if (invariant.sizeLedger !== undefined) {
+    const failure = ledgerFailure(invariant.skill, checkBytes, readSizeLedger(repoRoot, invariant.sizeLedger), baseline?.skillMdBytes);
+    if (failure) failures.push(failure);
+  } else if (invariant.maxSizeRatio !== undefined && baseline) {
     const ratio = checkBytes / baseline.skillMdBytes;
     if (ratio > invariant.maxSizeRatio) {
       failures.push(`size ratio ${ratio.toFixed(3)} > maxSizeRatio ${invariant.maxSizeRatio}`);
@@ -208,22 +214,6 @@ const MONOLITH_INVARIANTS: ParityInvariant[] = [
   // cso is now carved — its invariant is generated from CARVE_GUARDS below.
   // review, codex, land-and-deploy (w1), autoplan (w2), qa (w3) carved in token-reduction Phase 4
   // wave 1 (v1.69.x branch) — their invariants generate from CARVE_GUARDS too.
-  {
-    skill: 'investigate',
-    mustContain: ['root cause', 'hypothes'],
-    mustHaveHeadings: ['## Preamble', '## When to invoke'],
-    // Cross-cutting preamble growth (v1.57.2.0 AUQ-failure prose fallback ~2KB + the
-    // cross-session decision-memory nudge) lands this skill just over the strict 1.05;
-    // headroom for the shared preamble additions (matches the carved-skill overrides).
-    // v1.2.0 activation lift adds the first-run-guidance section on top.
-    // 1.09 → 1.10: the plan-mode preamble reword (scope-gate auto-select-B
-    // change) adds ~250 B to every skill's shared preamble; investigate was
-    // the closest to its ceiling (landed 1.092).
-        // Fork port wave 2 (D1): the evidence-before-claimed-limitations preamble
-    // directive adds ~0.45KB to every tier-2+ skill. Measured values noted.
-    maxSizeRatio: 1.12, // D1 measured
-    minBytes: 30_000,
-  },
 ];
 
 /**
@@ -243,8 +233,8 @@ const CARVED_INVARIANTS: ParityInvariant[] = Object.values(CARVE_GUARDS).map((g)
   mustContain: g.mustContain,
   // CSO's helper trust boundary requires its private startup; demanding the
   // shared Preamble here would silently reintroduce conflicting policy.
-  mustHaveHeadings: g.skill === 'cso' ? ['## When to invoke'] : ['## Preamble', '## When to invoke'],
-  maxSizeRatio: g.maxSizeRatio ?? 1.05,
+  mustHaveHeadings: g.skill === 'cso' ? [] : ['## Preamble'],
+  ...(g.sizeLedger ? { sizeLedger: g.sizeLedger } : { maxSizeRatio: g.maxSizeRatio ?? 1.05 }),
 }));
 
 export const PARITY_INVARIANTS: ParityInvariant[] = [

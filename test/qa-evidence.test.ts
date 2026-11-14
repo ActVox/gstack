@@ -7,6 +7,7 @@ import { createHash, randomBytes } from 'node:crypto';
 
 import { qaCommandAllowed } from './helpers/qa-functional-observer';
 import { qaCallerCommandAllowed } from './helpers/qa-callers-fixture';
+import { expectMentions } from './helpers/prompt-structure';
 
 const CLI = path.resolve(import.meta.dir, '../bin/gstack-qa-evidence');
 const ROOT = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'qa-evidence-'));
@@ -162,33 +163,70 @@ test('public permission never exposes detected credentials in output or receipts
 test.each(['resumed', 'blocked-forever'])('evidence receipts survive a genuinely %s stdout pipe without extending command execution', async mode => {
   const f = fixture();
   const preload = path.join(f.root, 'full-pipe.ts');
-  fs.writeFileSync(preload, `import { write } from 'node:fs'; if (process.argv[1] === ${JSON.stringify(CLI)}) { write(1, Buffer.alloc(2 * 1024 * 1024, 32), () => {}); await Bun.sleep(100); }`);
-  const child = spawn(process.execPath, ['--preload', preload, CLI, 'capture', f.root, '001', '--timeout-ms', '1000', '--', process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(path.join(f.root, 'effect'))}, 'once'); process.exit(69);`], { cwd: f.root, stdio: ['ignore', 'pipe', 'pipe'] });
+  const writing = path.join(f.root, 'stdout-writing');
+  const saturated = path.join(f.root, 'stdout-saturated');
+  // POSIX: stdout is a FIFO this test never reads until it chooses to, so the
+  // 2 MB write is held by the kernel, not by how the runtime buffers a paused
+  // child stream (under load Bun could drain a paused pipe and let the child
+  // finish early). Windows keeps the paused child pipe.
+  const fifo = process.platform === 'win32' ? null : path.join(f.root, 'stdout.fifo');
+  if (fifo) expect(spawnSync('mkfifo', [fifo], { timeout: 5000 }).status).toBe(0);
+  const readFd = fifo ? fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK) : -1;
+  const writeFd = fifo ? fs.openSync(fifo, 'w') : -1;
+  fs.writeFileSync(preload, `import { existsSync, write, writeFileSync } from 'node:fs'; if (process.argv[1] === ${JSON.stringify(CLI)}) { write(1, Buffer.alloc(2 * 1024 * 1024, 32), () => {}); writeFileSync(${JSON.stringify(writing)}, ''); while (!existsSync(${JSON.stringify(saturated)})) await Bun.sleep(10); }`);
+  const child = spawn(process.execPath, ['--preload', preload, CLI, 'capture', f.root, '001', '--timeout-ms', '1000', '--', process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(path.join(f.root, 'effect'))}, 'once'); process.exit(69);`], { cwd: f.root, stdio: ['ignore', fifo ? writeFd : 'pipe', 'pipe'] });
+  if (fifo) fs.closeSync(writeFd);
   let stdout = '', stderr = '';
-  child.stdout!.on('data', bytes => { stdout += bytes; });
+  const drain = () => {
+    if (!fifo) return;
+    const buffer = Buffer.alloc(65536);
+    for (;;) {
+      let read = 0;
+      try { read = fs.readSync(readFd, buffer, 0, buffer.length, null); } catch (error: any) { if (error.code === 'EAGAIN') return; throw error; }
+      if (read === 0) return;
+      stdout += buffer.subarray(0, read).toString();
+    }
+  };
+  child.stdout?.on('data', bytes => { stdout += bytes; });
   child.stderr!.on('data', bytes => { stderr += bytes; });
-  child.stdout!.pause();
+  child.stdout?.pause();
   const finished = new Promise<number | null>(resolve => child.once('exit', resolve));
   const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let draining: ReturnType<typeof setInterval> | undefined;
   try {
+    if (fifo) {
+      for (let index = 0; index < 300 && !fs.existsSync(writing); index++) await Bun.sleep(10);
+      expect(fs.existsSync(writing)).toBe(true);
+    } else {
+      for (let index = 0; index < 300 && child.stdout!.readableLength < child.stdout!.readableHighWaterMark; index++) await Bun.sleep(10);
+      expect(child.stdout!.readableLength).toBeGreaterThanOrEqual(child.stdout!.readableHighWaterMark);
+    }
+    fs.writeFileSync(saturated, '');
     const file = path.join(f.root, '.qa-evidence/001/receipt.json');
     for (let index = 0; index < 300 && !fs.existsSync(file); index++) await Bun.sleep(10);
     expect(fs.existsSync(file)).toBe(true);
     expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toMatchObject({ status: 'complete', exitCode: 69 });
     expect(fs.readFileSync(path.join(f.root, 'effect'), 'utf8')).toBe('once');
     expect(child.exitCode).toBeNull();
-    if (mode === 'resumed') child.stdout!.resume();
+    if (mode === 'resumed') {
+      child.stdout?.resume();
+      if (fifo) draining = setInterval(drain, 5);
+    }
     const exit = await Promise.race([finished, new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), 7000); })]);
     expect(exit, stderr).toBe(mode === 'resumed' ? 69 : 2);
-    child.stdout!.resume();
+    clearInterval(draining);
+    drain();
+    child.stdout?.resume();
     await closed;
     if (mode === 'resumed') expect(receipt(stdout.split('\n').find(line => line.startsWith('QA_EVIDENCE '))!)).toMatchObject({ status: 'complete', exitCode: 69 });
   } finally {
     clearTimeout(timer);
-    child.stdout!.resume();
+    clearInterval(draining);
+    child.stdout?.resume();
     child.kill('SIGKILL');
     await closed;
+    if (fifo) fs.closeSync(readFd);
   }
 }, 15_000);
 
@@ -432,6 +470,35 @@ test('a superseded row closes only when the same native probe was rerun on the c
   expect(materialize(row('001', 'superseded'), row('002', 'pass'), row('003', 'pass'))).toEqual({ status: 'pass', open: [] });
 });
 
+test('every capture after an input change names the commands still to rerun, until each has run on current inputs', () => {
+  // gate-census-6 of run 37158847998: the fixture locale changed after captures 001 and 002; the agent reran
+  // only input 9, materialized once with capture 001 still open, and the published verdict stayed inconclusive.
+  const f = fixture();
+  const hypothesis = 'The input snapshot changed, so the earlier probes must be rerun on current inputs next.';
+  const program = (input: string) => `console.log(JSON.stringify({ snapshot: require('node:fs').readFileSync('snap', 'utf8'), input: '${input}' }))`;
+  const probe = (id: string, after: string, input: string) => receipt(f.run('capture', f.root, id, '--timeout-ms', '4000', '--after', after, '--hypothesis', hypothesis, '--', process.execPath, '-e', program(input)).stdout);
+  const command = (input: string) => [process.execPath, '-e', program(input)].join(' ');
+  fs.writeFileSync(path.join(f.root, 'snap'), 'C');
+  expect(receipt(f.capture('001', program('3')).stdout).revalidate).toBeUndefined();
+  expect(probe('002', '001', '9').revalidate).toBeUndefined();
+  fs.writeFileSync(path.join(f.root, 'snap'), 'POSIX');
+  const changed = probe('003', '002', '10');
+  expect(changed.revalidate).toEqual([command('3'), command('9')]);
+  expectMentions(changed.next, [['cannot', 'materialize', 'verdict']], 'changed.next');
+  expect(probe('004', '003', '9').revalidate).toEqual([command('3')]);
+  const current = probe('005', '004', '3');
+  expect(current.revalidate).toBeUndefined();
+  expect(current.next).not.toContain('Inputs changed');
+  const row = (capture: string, classification: string) => ({ capture, command: `capture ${capture}`, contract: 'README.md', expected: 'declared', classification });
+  f.json('annotations.json', { revision: 'fixture-revision', limits: ['Locale changed after capture 002.'],
+    evidence: [row('001', 'superseded'), row('002', 'superseded'), row('003', 'pass'), row('004', 'pass'), row('005', 'pass')] });
+  const materialized = f.run('materialize', f.root, 'annotations.json');
+  expect(materialized.status, materialized.stderr).toBe(0);
+  expect(receipt(materialized.stdout).verdict).toEqual({ status: 'pass', open: [] });
+  expect(receipt(materialized.stdout).next).toContain('this verdict is final. Next, write the Markdown report beside evidence.json.');
+  expect(receipt(materialized.stdout).next).not.toContain('report root');
+});
+
 test('a descriptive classification is rejected before publication, so the corrected label can still materialize', () => {
   // gate-census-6 of run 36920606897: "pass (current snapshot)" left the one-shot verdict inconclusive.
   const f = fixture();
@@ -457,6 +524,43 @@ test('captures list declared-but-unrun required probes without judging them', ()
   expect(receipt(result.stdout).requiredRemaining).toEqual(['bun run probe -- reject']);
 });
 
+test('post-repair required probes count only captures started after the last fixture-declared source edit', () => {
+  const f = fixture();
+  const src = path.join(f.root, 'src');
+  fs.mkdirSync(src);
+  fs.writeFileSync(path.join(src, 'worker.ts'), 'export const effect = 1;\n');
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(path.join(src, 'worker.ts'), old, old);
+  fs.utimesSync(src, old, old);
+  const probe = (program: string) => [process.execPath, '-e', program];
+  const [duplicate, partial] = [probe('console.log(JSON.stringify({scenario:"duplicate"}))'), probe('console.log(JSON.stringify({scenario:"partial"}))')];
+  const env = { ...process.env, GSTACK_QA_REQUIRED_PROBES: JSON.stringify([duplicate.join(' '), partial.join(' ')]),
+    GSTACK_QA_REQUIRED_AFTER_EDIT: JSON.stringify({ paths: [src], since: new Date(Date.now() - 30_000).toISOString() }) };
+  let last: Record<string, unknown> = {};
+  const capture = (captureId: string, argv: string[]) => {
+    const after = captureId === '001' ? [] : ['--after', String(Number(captureId) - 1).padStart(3, '0'), '--hypothesis', 'The previous scenario result shows which invariant the next probe must check.'];
+    const result = spawnSync(process.execPath, [CLI, 'capture', f.root, captureId, '--timeout-ms', '4000', ...after, '--', ...argv], { cwd: f.root, encoding: 'utf8', timeout: 10_000, env });
+    expect(result.status, result.stderr).toBe(0);
+    last = receipt(result.stdout);
+    return last.requiredRemaining as string[];
+  };
+  expect(capture('001', duplicate)).toEqual([duplicate.join(' '), partial.join(' ')]);
+  expect(capture('002', partial)).toEqual([duplicate.join(' '), partial.join(' ')]);
+  // The edit's mtime is pinned to capture 002's completion: a real write's mtime comes from the kernel's coarse clock,
+  // which lags Date.now() by up to a tick, while 002 started only one child run (a few ms on a fast machine) earlier;
+  // the GPT voice's run on 51f1e02 counted 002 as post-edit that way. 002 started before this instant and 003 after it.
+  const edit = new Date(Date.parse(String(last.completedAt)));
+  expect(Date.parse(String(last.startedAt))).toBeLessThan(edit.getTime());
+  fs.writeFileSync(path.join(src, 'worker.ts'), 'export const effect = 2;\n');
+  fs.utimesSync(path.join(src, 'worker.ts'), edit, edit);
+  expect(capture('003', duplicate)).toEqual([partial.join(' ')]);
+  expect(capture('004', partial)).toEqual([]);
+  const secondEdit = new Date(Date.now() + 60_000);
+  fs.writeFileSync(path.join(src, 'worker.ts'), 'export const effect = 3;\n');
+  fs.utimesSync(path.join(src, 'worker.ts'), secondEdit, secondEdit);
+  expect(capture('005', probe('console.log(JSON.stringify({scenario:"happy"}))'))).toEqual([duplicate.join(' '), partial.join(' ')]);
+});
+
 test('materialize accepts a single limits string as a one-item list', () => {
   const f = fixture();
   expect(f.capture('001', 'console.log(JSON.stringify({ step: 1 }))').status).toBe(0);
@@ -465,3 +569,75 @@ test('materialize accepts a single limits string as a one-item list', () => {
   expect(report.status, report.stderr).toBe(0);
   expect(JSON.parse(fs.readFileSync(path.join(f.root, 'evidence.json'), 'utf8')).limits).toEqual(['One probe only.']);
 });
+
+function refusedGroupKill(f: { root: string }, platform: NodeJS.Platform) {
+  const preload = path.join(f.root, 'refused-group-kill.ts');
+  const refused = path.join(f.root, 'refused-group-kill');
+  const group = path.join(f.root, 'refused-group');
+  fs.writeFileSync(preload, `import { appendFileSync, writeFileSync } from 'node:fs';
+if (process.argv[1] === ${JSON.stringify(CLI)}) {
+  Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} });
+  const kill = process.kill.bind(process);
+  process.kill = (pid, signal) => {
+    if (pid >= 0) return kill(pid, signal);
+    appendFileSync(${JSON.stringify(refused)}, String(signal ?? 'SIGTERM') + '\\n');
+    writeFileSync(${JSON.stringify(group)}, String(-pid));
+    throw Object.assign(new Error('kill EPERM'), { code: 'EPERM', errno: -1, syscall: 'kill' });
+  };
+}`);
+  return { preload, refused, group };
+}
+
+test.skipIf(process.platform === 'win32')('a refused group kill after the command exits still records a complete capture once the group is empty', () => {
+  const f = fixture();
+  const stub = refusedGroupKill(f, 'darwin');
+  const result = spawnSync(process.execPath, ['--preload', stub.preload, CLI, 'capture', f.root, '001', '--timeout-ms', '4000', '--', process.execPath, '-e', 'console.log("{}")'],
+    { cwd: f.root, encoding: 'utf8', timeout: 10_000 });
+  expect(fs.readFileSync(stub.refused, 'utf8')).toContain('SIGKILL');
+  expect(result.status, result.stderr).toBe(0);
+  expect(receipt(result.stdout)).toMatchObject({ status: 'complete', exitCode: 0 });
+});
+
+test.skipIf(process.platform === 'win32')('a refused group kill off macOS fails closed even once the group is empty', () => {
+  const f = fixture();
+  const stub = refusedGroupKill(f, 'linux');
+  const result = spawnSync(process.execPath, ['--preload', stub.preload, CLI, 'capture', f.root, '001', '--timeout-ms', '4000', '--', process.execPath, '-e', 'console.log("{}")'],
+    { cwd: f.root, encoding: 'utf8', timeout: 10_000 });
+  expect(fs.readFileSync(stub.refused, 'utf8')).toContain('SIGKILL');
+  expect(result.status).not.toBe(0);
+  expect(receipt(result.stdout)).toMatchObject({ status: 'incomplete', exitCode: 2 });
+});
+
+test.skipIf(process.platform === 'win32')('a refused group kill fails closed while the group still has a live member', () => {
+  const f = fixture();
+  const stub = refusedGroupKill(f, 'darwin');
+  const marker = path.join(f.root, 'member.pid');
+  const program = `const member = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); require('node:fs').writeFileSync(${JSON.stringify(marker)}, String(member.pid)); member.unref(); console.log('{}');`;
+  let pid = 0;
+  try {
+    const result = spawnSync(process.execPath, ['--preload', stub.preload, CLI, 'capture', f.root, '001', '--timeout-ms', '4000', '--', process.execPath, '-e', program],
+      { cwd: f.root, encoding: 'utf8', timeout: 10_000 });
+    pid = Number(fs.readFileSync(marker, 'utf8'));
+    expect(fs.readFileSync(stub.refused, 'utf8')).toContain('SIGKILL');
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    expect(result.status).not.toBe(0);
+    expect(receipt(result.stdout)).toMatchObject({ status: 'incomplete', exitCode: 2 });
+  } finally {
+    if (pid > 0) try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+});
+
+for (const [state, status, exitCode] of [['RE', 'complete', 0], ['UE', 'complete', 0], ['R', 'incomplete', 2], ['S', 'incomplete', 2], ['X', 'incomplete', 2], ['RX', 'incomplete', 2]] as const) {
+  test.skipIf(process.platform === 'win32')(`a refused macOS group kill reads a listed member in ps state ${state} as ${status}`, () => {
+    const f = fixture();
+    const stub = refusedGroupKill(f, 'darwin');
+    const bin = path.join(f.root, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'ps'), `#!/bin/sh\nprintf '%s ${state}\\n' "$(cat ${JSON.stringify(stub.group)})"\n`, { mode: 0o755 });
+    const result = spawnSync(process.execPath, ['--preload', stub.preload, CLI, 'capture', f.root, '001', '--timeout-ms', '4000', '--', process.execPath, '-e', 'console.log("{}")'],
+      { cwd: f.root, encoding: 'utf8', timeout: 10_000, env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` } });
+    expect(fs.readFileSync(stub.refused, 'utf8')).toContain('SIGKILL');
+    expect(result.status, result.stderr).toBe(exitCode);
+    expect(receipt(result.stdout)).toMatchObject({ status, exitCode });
+  });
+}

@@ -17,10 +17,12 @@ import { guardScreenshotPath } from './screenshot-size-guard';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { SetContentWaitUntil } from './tab-session';
-import { TEMP_DIR, isPathWithin } from './platform';
+import { TEMP_DIR } from './platform';
 import { SAFE_DIRECTORIES } from './path-security';
 import { modifyStyle, undoModification, resetModifications, getModificationHistory } from './cdp-inspector';
 import { withCdpSession } from './cdp-bridge';
+import { handleDeviceCommand, reassertDevice, refuseWhileDevice } from './device-emulation';
+import { TOUCH_COMMANDS, handleTouchCommand } from './touch-commands';
 
 /**
  * Aggressive page cleanup selectors and heuristics.
@@ -141,6 +143,8 @@ export async function handleWriteCommand(
   // Frame-aware target for locator-based operations (click, fill, etc.)
   const target = session.getActiveFrameOrPage();
   const inFrame = session.getFrame() !== null;
+  if (command === 'device') return handleDeviceCommand(args, session);
+  if (TOUCH_COMMANDS.has(command)) return handleTouchCommand(command, args, session);
 
   switch (command) {
     case 'goto': {
@@ -420,10 +424,32 @@ export async function handleWriteCommand(
     }
 
     case 'type': {
-      const text = args.join(' ');
-      if (!text) throw new Error('Usage: browse type <text>');
+      // #2936: bare `type` sends keystrokes to whatever has focus, so a selector
+      // given as the first word was typed as text. --selector targets an
+      // element; `--` ends flags so literal text may start with "--".
+      const usage = 'Usage: browse type [--selector <sel>] [--] <text>';
+      let rest = args;
+      let selector: string | undefined;
+      if (rest[0] === '--selector') {
+        selector = rest[1];
+        if (!selector) throw new Error(usage);
+        rest = rest.slice(2);
+      }
+      if (rest[0] === '--') rest = rest.slice(1);
+      const text = rest.join(' ');
+      if (!text) throw new Error(usage);
+      if (selector) {
+        const resolved = await session.resolveRef(selector);
+        const locator = 'locator' in resolved ? resolved.locator : target.locator(resolved.selector);
+        await locator.pressSequentially(text, { timeout: 5000 });
+        return `Typed ${text.length} characters into ${selector}`;
+      }
       await page.keyboard.type(text);
-      return `Typed ${text.length} characters`;
+      const first = rest[0];
+      const selectorLike = /^([#.][A-Za-z_-]|\[[^\]]+\]$|[A-Za-z][\w-]*[#.[][A-Za-z_-])/.test(first) || rest.includes('>');
+      return selectorLike
+        ? `Typed ${text.length} characters into the focused element\nhint: "${first}" looks like a CSS selector. To type into that element: browse type --selector '${first}' <text>`
+        : `Typed ${text.length} characters`;
     }
 
     case 'press': {
@@ -435,11 +461,14 @@ export async function handleWriteCommand(
 
     case 'scroll': {
       // Parse --times N and --wait ms flags
-      const timesIdx = args.indexOf('--times');
-      const times = timesIdx >= 0 ? parseInt(args[timesIdx + 1], 10) || 1 : 0;
-      const waitIdx = args.indexOf('--wait');
-      const waitMs = waitIdx >= 0 ? parseInt(args[waitIdx + 1], 10) || 1000 : 1000;
-      const selector = args.find(a => !a.startsWith('--') && args.indexOf(a) !== timesIdx + 1 && args.indexOf(a) !== waitIdx + 1);
+      let times = 0;
+      let waitMs = 1000;
+      let selector: string | undefined;
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--times') times = parseInt(args[++i], 10) || 1;
+        else if (args[i] === '--wait') waitMs = parseInt(args[++i], 10) || 1000;
+        else if (!args[i].startsWith('--') && selector === undefined) selector = args[i];
+      }
 
       if (times > 0) {
         // Repeated scroll mode
@@ -504,6 +533,7 @@ export async function handleWriteCommand(
     }
 
     case 'viewport': {
+      refuseWhileDevice(session, 'viewport');
       // Parse args: [<WxH>] [--scale <n>]. Either may be omitted, but NOT both.
       let sizeArg: string | undefined;
       let scaleArg: number | undefined;
@@ -523,18 +553,25 @@ export async function handleWriteCommand(
         } else if (sizeArg === undefined) {
           sizeArg = args[i];
         } else {
-          throw new Error(`Unexpected positional arg: ${args[i]}. Usage: viewport [WxH] [--scale <n>]`);
+          throw new Error(`Unexpected positional arg: ${args[i]}. Usage: viewport [WxH|auto] [--scale <n>]`);
         }
       }
 
       if (sizeArg === undefined && scaleArg === undefined) {
-        throw new Error('Usage: browse viewport [<WxH>] [--scale <n>]  (e.g. 375x812, or --scale 2 to keep current size)');
+        throw new Error('Usage: browse viewport [<WxH>|auto] [--scale <n>]  (e.g. 375x812, auto to unpin, or --scale 2 to keep current size)');
+      }
+
+      if (sizeArg !== undefined && ['auto', 'reset', 'unpin'].includes(sizeArg.toLowerCase())) {
+        if (scaleArg !== undefined) throw new Error('viewport auto cannot be combined with --scale or a size.');
+        return (await bm.resetViewport()) === 'window'
+          ? 'Viewport unpinned: the page follows the browser window again (refs cleared)'
+          : 'Viewport reset to default 1280x720';
       }
 
       // Resolve width/height: either from sizeArg or from current viewport if --scale-only.
       let w: number, h: number;
       if (sizeArg) {
-        if (!sizeArg.includes('x')) throw new Error('Usage: browse viewport [<WxH>] [--scale <n>] (e.g., 375x812)');
+        if (!sizeArg.includes('x')) throw new Error('Usage: browse viewport [<WxH>|auto] [--scale <n>] (e.g., 375x812)');
         const [rawW, rawH] = sizeArg.split('x').map(Number);
         w = Math.min(Math.max(Math.round(rawW) || 1280, 1), 16384);
         h = Math.min(Math.max(Math.round(rawH) || 720, 1), 16384);
@@ -639,18 +676,9 @@ export async function handleWriteCommand(
     case 'cookie-import': {
       const filePath = args[0];
       if (!filePath) throw new Error('Usage: browse cookie-import <json-file>');
-      // Path validation — resolve to absolute and check against safe dirs.
-      // Fixes #707: relative paths previously bypassed the safe directory check.
-      // Mirrors validateOutputPath() — resolves symlinks (e.g., macOS /tmp → /private/tmp).
-      const resolved = path.resolve(filePath);
-      let resolvedReal = resolved;
-      try { resolvedReal = fs.realpathSync(resolved); } catch {
-        // File may not exist yet — resolve parent dir instead
-        try { resolvedReal = path.join(fs.realpathSync(path.dirname(resolved)), path.basename(resolved)); } catch {}
-      }
-      if (!SAFE_DIRECTORIES.some(dir => isPathWithin(resolvedReal, dir))) {
-        throw new Error(`Path must be within: ${SAFE_DIRECTORIES.join(', ')}`);
-      }
+      // Path validation against safe dirs (#707: relative paths included),
+      // through the same realpath as SAFE_DIRECTORIES (#3104).
+      validateReadPath(filePath);
       if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
       const raw = fs.readFileSync(filePath, 'utf-8');
       let cookies: any[];
@@ -974,13 +1002,18 @@ export async function handleWriteCommand(
         } else if (args[i] === '--cleanup') {
           doCleanup = true;
         } else if (args[i] === '--hide' && i + 1 < args.length) {
-          // Collect all following non-flag args as selectors to hide
+          // Collect all following non-flag args as selectors to hide. A
+          // trailing image path is the output path, not a selector (#1419).
+          const values: string[] = [];
           i++;
           while (i < args.length && !args[i].startsWith('--')) {
-            hideSelectors.push(args[i]);
+            values.push(args[i]);
             i++;
           }
           i--; // Back up since the for loop will increment
+          const last = values[values.length - 1];
+          if (!outputPath && values.length > 1 && /^(\/|\.\.?\/|~)|\.(png|jpe?g|webp)$/i.test(last)) outputPath = values.pop();
+          hideSelectors.push(...values);
         } else if (args[i] === '--width' && i + 1 < args.length) {
           viewportWidth = parseInt(args[++i], 10);
           if (isNaN(viewportWidth)) throw new Error('--width must be a number');
@@ -1101,6 +1134,7 @@ export async function handleWriteCommand(
       if (viewportWidth && originalViewport) {
         await page.setViewportSize(originalViewport);
       }
+      await reassertDevice(session);
 
       const parts = ['Screenshot saved'];
       if (doCleanup) parts.push('(cleaned)');
@@ -1282,12 +1316,17 @@ export async function handleWriteCommand(
       const selectorIdx = args.indexOf('--selector');
       const selector = selectorIdx >= 0 ? args[selectorIdx + 1] : undefined;
       const dirIdx = args.indexOf('--dir');
-      const dir = dirIdx >= 0 ? args[dirIdx + 1] : path.join(TEMP_DIR, `browse-scrape-${Date.now()}`);
+      const requestedDir = dirIdx >= 0 ? args[dirIdx + 1] : path.join(TEMP_DIR, `browse-scrape-${Date.now()}`);
       const limitIdx = args.indexOf('--limit');
       const limit = Math.min(limitIdx >= 0 ? parseInt(args[limitIdx + 1], 10) || 50 : 50, 200);
 
-      validateOutputPath(dir);
+      validateOutputPath(requestedDir);
+      const dir = path.resolve(requestedDir);
       fs.mkdirSync(dir, { recursive: true });
+      // Each file is validated too: a symlink planted in an existing --dir
+      // would otherwise redirect the write outside the safe directories.
+      const manifestPath = path.join(dir, 'manifest.json');
+      validateOutputPath(manifestPath);
 
       const { extractMedia } = await import('./media-extract');
       const target = bm.getActiveFrameOrPage();
@@ -1346,6 +1385,7 @@ export async function handleWriteCommand(
           const ext = mimeToExt(ct.split(';')[0].trim());
           const filename = `${type}-${String(i + 1).padStart(3, '0')}${ext}`;
           const filePath = path.join(dir, filename);
+          validateOutputPath(filePath);
           const body = Buffer.from(await response.body());
           try {
             fs.writeFileSync(filePath, body);
@@ -1366,7 +1406,7 @@ export async function handleWriteCommand(
       }
 
       // Write manifest
-      fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2));
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
 
       return `Scraped ${toDownload.length} items to ${dir}/\n${lines.join('\n')}\n\nSummary: ${manifest.succeeded} succeeded, ${manifest.failed} failed, ${Math.round(manifest.total_size / 1024)}KB total`;
     }

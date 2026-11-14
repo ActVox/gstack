@@ -6,7 +6,7 @@ import AdmZip from "adm-zip";
 import sharp from "sharp";
 
 describe("security dependency overrides", () => {
-  for (const [name, minimum] of [["sharp", "0.35.4"], ["adm-zip", "0.6.1"]]) {
+  for (const [name, minimum] of [["sharp", "0.35.4"], ["adm-zip", "0.6.1"], ["qs", "6.16.1"], ["@hono/node-server", "2.1.3"]]) {
     test(`${name} resolves only versions at or above ${minimum}`, async () => {
       const lock = await Bun.file(join(import.meta.dir, "../bun.lock")).text();
       const versions = [...lock.matchAll(new RegExp(`"${name}@([^"]+)"`, "g"))];
@@ -16,6 +16,18 @@ describe("security dependency overrides", () => {
       }
     });
   }
+
+  test("sharp is a declared dependency, and the pinned override satisfies every range that asks for it", async () => {
+    const pkg = JSON.parse(readFileSync(join(import.meta.dir, "../package.json"), "utf8"));
+    const declared = pkg.dependencies?.sharp;
+    expect(typeof declared).toBe("string");
+    const pinned = pkg.overrides?.sharp;
+    expect(Bun.semver.satisfies(pinned, declared)).toBe(true);
+    const lock = await Bun.file(join(import.meta.dir, "../bun.lock")).text();
+    const askers = [...lock.matchAll(/"([@\w./-]+)": \["[^"]+", "", \{ "dependencies": \{[^}]*"sharp": "([^"]+)"/g)];
+    expect(askers.map(m => m[1])).toContain("@huggingface/transformers");
+    for (const [, name, range] of askers) expect({ name, ok: Bun.semver.satisfies(pinned, range) }).toEqual({ name, ok: true });
+  });
 
   test("sharp loads the patched runtime", () => {
     expect(Bun.semver.satisfies(sharp.versions.sharp, ">=0.35.4")).toBe(true);

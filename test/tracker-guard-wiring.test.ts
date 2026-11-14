@@ -42,10 +42,10 @@ const READ_PATTERNS: { name: string; re: RegExp }[] = [
 // (file, pattern-name) exemptions with reasons. Keep every entry REASONED.
 const SCANNER_EXEMPT: { file: string; pattern: string; reason: string }[] = [
   {
-    file: 'review/greptile-triage.md',
-    pattern: 'gh comment-body api read',
+    file: 'scripts/resolvers/plan-gates.ts',
+    pattern: 'gh pr body read',
     reason:
-      'raw fetch lands in /tmp json FILES (metadata/body split); body text is read into context only via the gstack-issue-guard --stdin pipes documented in the same file',
+      'F1 plan binding: only the first `Plan: <path>` token survives (one whitespace-free path, CR and backticks stripped); the body never reaches model context, and the path is then read as a file the parent confirms',
   },
   {
     file: 'document-release/sections/release-body.md.tmpl',

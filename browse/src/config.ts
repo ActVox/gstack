@@ -15,6 +15,7 @@ import * as path from 'path';
 import { mkdirSecure } from './file-permissions';
 import { safeUnlinkQuiet } from './error-handling';
 import { readConfigKey, resolveStateRoot } from '../../lib/state-root';
+import { remoteSlug } from '../../lib/remote-identity';
 
 export interface BrowseConfig {
   projectDir: string;
@@ -99,6 +100,21 @@ function isIgnoredByGit(projectDir: string, relPath: string): boolean {
   }
 }
 
+function gitExcludePath(projectDir: string): string | null {
+  try {
+    const proc = Bun.spawnSync(['git', 'rev-parse', '--git-path', 'info/exclude'], {
+    windowsHide: true,
+      cwd: projectDir, stdout: 'pipe', stderr: 'pipe',
+      timeout: 2_000,
+    });
+    if (proc.exitCode !== 0) return null;
+    const rel = proc.stdout.toString().trim();
+    return rel ? path.resolve(projectDir, rel) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Create the .gstack/ state directory if it doesn't exist.
  * Throws with a clear message on permission errors.
@@ -118,45 +134,43 @@ export function ensureStateDir(config: BrowseConfig): void {
 
   // Load-bearing guard: a self-contained ignore INSIDE the state dir so its
   // contents can NEVER be `git add`-ed, regardless of the project's own
-  // .gitignore (which may be absent, or the append below may silently fail).
-  // The state dir holds session-state.json (live cookies + localStorage/
-  // sessionStorage tokens) and browse-network.log / browse-audit.jsonl
-  // (captured request headers can carry bearer tokens). Written unconditionally,
-  // synchronously, before return — the project-.gitignore dance below is now
-  // redundant safety, kept so `.gstack/` still reads as ignored in git status.
+  // ignore rules. The state dir holds session-state.json (live cookies +
+  // localStorage/sessionStorage tokens) and browse-network.log /
+  // browse-audit.jsonl (captured request headers can carry bearer tokens).
+  // Written unconditionally, synchronously, before return.
   try {
     fs.writeFileSync(path.join(config.stateDir, '.gitignore'), '*\n');
   } catch {
-    // Best-effort; the project-.gitignore path below is the fallback.
+    // Best-effort; the repository's info/exclude below is the fallback.
   }
 
-  // Ensure .gstack/ is in the project's .gitignore
-  // First, check if git already ignores .gstack/ (via global excludes, .git/info/exclude, or parent .gitignore)
+  // Ensure git reads .gstack/ as ignored through the repository's own
+  // info/exclude, never the project's .gitignore: that file is tracked, and
+  // editing it mid-/ship changes the tree after pregate (PREGATE_STALE, #3560).
   if (isIgnoredByGit(config.projectDir, '.gstack/')) return;
-
-  const gitignorePath = path.join(config.projectDir, '.gitignore');
+  const excludePath = gitExcludePath(config.projectDir);
+  if (!excludePath) return;
   try {
-    const content = fs.readFileSync(gitignorePath, 'utf-8');
+    const content = fs.existsSync(excludePath) ? fs.readFileSync(excludePath, 'utf-8') : '';
     if (!content.match(/^\.gstack\/?$/m)) {
-      const separator = content.endsWith('\n') ? '' : '\n';
-      fs.appendFileSync(gitignorePath, `${separator}.gstack/\n`);
+      const separator = content === '' || content.endsWith('\n') ? '' : '\n';
+      fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+      fs.appendFileSync(excludePath, `${separator}.gstack/\n`);
     }
   } catch (err: any) {
-    if (err.code !== 'ENOENT') {
-      // Write warning to server log (visible even in daemon mode)
-      const logPath = path.join(config.stateDir, 'browse-server.log');
-      try {
-        fs.appendFileSync(logPath, `[${new Date().toISOString()}] Warning: could not update .gitignore at ${gitignorePath}: ${err.message}\n`);
-      } catch {
-        // stateDir write failed too — nothing more we can do
-      }
+    const logPath = path.join(config.stateDir, 'browse-server.log');
+    try {
+      fs.appendFileSync(logPath, `[${new Date().toISOString()}] Warning: could not update ${excludePath}: ${err.message}\n`);
+    } catch {
+      // stateDir write failed too — nothing more we can do
     }
-    // ENOENT (no .gitignore) — skip silently
   }
 }
 
 /**
- * Derive a slug from the git remote origin URL (owner-repo format).
+ * Derive a slug from the git remote origin URL via the shared rule in
+ * lib/remote-identity.ts (owner-repo; "<last-two>-<16 hex>" for 3+-segment
+ * nested-group remotes, #3003), so browse files state where gstack-slug does.
  * Falls back to the directory basename if no remote is configured.
  */
 export function getRemoteSlug(): string {
@@ -168,11 +182,8 @@ export function getRemoteSlug(): string {
       timeout: 2_000,
     });
     if (proc.exitCode !== 0) throw new Error('no remote');
-    const url = proc.stdout.toString().trim();
-    // SSH:   git@github.com:owner/repo.git → owner-repo
-    // HTTPS: https://github.com/owner/repo.git → owner-repo
-    const match = url.match(/[:/]([^/]+)\/([^/]+?)(?:\.git)?$/);
-    if (match) return `${match[1]}-${match[2]}`;
+    const slug = remoteSlug(proc.stdout.toString().trim());
+    if (slug) return slug;
     throw new Error('unparseable');
   } catch {
     const root = getGitRoot();
@@ -250,19 +261,21 @@ export function isPairAgentEnabled(): boolean {
 }
 
 /**
- * Resolve the Chromium profile directory.
+ * Resolve the headed Chromium profile directory.
  *
  * Resolution order:
  *   1. `explicit` arg (no production caller passes one today; kept for
  *      direct programmatic use)
  *   2. CHROMIUM_PROFILE env (used by gbrowser's gbd per-workspace)
- *   3. <resolveGstackHome()>/chromium-profile (default)
+ *   3. <project state dir>/chromium-profile (default; per project since D5,
+ *      #2492 — a machine-wide profile let one project's headed launch kill
+ *      another project's live browser)
  */
 export function resolveChromiumProfile(explicit?: string): string {
   if (explicit && explicit.length > 0) return explicit;
   const env = process.env.CHROMIUM_PROFILE;
   if (env && env.length > 0) return env;
-  return path.join(resolveGstackHome(), 'chromium-profile');
+  return path.join(resolveConfig().stateDir, 'chromium-profile');
 }
 
 /**

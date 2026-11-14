@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { inspectPreparation, railsTestConfiguration } from '../lib/cso/preparation';
 import { assertRuntimeCompatible, RUNTIME_CATALOG, rollbackCatalog, selectRuntime, validateRuntimeCatalog } from '../lib/cso/runtime-catalog';
-import { completeRuntimeCatalogFixture, qualifiedRuntimeFixture } from './helpers/cso-runtime-catalog';
+import { completeRuntimeCatalogFixture, qualifiedRuntimeFixture, unqualifiedRuntimeCatalog } from './helpers/cso-runtime-catalog';
 
 const roots: string[] = [];
 const hash = 'a'.repeat(64);
@@ -75,6 +75,17 @@ describe('CSO inert Node preparation', () => {
     const plan = inspectPreparation(fixture(nodeFiles(1)));
     expect(plan.prerequisites[0].code).toBe('UNSUPPORTED_LOCK'); expect(plan.acquisition).toEqual([]); expect(plan.metadata).toEqual([]);
   });
+  // npm 11 refuses one file loaded as both user and global config ("double-loading config").
+  test('every npm command loads distinct empty user and global configs', () => {
+    const plan = inspectPreparation(fixture(nodeFiles(3)));
+    const npm = [...plan.acquisition, ...plan.offline].filter(command => command.executable === '/usr/local/bin/npm');
+    expect(npm.length).toBeGreaterThanOrEqual(3);
+    for (const command of npm) {
+      const value = (flag: string) => command.args[command.args.indexOf(flag) + 1];
+      expect([value('--userconfig'), value('--globalconfig')]).toEqual(['/opt/cso/empty-config', '/opt/cso/empty-globalconfig']);
+    }
+    expect(readFileSync(join(import.meta.dir, '../lib/cso/images/node.Dockerfile'), 'utf8')).toContain('touch /opt/cso/empty-config /opt/cso/empty-globalconfig');
+  });
   for (const url of [CREDENTIAL_ARCHIVE_URL, 'http://registry.npmjs.org/a.tgz', 'https://registry.npmjs.org.evil.invalid/a.tgz', 'https://127.0.0.1/a.tgz', 'git+ssh://github.com/a/b', 'https://registry.npmjs.org/a.tgz?token=secret']) test(`rejects non-public archive ${url.split('@').at(-1)}`, () => {
     const files = nodeFiles(); files['package-lock.json'].packages['node_modules/cookie'].resolved = url;
     const plan = inspectPreparation(fixture(files)); expect(plan.status).toBe('prerequisites'); expect(plan.acquisition).toEqual([]);
@@ -132,6 +143,12 @@ describe('CSO inert Python preparation', () => {
     expect(plan.acquisition[0].args).toContain('--only-binary=:all:'); expect(plan.acquisition[0].args).toContain('--require-hashes');
     expect(plan.metadata).toHaveLength(1); expect(plan.offline[1].args).toContain('--no-index');
   });
+  test('offline Python preparation writes reproducible checked-hash bytecode', () => {
+    const plan = inspectPreparation(fixture({ 'requirements.txt': `Flask==3.1.0 --hash=sha256:${hash}\n` }));
+    expect(plan.status).toBe('ready');
+    // venv/ensurepip and pip compile .pyc files; without a fixed epoch each preparation differs and replay cannot match.
+    for (const command of plan.offline) expect(command.env.SOURCE_DATE_EPOCH).toMatch(/^[0-9]+$/);
+  });
   for (const requirement of ['flask>=3', '-e .', 'flask @ https://evil.invalid/x.whl', '--index-url https://evil.invalid', '-r other.txt', 'flask==3.1.0']) test(`rejects unpinned or executable requirement ${requirement}`, () => {
     expect(inspectPreparation(fixture({ 'requirements.txt': requirement })).prerequisites[0].code).toBe('UNPINNED_REQUIREMENTS');
   });
@@ -169,15 +186,49 @@ describe('CSO inert Python preparation', () => {
   });
 });
 
+describe('CSO preparation names a Go module as Go (#3263)', () => {
+  const goFiles = {
+    'go.mod': 'module example.com/app\n\ngo 1.23\n\nrequire github.com/google/uuid v1.6.0\n',
+    'go.sum': 'github.com/google/uuid v1.6.0 h1:abc=\n',
+    'main.go': 'package main\n\nfunc main() {}\n',
+  };
+  const GO_UNSUPPORTED = { code: 'UNSUPPORTED_STACK', message: 'Go (go.mod) is not a supported runtime stack yet; supported runtime stacks are Node, Bun, Python, and Rails.', path: 'go.mod' };
+  test('a go.mod repository is Go, unsupported, and never asks for requirements.txt', () => {
+    const plan = inspectPreparation(fixture(goFiles));
+    expect([plan.stack, plan.runtimeProfile, plan.status]).toEqual(['go', 'go', 'prerequisites']);
+    expect(plan.prerequisites).toEqual([GO_UNSUPPORTED]);
+    expect(JSON.stringify(plan)).not.toContain('requirements.txt');
+  });
+  test('Python helper metadata beside go.mod stays Go', () => {
+    const plan = inspectPreparation(fixture({ ...goFiles, 'requirements.txt': `mkdocs==1.6.1 --hash=sha256:${hash}\n` }));
+    expect(plan.stack).toBe('go');
+    expect(plan.prerequisites).toEqual([GO_UNSUPPORTED]);
+  });
+  test('controls: go.mod beside a Node lockfile stays Node; Python without go.mod stays Python', () => {
+    const node = inspectPreparation(fixture({ ...goFiles, ...nodeFiles() }));
+    expect([node.stack, node.status]).toEqual(['node', 'ready']);
+    expect(inspectPreparation(fixture({ 'requirements.txt': `Flask==3.1.0 --hash=sha256:${hash}\n` })).stack).toBe('python');
+    expect(inspectPreparation(fixture({ 'go.sum': '', 'main.go': '' })).stack).toBe('python');
+  });
+});
+
 describe('CSO inert Rails preparation', () => {
   test('does not silently choose Node in a multi-stack repository',()=>{const plan=inspectPreparation(fixture({...nodeFiles(),'Gemfile.lock':gemLock,'Gemfile':''}));expect(plan.status).toBe('prerequisites');expect(plan.prerequisites[0].code).toBe('MULTIPLE_STACKS');expect(inspectPreparation(fixture({...nodeFiles(),'Gemfile.lock':gemLock,'Gemfile':''}),'rails').stack).toBe('rails');});
   test('fetches exact gems without evaluating Gemfiles or building native extensions', () => {
     const plan = inspectPreparation(fixture({ 'Gemfile.lock': gemLock, 'Gemfile': 'system("touch /tmp/CSO_UNSAFE")\nsource "https://rubygems.org"' }));
     expect(plan.status).toBe('ready'); expect(plan.stack).toBe('rails'); expect(plan.metadata.some(m => m.path === 'Gemfile')).toBe(false);
     expect(plan.acquisition).toHaveLength(2); expect(plan.acquisition.every(c => c.args[0] === 'fetch')).toBe(true);
+    // One gem process per platform: each process loads the full RubyGems index once.
+    for (const command of plan.acquisition) {
+      const platform = command.args[command.args.indexOf('--platform') + 1];
+      expect(command.args.slice(1, command.args.indexOf('--platform'))).toEqual(plan.inputs.filter(input => input.platform === platform).map(input => `${input.name}:${input.version}`));
+      expect(command.args).not.toContain('--version');
+    }
     expect(plan.inputs[1].platform).toBe('x86_64-linux-gnu'); expect(plan.inputs[0].integritySource).toBe('registry-on-acquisition');
     expect(plan.runtimeRequirements).toEqual({ ruby: '3.3.6', bundler: '2.6.9' });
     expect(plan.offline[0].args).toContain('--local'); expect(plan.offline[0].env.BUNDLE_IGNORE_CONFIG).toBe('true');
+    // Parallel Bundler threads race RubyGems' File.umask calls and leave 0777 directories.
+    expect(plan.offline[0].args.slice(plan.offline[0].args.indexOf('--jobs'), plan.offline[0].args.indexOf('--jobs') + 2)).toEqual(['--jobs', '1']);
     expect(plan.offline[0].env.GEM_HOME).toBeUndefined(); expect(plan.offline[0].env.GEM_PATH).toBeUndefined();
   });
   test('records lock checksums separately from newly acquired archive hashes', () => {
@@ -222,10 +273,13 @@ describe('CSO inert Rails preparation', () => {
 describe('CSO runtime catalog admission', () => {
   const runtime = () => qualifiedRuntimeFixture('node');
   const catalog = () => completeRuntimeCatalogFixture('test-1');
-  test('default catalog cannot execute unqualified images', () => {
+  test('default catalog admits only digest-pinned reviewed profiles and unqualified profiles cannot execute', () => {
     expect(RUNTIME_CATALOG.profiles).toHaveLength(10);
-    expect(RUNTIME_CATALOG.runtimes).toEqual([]);
-    expect(() => selectRuntime('node', 'linux/amd64')).toThrow('Reviewed build profile node-24.4.0-amd64 is awaiting a qualified image promotion');
+    for (const runtime of RUNTIME_CATALOG.runtimes) {
+      expect(RUNTIME_CATALOG.profiles.filter(profile => profile.id === runtime.id && profile.stack === runtime.stack && profile.platform === runtime.platform)).toHaveLength(1);
+      expect(runtime.image).toMatch(/@sha256:[a-f0-9]{64}$/);
+    }
+    expect(() => selectRuntime('node', 'linux/amd64', unqualifiedRuntimeCatalog())).toThrow('Reviewed build profile node-24.4.0-amd64 is awaiting a qualified image promotion');
   });
   test('selects exact qualified digest and platform', () => {
     expect(selectRuntime('node', 'linux/amd64', catalog()).image).toContain('@sha256:');

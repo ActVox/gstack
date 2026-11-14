@@ -1,6 +1,6 @@
 /**
- * Verified first-attempt reuse for PR-lane E2E shards, on the same receipts as
- * the workflow-judge reuse (scripts/eval-input-cache.ts).
+ * Verified first-attempt reuse for PR-lane E2E shards, on the receipts of
+ * crew/scripts/eval-input-cache.ts.
  *
  * A PR-profile shard (a file, or one case of a case-sharded file) is reused
  * only when every consumed input is byte-identical to a fresh pass recorded in
@@ -27,10 +27,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { buildEvalInputIdentity, lookupEvalInputCache, sourceDependencyClosure, storeEvalInputCache,
-  type EvalCacheValue, type EvalInputIdentity, type EvalPassingProof } from './eval-input-cache';
+  type EvalCacheValue, type EvalInputIdentity, type EvalPassingProof } from '../crew/scripts/eval-input-cache';
 import { matchGlob } from '../test/helpers/test-selection';
 import { E2E_TOUCHFILES, GLOBAL_TOUCHFILES } from '../test/helpers/touchfiles-data';
-import { EVAL_CACHE_MAX_AGE_MS as RECEIPT_MAX_AGE_MS } from './eval-input-cache';
+import { EVAL_CACHE_MAX_AGE_MS as RECEIPT_MAX_AGE_MS } from '../crew/scripts/eval-input-cache';
 import { panelVerdict, TRIAL_ENV, type EvalCaseKind, type PanelShape, type PanelTrial } from '../test/helpers/eval-store';
 
 export interface E2EShardReuseRequest {
@@ -58,7 +58,7 @@ export interface E2EShardReuseRequest {
 
 export interface E2EShardReuseHit { key: string; source: EvalPassingProof['source'] }
 
-const HARNESS_FILES = ['scripts/test-paid-shards.ts', 'scripts/e2e-shard-reuse.ts', 'scripts/eval-input-cache.ts',
+const HARNESS_FILES = ['scripts/test-paid-shards.ts', 'scripts/e2e-shard-reuse.ts', 'crew/scripts/eval-input-cache.ts',
   'lib/eval-model.ts', 'bun.lock', '.github/docker/Dockerfile.ci', '.github/workflows/evals.yml',
   '.github/actions/fix-bun-temp/action.yml', '.github/actions/restore-deps/action.yml',
   '.github/actions/seed-claude-config/action.yml', '.github/actions/register-gstack-skills/action.yml'];
@@ -83,6 +83,7 @@ export function e2eReuseLaneProblem(env: NodeJS.ProcessEnv, profileMode: string 
   if (!/^(?:sha256:)?[a-f0-9]{64}$/.test(env.EVALS_CACHE_RUNTIME_ID ?? '')) return 'No immutable runtime identity';
   if (env.EVALS_TIER !== 'gate' || env.EVALS_FRESH === '1') return 'Fresh validation requested';
   if (['release', 'periodic', 'marathon'].includes(env.EVALS_CACHE_PURPOSE ?? '')) return 'Scheduled and release lanes execute fresh';
+  if ((env.EVALS_HOST ?? '').trim() && env.EVALS_HOST!.trim() !== 'claude') return 'Non-Claude hosts execute fresh';
   if (env.NODE_OPTIONS || env.BUN_OPTIONS) return 'Preload options change execution outside the consumed source';
   if (env.ANTHROPIC_BASE_URL && env.ANTHROPIC_BASE_URL !== 'https://api.anthropic.com') return 'Custom model endpoint';
   return null;
@@ -169,6 +170,13 @@ export function prepareE2EShardReuse(request: E2EShardReuseRequest): {
   /** True when the inputs are unchanged since `before` (the outcome may carry inputKey). */
   unchanged(): boolean;
   publish(): void;
+  /**
+   * A completed single-trial shard that did not pass: write its negative
+   * receipt at the execution boundary (CEO-25), beside the pass receipts the
+   * slice artifact carries, so a cancelled run's FAIL still blocks an older
+   * PASS for the same inputs when its report never runs.
+   */
+  publishFailure(): void;
 } | null {
   if (e2eReuseLaneProblem(request.env, 'pr') !== null) return null;
   const before = e2eShardIdentity(request);
@@ -194,19 +202,29 @@ export function prepareE2EShardReuse(request: E2EShardReuseRequest): {
     },
     publish() {
       const after = e2eShardIdentity(request);
-      const env = request.env;
-      const runId = env.GITHUB_RUN_ID ? `${env.GITHUB_RUN_ID}/${env.GITHUB_RUN_ATTEMPT ?? '1'}` : env.EVALS_RUN_ID;
-      const revision = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: request.root, encoding: 'utf8', timeout: 3_000 });
-      if (after.status !== 'eligible' || !runId || revision.status !== 0) return;
+      const source = executionSource(request);
+      if (after.status !== 'eligible' || !source) return;
       storeEvalInputCache({ ...common, before: before.identity, after: after.identity, proof: {
         execution: 'new', finalized: true, completeAttemptHistory: true, exitCode: 0, timedOut: false,
         cancelled: false, skipped: 0, failed: 0, passed: before.identity.caseIds.length,
         cases: before.identity.caseIds.map(id => ({ id, outcome: 'passed' as const, attempt: 1 as const })),
-        source: { runId, revision: revision.stdout.trim(), completedAt: Date.now() },
-        result: { key: request.key, cases: before.identity.caseIds },
+        source, result: { key: request.key, cases: before.identity.caseIds },
       } });
     },
+    publishFailure() {
+      const source = executionSource(request);
+      if (source) writeNegativeReceipt(common.cacheDir, { schema: 1, key: before.identity.key, source });
+    },
   };
+}
+
+/** Provenance of a receipt written by this execution: `<run id>/<attempt>`, the checked-out revision and now. */
+function executionSource(request: E2EShardReuseRequest): { runId: string; revision: string; completedAt: number } | null {
+  const env = request.env;
+  const runId = env.GITHUB_RUN_ID ? `${env.GITHUB_RUN_ID}/${env.GITHUB_RUN_ATTEMPT ?? '1'}` : env.EVALS_RUN_ID;
+  const revision = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: request.root, encoding: 'utf8', timeout: 3_000 });
+  if (!runId || revision.status !== 0) return null;
+  return { runId, revision: revision.stdout.trim(), completedAt: Date.now() };
 }
 
 // ─── Panel receipts, negative receipts and the planner's receipt selection ──
@@ -231,6 +249,7 @@ export interface PanelReceipt {
 export interface NegativeReceipt { schema: 1; key: string; source: { runId: string; revision: string; completedAt: number } }
 
 const RECEIPT_KEY = /^[a-f0-9]{64}$/;
+const RECEIPT_FILE = /^[a-f0-9]{64}(?:\.panel|\.fail)?\.json$/;
 const validSource = (source: any) => !!source && typeof source.runId === 'string' && /^[\w./-]{1,160}$/.test(source.runId)
   && typeof source.revision === 'string' && /^[a-f0-9]{40}$/.test(source.revision) && Number.isSafeInteger(source.completedAt) && source.completedAt > 0;
 
@@ -268,23 +287,37 @@ export function writeNegativeReceipt(dir: string, receipt: NegativeReceipt): voi
   fs.writeFileSync(path.join(dir, `${receipt.key}.fail.json`), `${JSON.stringify(receipt)}\n`, { mode: 0o600 });
 }
 
-const receiptTime = (file: string): number => {
+const receiptSource = (file: string): { runId: string; completedAt: number } => {
   const parsed = readJson(file);
-  return Number(parsed?.source?.completedAt ?? parsed?.proof?.source?.completedAt) || 0;
+  const source = parsed?.source ?? parsed?.proof?.source;
+  return { runId: typeof source?.runId === 'string' ? source.runId : '', completedAt: Number(source?.completedAt) || 0 };
 };
+const receiptTime = (file: string): number => receiptSource(file).completedAt;
+
+/**
+ * Receipt order (ENG-6): within one CI run, a later attempt is newer
+ * whatever its clock says; otherwise the later `completedAt` is newer.
+ * Positive when `a` is newer than `b`, zero on a tie.
+ */
+export function compareReceiptSources(a: { runId: string; completedAt: number }, b: { runId: string; completedAt: number }): number {
+  const [runA, attemptA] = a.runId.split('/');
+  const [runB, attemptB] = b.runId.split('/');
+  if (runA && runA === runB && Number(attemptA) !== Number(attemptB)) return (Number(attemptA) || 0) - (Number(attemptB) || 0);
+  return a.completedAt - b.completedAt;
+}
 
 /**
  * Planner-side selection: copy `from` into `to`, dropping every pass or panel
  * receipt that has a same-or-newer negative receipt for its identity, and
- * every panel receipt that is not a whole PASS panel. Workflow-judge and
- * other receipts pass through for their own validation at lookup.
+ * every panel receipt that is not a whole PASS panel. Other receipts pass
+ * through for their own validation at lookup.
  */
 export function selectPlanReceipts(from: string, to: string, now = Date.now()): { shipped: number; blocked: string[] } {
   fs.mkdirSync(to, { recursive: true });
   const blocked: string[] = [];
   let shipped = 0;
   let names: string[] = [];
-  try { names = fs.readdirSync(from).filter(name => name.endsWith('.json')); } catch { return { shipped, blocked }; }
+  try { names = fs.readdirSync(from).filter(name => RECEIPT_FILE.test(name)); } catch { return { shipped, blocked }; }
   for (const name of names) {
     const file = path.join(from, name);
     const [key, suffix] = [name.slice(0, 64), name.slice(64)];
@@ -298,20 +331,33 @@ export function selectPlanReceipts(from: string, to: string, now = Date.now()): 
   return { shipped, blocked };
 }
 
-/** Merge receipt directories into one store, keeping the newest file per name. */
+/**
+ * Merge receipt directories into one store, keeping the newest file per name
+ * by (run attempt, completedAt); a tie keeps the file already there. Negative
+ * receipts merge before passes, so a reader of a partial merge never sees a
+ * PASS without the FAIL that blocks it. The recovery checkpoint carries over.
+ */
 export function mergeReceiptDirs(out: string, dirs: string[]): number {
   fs.mkdirSync(out, { recursive: true });
   let merged = 0;
+  const negativesFirst = (a: string, b: string) => Number(b.endsWith('.fail.json')) - Number(a.endsWith('.fail.json')) || (a < b ? -1 : a > b ? 1 : 0);
   for (const dir of dirs) {
     let names: string[] = [];
-    try { names = fs.readdirSync(dir).filter(name => name.endsWith('.json')); } catch { continue; }
+    try { names = fs.readdirSync(dir).filter(name => RECEIPT_FILE.test(name)).sort(negativesFirst); } catch { continue; }
     for (const name of names) {
       const source = path.join(dir, name);
       const target = path.join(out, name);
       if (!fs.lstatSync(source).isFile()) continue;
-      if (fs.existsSync(target) && receiptTime(target) >= receiptTime(source)) continue;
+      if (fs.existsSync(target) && compareReceiptSources(receiptSource(source), receiptSource(target)) <= 0) continue;
       fs.copyFileSync(source, target);
       merged++;
+    }
+    // The recovery checkpoint (crew/scripts/recover-receipts.ts) travels with the store; the newest wins.
+    const checkpoint = path.join(dir, 'recovery.json');
+    const current = path.join(out, 'recovery.json');
+    if (fs.existsSync(checkpoint) && fs.lstatSync(checkpoint).isFile()
+      && (Number(readJson(checkpoint)?.updatedAt) || 0) > (fs.existsSync(current) ? Number(readJson(current)?.updatedAt) || 0 : -1)) {
+      fs.copyFileSync(checkpoint, current);
     }
   }
   return merged;

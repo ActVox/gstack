@@ -16,16 +16,23 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { chromium, type Browser, type BrowserContext, type BrowserContextOptions, type Page, type Locator, type Cookie } from 'playwright';
 import { writeSecureFile, mkdirSecure } from './file-permissions';
 import { addConsoleEntry, addNetworkEntry, addDialogEntry, networkBuffer, type DialogEntry } from './buffers';
 import { emitActivity } from './activity';
-import { validateNavigationUrl } from './url-validation';
-import { TabSession, type RefEntry } from './tab-session';
-import { resolveChromiumProfile, cleanSingletonLocks } from './config';
+import { validateNavigationUrl, blockedNavigationReason } from './url-validation';
+import { TabSession, type DeviceProfile, type RefEntry } from './tab-session';
+import { resolveChromiumProfile, cleanSingletonLocks, resolveConfig } from './config';
+import { ensureProjectProfile } from './chromium-profiles';
 import { launchWithXProtectHeal } from './xprotect-heal';
-import { readPidStartTime, shouldSpawnXvfb, pickFreeDisplay, spawnXvfb, xvfbInstallHint, type XvfbHandle } from './xvfb';
+import { explainSandboxFailure, sandboxBlockedByHost, shouldEnableChromiumSandbox } from './chromium-sandbox';
+import { DIRECT_PROXY_ARG, forcesDirect } from './proxy-config';
+import { readPidStartTime, shouldSpawnXvfb, spawnFreeXvfb, xvfbInstallHint, type XvfbHandle } from './xvfb';
 import { withCdpSession } from './cdp-bridge';
+import { applyDevice } from './device-emulation';
+import { resultLine } from '../../lib/result-codes';
+import { sanitizeEcho } from '../../lib/sanitize-echo';
 import type { MemorySnapshot, MemoryStructureStats, MemoryTabSnapshot, MemoryProcess } from './memory-snapshot';
 
 /**
@@ -69,35 +76,7 @@ export function isCustomChromium(): boolean {
   return p.includes('GBrowser') || p.includes('gbrowser');
 }
 
-/**
- * Decide whether Playwright should request Chromium's sandbox.
- *
- * Returns false on Windows (Bun→Node→Chromium chain breaks the sandbox,
- * GitHub #276) and on Linux under root / CI / container (sandbox needs
- * unprivileged user namespaces, which are missing for root and typically
- * disabled in containers).
- *
- * When false, Playwright auto-adds --no-sandbox to the launch args — the
- * desired behavior in those environments. When true, Playwright does NOT
- * add --no-sandbox, which keeps Chromium's "unsupported command-line flag"
- * yellow infobar from appearing on every headed launch.
- *
- * The headless launch path also pushes an explicit '--no-sandbox' into args
- * when CI/CONTAINER/root is set; that push is now defensively redundant
- * (Playwright will add it anyway when this returns false) and harmless.
- */
-export function shouldEnableChromiumSandbox(): boolean {
-  if (process.platform === 'win32') return false;
-  // Explicit user override for Ubuntu/AppArmor and similar environments where
-  // unprivileged Chromium sandboxing is blocked even for normal users (the
-  // sandbox needs unprivileged user namespaces that the host policy denies,
-  // so /qa hangs without --no-sandbox). Setting GSTACK_CHROMIUM_NO_SANDBOX=1
-  // forces the sandbox off without changing the default for everyone else.
-  // See #1562.
-  if (process.env.GSTACK_CHROMIUM_NO_SANDBOX === '1') return false;
-  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
-  return !(process.env.CI || process.env.CONTAINER || isRoot);
-}
+export { shouldEnableChromiumSandbox } from './chromium-sandbox';
 
 /**
  * Thrown by probePoisonedChromiumBundle() when it finds — and removes — a
@@ -182,6 +161,41 @@ function launchedProcess(browser: Browser | null | undefined): ChildProcess | nu
 }
 
 /**
+ * #2709: PID of the Chromium browser process gstack launched, read over CDP
+ * (`SystemInfo.getProcessInfo`, type "browser") because Playwright 1.62's
+ * Browser has no `process()`. Call it only for a launch gstack owns; a
+ * connected browser belongs to someone else and must never be reaped. Bounded:
+ * a hung or failed CDP call logs once and returns null, which means no reap.
+ */
+export async function launchedChromiumPid(browser: Browser, timeoutMs = 2_000): Promise<number | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const query = async (): Promise<number | null> => {
+    const session = await browser.newBrowserCDPSession();
+    try {
+      const { processInfo } = await session.send('SystemInfo.getProcessInfo');
+      const pid = processInfo.find((p) => p.type === 'browser')?.id;
+      return Number.isInteger(pid) && pid! > 0 ? pid! : null;
+    } finally {
+      await session.detach().catch(() => {});
+    }
+  };
+  try {
+    return await Promise.race([
+      query(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[browse] Could not record the Chromium PID (CDP SystemInfo.getProcessInfo: ${msg}); browse stop cannot reap a surviving Chromium.`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * Resolve why the underlying Chromium ChildProcess is going away.
  *
  * The 'disconnected' Playwright event fires before the child process emits
@@ -252,6 +266,44 @@ export async function handleChromiumDisconnect(browser: Browser | null): Promise
   process.exit(1);
 }
 
+/**
+ * How long a tab-independent read waits on one tab's renderer (#3247). A page
+ * stuck in a long script never answers page.evaluate() or page.title(); before
+ * this bound, one such tab made /health call the whole daemon unhealthy and
+ * hung `tabs`. Kept well under the CLI's /health request timeout
+ * (HEALTH_REQUEST_TIMEOUT_MS in cli.ts) so the CLI reads the answer instead of
+ * timing out on it.
+ */
+export const TAB_PROBE_TIMEOUT_MS = 1_000;
+
+/**
+ * Budget for saveState()'s per-tab storage read. Longer than the probe: a tab
+ * that misses it falls back to the last storage it answered with, which may
+ * be stale, so only a tab that is really stuck takes that path.
+ */
+const TAB_STORAGE_READ_TIMEOUT_MS = 5_000;
+
+type TabStorage = { localStorage: Record<string, string>; sessionStorage: Record<string, string> };
+type TabReadKind = 'probe' | 'title' | 'storage';
+
+function urlOrigin(url: string): string {
+  return URL.canParse(url) ? new URL(url).origin : '';
+}
+
+/**
+ * Resolve with `work`'s value, or with undefined once `ms` passes. The losing
+ * read settles on its own when the renderer frees up, so callers pass a promise
+ * that cannot reject.
+ */
+function withinTabBudget<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
+}
+
 export type { RefEntry };
 
 // Re-export TabSession for consumers
@@ -262,7 +314,7 @@ export interface BrowserState {
   pages: Array<{
     url: string;
     isActive: boolean;
-    storage: { localStorage: Record<string, string>; sessionStorage: Record<string, string> } | null;
+    storage: TabStorage | null;
     /**
      * HTML content loaded via load-html (setContent), replayed after context recreation.
      * In-memory only — never persisted to disk (HTML may contain secrets or customer data).
@@ -275,8 +327,15 @@ export interface BrowserState {
      * In-memory only.
      */
     owner?: string;
+    /** `$B device` profile, re-applied before the restored tab's first request. */
+    device?: DeviceProfile;
+    /** The tab's id before the save, so scopes on it follow it to its restored id. In-memory only. */
+    tabId?: number;
   }>;
 }
+
+/** The tab a scoped request runs on; owner set for session scopes (#1961). */
+export interface TabScope { tabId: number; owner?: string; picked?: number }
 
 export class BrowserManager {
   private browser: Browser | null = null;
@@ -285,10 +344,18 @@ export class BrowserManager {
   // at startup based on BROWSE_PROXY_URL. For SOCKS5 with auth, server.ts
   // points this at the local bridge (socks5://127.0.0.1:<bridgePort>); for
   // HTTP/HTTPS or unauth SOCKS5, it's the upstream URL directly.
-  private proxyConfig: { server: string; username?: string; password?: string } | null = null;
+  private proxyConfig: { server: string; bypass?: string; username?: string; password?: string } | null = null;
   private pages: Map<number, Page> = new Map();
   private tabSessions: Map<number, TabSession> = new Map();
   private activeTabId: number = 0;
+  /**
+   * The tab one request runs on (#1961). A request that names a tab or a
+   * session runs inside this scope, so every getActiveSession() under it, after
+   * any await, resolves to that tab and never moves activeTabId for other
+   * callers. A scope with an owner follows that owner's tab across a context
+   * rebuild, which gives every tab a new id.
+   */
+  private readonly tabScope = new AsyncLocalStorage<TabScope>();
   private nextTabId: number = 1;
   private extraHeaders: Record<string, string> = {};
   private customUserAgent: string | null = null;
@@ -318,6 +385,34 @@ export class BrowserManager {
   // ─── Tab Ownership (multi-agent isolation) ──────────────
   // Maps tabId → clientId. Unowned tabs (not in this map) are root-only for writes.
   private tabOwnership: Map<number, string> = new Map();
+  /** Old tab id → its id after a context rebuild, so every scope on it follows it. */
+  private restoredTabIds = new Map<number, number>();
+  /** Headless launch with BROWSE_EXTENSIONS_DIR: a persistent context (#2281). */
+  private extensionContext = false;
+  /** Pending and recorded navigation-guard verdicts per page (D2). */
+  private navigationGuards = new WeakMap<Page, { pending: Set<Promise<void>>; blocked: string | null }>();
+  /** One pending read per page and kind (#3247). A read that outlives its
+   * budget stays queued in the renderer until the page frees up, so a stuck
+   * tab reuses it instead of collecting a new one on every /health poll,
+   * `tabs` call or persist tick. */
+  private pendingTabReads = new WeakMap<Page, Map<TabReadKind, Promise<unknown>>>();
+  /** The last storage each page answered with, and the origin it came from. */
+  private lastTabStorage = new WeakMap<Page, { origin: string; storage: TabStorage }>();
+  // Our own 'disconnected' listeners per browser. Detach only these: removing
+  // every 'disconnected' listener also strips Playwright's internal one that
+  // resolves browser.close(), so each close waited the full race timeout (and
+  // Playwright 1.62 has no Browser.process() for the SIGKILL fallback).
+  private disconnectHandlers = new WeakMap<Browser, Array<() => void>>();
+  private onBrowserDisconnected(browser: Browser | null | undefined, handler: () => void): void {
+    if (!browser) return;
+    browser.on('disconnected', handler);
+    this.disconnectHandlers.set(browser, [...(this.disconnectHandlers.get(browser) ?? []), handler]);
+  }
+  private detachDisconnectHandlers(browser: Browser | null | undefined): void {
+    if (!browser) return;
+    for (const handler of this.disconnectHandlers.get(browser) ?? []) browser.off('disconnected', handler);
+    this.disconnectHandlers.delete(browser);
+  }
 
   // ─── Dialog Handling (global, not per-tab) ──────────────────
   private dialogAutoAccept: boolean = true;
@@ -351,6 +446,7 @@ export class BrowserManager {
   private xvfb: XvfbHandle | null = null;
   private displayAllocation: Promise<void> | null = null;
   private handoffPending: Promise<string> | null = null;
+  private activeTabRecovery: Promise<void> | null = null;
   private closing = false;
   private handoffPrevious: { browser: Browser; pages: Map<number, Page>; tabSessions: Map<number, TabSession>; activeTabId: number } | null = null;
 
@@ -362,10 +458,8 @@ export class BrowserManager {
     if (this.displayAllocation) return this.displayAllocation;
     if (!shouldSpawnXvfb({ ...process.env, BROWSE_HEADED: '1' }, process.platform).spawn) return;
     this.displayAllocation = (async () => {
-      const displayNum = pickFreeDisplay();
-      if (displayNum == null) throw new Error('no free X display in range :99-:120 — refusing to clobber existing X servers');
       try {
-        const handle = await spawnXvfb(displayNum);
+        const handle = await spawnFreeXvfb();
         if (this.closing) {
           handle.close();
           throw new Error('Browser is shutting down');
@@ -509,8 +603,20 @@ export class BrowserManager {
    * launchHeaded(). Called by server.ts at startup once the (optional) SOCKS5
    * bridge is up.
    */
-  setProxyConfig(cfg: { server: string; username?: string; password?: string } | null): void {
+  setProxyConfig(cfg: { server: string; bypass?: string; username?: string; password?: string } | null): void {
     this.proxyConfig = cfg;
+  }
+
+  /**
+   * Playwright passes a configured proxy explicitly as --proxy-server, so only
+   * a session browse resolved to direct was exposed: `BROWSE_PROXY_URL=direct`
+   * on a machine with HTTPS_PROXY set still routed every `goto` through that
+   * proxy (#3440 item 8). Direct now means DIRECT_PROXY_ARG on every launch
+   * path (headless, the extension context, headed, handoff) wherever Chromium
+   * would otherwise pick a proxy browse did not resolve (forcesDirect).
+   */
+  private proxyLaunchArgs(): string[] {
+    return !this.proxyConfig && forcesDirect(process.env) ? [DIRECT_PROXY_ARG] : [];
   }
 
   /**
@@ -528,17 +634,27 @@ export class BrowserManager {
     this.closing = false;
     // ─── Extension Support ────────────────────────────────────
     // BROWSE_EXTENSIONS_DIR points to an unpacked Chrome extension directory.
-    // Extensions only work in headed mode, so we use an off-screen window.
+    // Extensions only run in a persistent context (launch() + newContext()
+    // isolates them), so that path uses launchPersistentContext with Chrome's
+    // new headless mode: no window, unlike the old off-screen window that
+    // macOS still showed (#2281, #432).
     const extensionsDir = process.env.BROWSE_EXTENSIONS_DIR;
-    const { STEALTH_LAUNCH_ARGS, buildGStackLaunchArgs } = await import('./stealth');
-    const launchArgs: string[] = [...STEALTH_LAUNCH_ARGS, ...buildGStackLaunchArgs()];
-    let useHeadless = true;
+    const { STEALTH_LAUNCH_ARGS, buildGStackLaunchArgs, STEALTH_IGNORE_DEFAULT_ARGS } = await import('./stealth');
+    const launchArgs: string[] = [...STEALTH_LAUNCH_ARGS, ...buildGStackLaunchArgs(), ...this.proxyLaunchArgs()];
+    // #2771/#1968: honor GSTACK_CHROMIUM_PATH headless too (NixOS, macOS 13).
+    // That bundle belongs to the user, so the XProtect heal never touches it,
+    // and a launch failure names it.
+    const executablePath = process.env.GSTACK_CHROMIUM_PATH || undefined;
+    const nameCustomChromium = (err: unknown): never => {
+      if (!executablePath) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Chromium at GSTACK_CHROMIUM_PATH=${executablePath} failed to launch: ${message}\nFix: point GSTACK_CHROMIUM_PATH at a working Chromium or Chrome binary, or unset it to use Playwright's bundled Chromium.`, { cause: err });
+    };
 
     // Docker/CI/root: Chromium sandbox requires unprivileged user namespaces which
     // are typically disabled in containers and are never available for the root
-    // user on Linux. Detect all three cases and add --no-sandbox automatically.
-    const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
-    if (process.env.CI || process.env.CONTAINER || isRoot) {
+    // user on Linux. Detect those cases and add --no-sandbox automatically.
+    if (sandboxBlockedByHost()) {
       launchArgs.push('--no-sandbox');
     }
 
@@ -552,24 +668,59 @@ export class BrowserManager {
           `--load-extension=${extensionsDir}`,
         );
       }
-      launchArgs.push('--window-position=-9999,-9999', '--window-size=1,1');
-      useHeadless = false; // extensions require headed mode; off-screen window simulates headless
+      launchArgs.push('--headless=new');
       console.log(`[browse] Extensions loaded from: ${extensionsDir}`);
     }
 
-    // #2709: headless-only — the extensions path above forces headed mode,
-    // and headed/GBrowser sessions must keep the GPU.
-    if (useHeadless) {
-      launchArgs.push(...headlessGpuArgs(process.platform, process.env));
+    // #2709: headless-only GPU flags; headed/GBrowser sessions keep the GPU.
+    launchArgs.push(...headlessGpuArgs(process.platform, process.env));
+
+    const contextOptions: BrowserContextOptions = {
+      viewport: { width: this.currentViewport.width, height: this.currentViewport.height },
+      deviceScaleFactor: this.deviceScaleFactor,
+    };
+    if (this.customUserAgent) {
+      contextOptions.userAgent = this.customUserAgent;
+    }
+
+    if (extensionsDir) {
+      const profileDir = require('path').join(resolveConfig().stateDir, 'extensions', 'chromium-profile');
+      require('fs').mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+      cleanSingletonLocks(profileDir);
+      this.context = await launchWithXProtectHeal(() => chromium.launchPersistentContext(profileDir, {
+        headless: false, // --headless=new in launchArgs: windowless, extensions run
+        handleSIGINT: false,
+        handleSIGTERM: false,
+        handleSIGHUP: false,
+        chromiumSandbox: shouldEnableChromiumSandbox(),
+        args: launchArgs,
+        ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT_ARGS,
+        ...contextOptions,
+        ...(executablePath ? { executablePath } : {}),
+        ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
+      }), { usesCustomExecutable: Boolean(executablePath) }).catch(nameCustomChromium).catch(explainSandboxFailure);
+      this.extensionContext = true;
+      this.browser = this.context.browser();
+      this.onBrowserDisconnected(this.browser, () => {
+        void handleChromiumDisconnect(this.browser);
+      });
+      for (const page of this.context.pages()) await page.close().catch(() => {});
+      if (Object.keys(this.extraHeaders).length > 0) {
+        await this.context.setExtraHTTPHeaders(this.extraHeaders);
+      }
+      const { applyStealth } = await import('./stealth');
+      await applyStealth(this.context);
+      await this.newTab();
+      return;
     }
 
     // XProtect self-heal wrapper (P0 #2554): a macOS definition update can
     // start SIGKILLing the pinned Chromium at spawn. On the classified
     // signature, clear quarantine on the Playwright cache + force-reinstall
-    // once, then retry this launch once. This headless path always uses the
-    // Playwright cache (no executablePath), so the heal is never scoped out.
+    // once, then retry this launch once. A GSTACK_CHROMIUM_PATH bundle is
+    // scoped out of the heal.
     this.browser = await launchWithXProtectHeal(() => chromium.launch({
-      headless: useHeadless,
+      headless: true,
       // #2220: the daemon owns signal policy, not Playwright. Playwright's
       // default handlers close Chromium the moment THIS process receives
       // SIGINT/SIGTERM/SIGHUP — which fights the deliberate headless
@@ -587,8 +738,9 @@ export class BrowserManager {
       // namespaces that aren't available.
       chromiumSandbox: shouldEnableChromiumSandbox(),
       ...(launchArgs.length > 0 ? { args: launchArgs } : {}),
+      ...(executablePath ? { executablePath } : {}),
       ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
-    }));
+    }), { usesCustomExecutable: Boolean(executablePath) }).catch(nameCustomChromium).catch(explainSandboxFailure);
 
     // Chromium disconnect → distinguish clean user-quit from crash. Both
     // events look identical to Playwright (one 'disconnected' fires), but
@@ -599,26 +751,17 @@ export class BrowserManager {
     // means "user wanted this, don't restart"; non-zero means "crash, please
     // bring me back." Without this distinction every Cmd+Q gets treated as
     // a crash and the user-visible window keeps respawning.
-    this.browser.on('disconnected', () => {
+    this.onBrowserDisconnected(this.browser, () => {
       void handleChromiumDisconnect(this.browser);
     });
 
     // #2709: record the child's identity so the CLI can reap a survivor after
-    // daemon shutdown. `.process()` exists here — we launched this browser.
+    // daemon shutdown. We launched this browser, so its PID is ours to record.
     {
-      const proc = launchedProcess(this.browser);
-      this.chromiumProcInfo = proc?.pid
-        ? { pid: proc.pid, startTime: readPidStartTime(proc.pid) }
-        : null;
+      const pid = await launchedChromiumPid(this.browser);
+      this.chromiumProcInfo = pid ? { pid, startTime: readPidStartTime(pid) } : null;
     }
 
-    const contextOptions: BrowserContextOptions = {
-      viewport: { width: this.currentViewport.width, height: this.currentViewport.height },
-      deviceScaleFactor: this.deviceScaleFactor,
-    };
-    if (this.customUserAgent) {
-      contextOptions.userAgent = this.customUserAgent;
-    }
     this.context = await this.browser.newContext(contextOptions);
 
     if (Object.keys(this.extraHeaders).length > 0) {
@@ -670,6 +813,7 @@ export class BrowserManager {
       // empty-fallback returns native), so this is safe on stock Playwright
       // Chromium too.
       ...buildGStackLaunchArgs(),
+      ...this.proxyLaunchArgs(),
     ];
     if (extensionPath) {
       // Skip --load-extension when running against a custom Chromium build
@@ -706,6 +850,7 @@ export class BrowserManager {
     const fs = require('fs');
     const path = require('path');
     const userDataDir = resolveChromiumProfile();
+    ensureProjectProfile(userDataDir);
     fs.mkdirSync(userDataDir, { recursive: true });
 
     // Pre-launch cleanup of stale SingletonLock/Socket/Cookie. Chromium's
@@ -803,7 +948,7 @@ export class BrowserManager {
       ...(executablePath ? { executablePath } : {}),
       ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
       ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT_ARGS,
-    }), { usesCustomExecutable: Boolean(executablePath) });
+    }), { usesCustomExecutable: Boolean(executablePath) }).catch(explainSandboxFailure);
     this.browser = this.context.browser();
     this.connectionMode = 'headed';
     this.intentionalDisconnect = false;
@@ -898,7 +1043,7 @@ export class BrowserManager {
     // terminal agent, save session, clean profile locks + state file) so
     // crashes don't strand resources either.
     if (this.browser) {
-      this.browser.on('disconnected', () => {
+      this.onBrowserDisconnected(this.browser, () => {
         if (this.intentionalDisconnect) return;
         const browserRef = this.browser;
         void (async () => {
@@ -954,17 +1099,17 @@ export class BrowserManager {
       (t as { unref?: () => void }).unref?.();
     });
     if (this.browser || ((this.connectionMode === 'headed' || this.handoffPrevious) && this.context)) {
-      if (this.connectionMode === 'headed' || this.handoffPrevious) {
+      if (this.connectionMode === 'headed' || this.handoffPrevious || this.extensionContext) {
         // Headed/persistent context mode: close the context (which closes the browser)
         this.intentionalDisconnect = true;
-        if (this.browser) this.browser.removeAllListeners('disconnected');
+        this.detachDisconnectHandlers(this.browser);
         await Promise.race([
           this.context ? this.context.close() : Promise.resolve(),
           raceTimeout(this.closeRaceMs),
         ]).catch(() => {});
       } else if (this.browser) {
         // Launched mode: close the browser we spawned.
-        this.browser.removeAllListeners('disconnected');
+        this.detachDisconnectHandlers(this.browser);
         // Grab the child handle BEFORE the race: nulling this.browser after a
         // race-timeout used to ABANDON a live Chromium whose sockets kept the
         // caller's event loop (and keep-alive connections into test servers)
@@ -982,7 +1127,7 @@ export class BrowserManager {
       this.browser = null;
     }
     if (previousBrowser && previousBrowser !== currentBrowser) {
-      previousBrowser.removeAllListeners('disconnected');
+      this.detachDisconnectHandlers(previousBrowser);
       const child = launchedProcess(previousBrowser);
       const closed = await Promise.race([
         previousBrowser.close().then(() => true), raceTimeout(this.closeRaceMs),
@@ -995,20 +1140,43 @@ export class BrowserManager {
     this.closeOwnedDisplay();
   }
 
-  /** Health check — verifies Chromium is connected AND responsive */
-  async isHealthy(): Promise<boolean> {
-    if (!this.browser || !this.browser.isConnected()) return false;
-    try {
-      const page = this.pages.get(this.activeTabId);
-      if (!page) return true; // connected but no pages — still healthy
-      await Promise.race([
-        page.evaluate('1'),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000)),
-      ]);
-      return true;
-    } catch {
-      return false;
+  /**
+   * Daemon liveness for /health: Chromium is connected. The active tab is NOT
+   * part of it (#3247): a page stuck in a long script is one busy tab, not a
+   * dead daemon, and the CLI gates every command on this answer — including
+   * the tabs, tab, closetab and stop commands that get out of that state.
+   * probeActiveTab() reports the tab on its own.
+   */
+  isHealthy(): boolean {
+    return Boolean(this.browser?.isConnected());
+  }
+
+  /**
+   * Does the active tab's main thread answer within `timeoutMs`? Null when
+   * there is no active page. A rejected evaluate (crashed or closing target)
+   * also counts as not responsive.
+   */
+  async probeActiveTab(timeoutMs = TAB_PROBE_TIMEOUT_MS): Promise<{ id: number; responsive: boolean } | null> {
+    const id = this.activeTabId;
+    const page = this.pages.get(id);
+    if (!page) return null;
+    const probe = this.sharedTabRead(page, 'probe', () => page.evaluate('1').then(() => true, () => false));
+    return { id, responsive: (await withinTabBudget(probe, timeoutMs)) === true };
+  }
+
+  /** Join the page's pending read of this kind, or start one. `read` must not
+   * reject. */
+  private sharedTabRead<T>(page: Page, kind: TabReadKind, read: () => Promise<T>): Promise<T> {
+    let reads = this.pendingTabReads.get(page);
+    if (!reads) {
+      reads = new Map();
+      this.pendingTabReads.set(page, reads);
     }
+    const pending = reads.get(kind);
+    if (pending) return pending as Promise<T>;
+    const started = read().finally(() => reads.delete(kind));
+    reads.set(kind, started);
+    return started;
   }
 
   // ─── Tab Management ────────────────────────────────────────
@@ -1023,19 +1191,29 @@ export class BrowserManager {
       normalizedUrl = await validateNavigationUrl(url);
     }
 
+    const activeBefore = this.activeTabId;
     const page = await this.context.newPage();
-    const id = this.nextTabId++;
-    this.pages.set(id, page);
-    this.tabSessions.set(id, new TabSession(page));
-    this.activeTabId = id;
+    let id = [...this.pages].find(([, p]) => p === page)?.[0];
+    const adopted = id !== undefined;
+    if (id === undefined) {
+      id = this.nextTabId++;
+      this.pages.set(id, page);
+      this.tabSessions.set(id, new TabSession(page));
+    }
+    const scope = this.tabScope.getStore();
+    if (scope) {
+      scope.tabId = id;
+      if (this.activeTabId === id) this.activeTabId = activeBefore;
+    } else this.activeTabId = id;
 
     // Record tab ownership for multi-agent isolation
-    if (clientId) {
-      this.tabOwnership.set(id, clientId);
+    const owner = clientId ?? scope?.owner;
+    if (owner) {
+      this.tabOwnership.set(id, owner);
     }
 
     // Wire up console/network/dialog capture
-    this.wirePageEvents(page);
+    if (!adopted) this.wirePageEvents(page);
 
     if (normalizedUrl) {
       await page.goto(normalizedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
@@ -1045,9 +1223,10 @@ export class BrowserManager {
   }
 
   async closeTab(id?: number): Promise<void> {
-    const tabId = id ?? this.activeTabId;
+    const tabId = id ?? this.getActiveTabId();
     const page = this.pages.get(tabId);
     if (!page) throw new Error(`Tab ${tabId} not found`);
+    const scope = this.tabScope.getStore();
 
     // Capture BEFORE close(): the page 'close' event handler wired in
     // wirePageEvents() can fire while page.close() is awaited. It removes
@@ -1057,15 +1236,19 @@ export class BrowserManager {
     // close() resolves varies across Playwright/Chromium versions and
     // machines, and losing the race means the last-tab auto-create below
     // never runs, leaving the manager with zero tabs.
-    const wasActive = tabId === this.activeTabId;
+    const wasActive = tabId === this.getActiveTabId();
 
     await page.close();
     this.pages.delete(tabId);
     this.tabSessions.delete(tabId);
     this.tabOwnership.delete(tabId);
 
-    // Switch to another tab if we closed the active one
-    if (wasActive) {
+    // Switch to another tab if we closed the active one. A scoped request moves
+    // only its own scope, to another tab of the same owner when there is one.
+    if (wasActive && scope && this.pages.size > 0) {
+      const ownedTabs = scope.owner ? this.tabsOwnedBy(scope.owner) : [];
+      if (ownedTabs.length > 0) scope.tabId = ownedTabs[ownedTabs.length - 1]!;
+    } else if (wasActive) {
       const remaining = [...this.pages.keys()];
       if (remaining.length === 0) {
         // No tabs left — create a new blank one
@@ -1080,7 +1263,9 @@ export class BrowserManager {
 
   switchTab(id: number, opts?: { bringToFront?: boolean }): void {
     if (!this.tabSessions.has(id)) throw new Error(`Tab ${id} not found`);
-    this.activeTabId = id;
+    const scope = this.tabScope.getStore();
+    if (scope) scope.tabId = scope.picked = id;
+    else this.activeTabId = id;
     // Only bring to front when explicitly requested (user-initiated tab switch).
     // Internal tab pinning (BROWSE_TAB) should NOT steal focus.
     if (opts?.bringToFront !== false) {
@@ -1134,7 +1319,40 @@ export class BrowserManager {
   }
 
   getActiveTabId(): number {
-    return this.activeTabId;
+    const scope = this.tabScope.getStore();
+    return scope ? this.resolveScopeTab(scope) : this.activeTabId;
+  }
+
+  /** The scope's tab; an owned scope whose tab is gone (context rebuild) or neither owned nor picked with `tab <id>` moves to its owner's newest tab. */
+  resolveScopeTab(scope: TabScope): number {
+    for (let hops = 0; hops < 64 && !this.pages.has(scope.tabId) && this.restoredTabIds.has(scope.tabId); hops++) {
+      const moved = this.restoredTabIds.get(scope.tabId)!;
+      if (scope.picked === scope.tabId) scope.picked = moved;
+      scope.tabId = moved;
+    }
+    const kept = this.tabOwnership.get(scope.tabId) === scope.owner || scope.picked === scope.tabId;
+    if (scope.owner && !(this.pages.has(scope.tabId) && kept)) {
+      const ownedTabs = this.tabsOwnedBy(scope.owner);
+      if (ownedTabs.length > 0) scope.tabId = ownedTabs[ownedTabs.length - 1]!;
+    }
+    return scope.tabId;
+  }
+
+  tabUrl(tabId: number): string | null {
+    return this.pages.get(tabId)?.url() ?? null;
+  }
+
+  /** Run fn with every active-tab lookup bound to scope.tabId (see tabScope). */
+  runInTab<T>(scope: TabScope, fn: () => Promise<T>): Promise<T> {
+    return this.tabScope.run(scope, fn);
+  }
+
+  hasTab(tabId: number): boolean {
+    return this.pages.has(tabId);
+  }
+
+  tabsOwnedBy(owner: string): number[] {
+    return [...this.tabOwnership].filter(([id, o]) => o === owner && this.pages.has(id)).map(([id]) => id).sort((a, b) => a - b);
   }
 
   getTabCount(): number {
@@ -1206,23 +1424,73 @@ export class BrowserManager {
     return released;
   }
 
-  async getTabListWithTitles(): Promise<Array<{ id: number; url: string; title: string; active: boolean }>> {
-    const tabs: Array<{ id: number; url: string; title: string; active: boolean }> = [];
-    for (const [id, page] of this.pages) {
-      tabs.push({
+  /**
+   * Every tab with its title. Titles are read in parallel, each bounded by
+   * TAB_PROBE_TIMEOUT_MS: a tab whose renderer is stuck comes back with
+   * `busy: true` and an empty title instead of hanging the list (#3247).
+   */
+  async getTabListWithTitles(): Promise<Array<{ id: number; url: string; title: string; active: boolean; busy: boolean; owner: string | null }>> {
+    const activeId = this.getActiveTabId();
+    return Promise.all([...this.pages].map(async ([id, page]) => {
+      const title = await withinTabBudget(
+        this.sharedTabRead(page, 'title', () => page.title().catch(() => '')), TAB_PROBE_TIMEOUT_MS);
+      return {
         id,
         url: page.url(),
-        title: await page.title().catch(() => ''),
-        active: id === this.activeTabId,
-      });
-    }
-    return tabs;
+        title: title ?? '',
+        active: id === activeId,
+        busy: title === undefined,
+        owner: this.tabOwnership.get(id) ?? null,
+      };
+    }));
   }
 
   // ─── Session Access ────────────────────────────────────────
+  /**
+   * Restore an active tab when every page was closed outside the CLI (for
+   * example, the user closed the headed window). The page 'close' handler is
+   * synchronous and cannot open a replacement, which left activeTabId at 0 and
+   * every later command, including status and stop, failing with "No active
+   * page". closeTab() already opens a blank tab for the last-tab case; this
+   * covers the external path. Concurrent callers share one recovery. Returns
+   * true when a new tab had to be opened.
+   */
+  async ensureActiveTab(): Promise<boolean> {
+    if (this.tabSessions.has(this.getActiveTabId())) return false;
+    const remaining = [...this.tabSessions.keys()];
+    if (remaining.length > 0) {
+      this.activeTabId = remaining[remaining.length - 1]!;
+      return false;
+    }
+    if (!this.context) throw new Error('Browser not launched');
+    this.activeTabRecovery ??= this.newTab()
+      .then(() => {})
+      .finally(() => { this.activeTabRecovery = null; });
+    await this.activeTabRecovery;
+    return true;
+  }
+
+  /**
+   * Called before every command runs (#3167). status, stop and restart never
+   * open a tab, so a daemon whose browser or context is gone can still report
+   * and be stopped. Any other command gets an active tab: a failed recovery is
+   * BROWSE_TAB_UNRECOVERABLE with the restart command, and a command that runs
+   * on a newly opened tab gets the returned one-line warning.
+   */
+  async ensureCommandTab(command: string): Promise<string | undefined> {
+    if (BrowserManager.NO_TAB_RECOVERY.has(command)) return undefined;
+    try {
+      if (!(await this.ensureActiveTab())) return undefined;
+    } catch (err: any) {
+      throw new Error(resultLine('browse', 'BROWSE_TAB_UNRECOVERABLE', sanitizeEcho(err?.message ?? String(err))));
+    }
+    return '[browse] warning: every tab was closed outside browse, so this command ran on a new blank tab; open your page again with: browse goto <url>';
+  }
+  private static readonly NO_TAB_RECOVERY = new Set(['status', 'stop', 'restart']);
+
   /** Get the TabSession for the active tab. */
   getActiveSession(): TabSession {
-    const session = this.tabSessions.get(this.activeTabId);
+    const session = this.tabSessions.get(this.getActiveTabId());
     if (!session) throw new Error('No active page. Use "browse goto <url>" first.');
     return session;
   }
@@ -1497,6 +1765,48 @@ export class BrowserManager {
     await this.getPage().setViewportSize({ width, height });
   }
 
+  /**
+   * Undo a `viewport WxH` pin. Headless contexts restore the 1280x720 launch
+   * default. Headed contexts launch with `viewport: null`, but Playwright has no
+   * way to drop a page's emulated size, so the active tab gets a fresh page in
+   * the same context (cookies and storage persist, refs reset as on navigation).
+   */
+  async resetViewport(): Promise<'window' | 'default'> {
+    this.currentViewport = { width: 1280, height: 720 };
+    if (this.connectionMode !== 'headed') {
+      await this.getPage().setViewportSize(this.currentViewport);
+      return 'default';
+    }
+    if (!this.context) throw new Error('Browser not launched');
+
+    const tabId = this.getActiveTabId();
+    const pinned = this.getPage();
+    const loaded = this.getActiveSession().getLoadedHtml();
+    const url = pinned.url();
+    const activeBefore = this.activeTabId;
+    const page = await this.context.newPage();
+    const listenerId = [...this.pages].find(([, p]) => p === page)?.[0];
+    if (listenerId !== undefined) {
+      this.pages.delete(listenerId);
+      this.tabSessions.delete(listenerId);
+    }
+    this.activeTabId = activeBefore;
+    const session = new TabSession(page);
+    if (listenerId === undefined) this.wirePageEvents(page);
+    try {
+      if (loaded) await session.setTabContent(loaded.html, { waitUntil: loaded.waitUntil });
+      else if (url !== 'about:blank') await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    } catch (err) {
+      await page.close().catch(() => {});
+      throw err;
+    }
+    this.pages.set(tabId, page);
+    this.tabSessions.set(tabId, session);
+    await pinned.close().catch(() => {});
+    await page.bringToFront().catch(() => {});
+    return 'window';
+  }
+
   // ─── Extra Headers ─────────────────────────────────────────
   async setExtraHeader(name: string, value: string) {
     this.extraHeaders[name] = value;
@@ -1543,7 +1853,9 @@ export class BrowserManager {
   // ─── State Save/Restore (shared by recreateContext + handoff) ─
   /**
    * Capture browser state: cookies, localStorage, sessionStorage, URLs, active tab.
-   * Skips pages that fail storage reads (e.g., already closed).
+   * Skips the storage of pages that fail the read (e.g., already closed).
+   * A page whose renderer is stuck past TAB_STORAGE_READ_TIMEOUT_MS does not
+   * hold up `state save` (#3247); see readTabStorage() for what it gets.
    */
   async saveState(): Promise<BrowserState> {
     if (!this.context) throw new Error('Browser not launched');
@@ -1553,13 +1865,7 @@ export class BrowserManager {
 
     for (const [id, page] of this.pages) {
       const url = page.url();
-      let storage = null;
-      try {
-        storage = await page.evaluate(() => ({
-          localStorage: { ...localStorage },
-          sessionStorage: { ...sessionStorage },
-        }));
-      } catch {}
+      const storage = await this.readTabStorage(page, url);
 
       // Capture load-html content so a later context recreation (viewport --scale)
       // can replay it via setTabContent. Never persisted to disk.
@@ -1575,10 +1881,34 @@ export class BrowserManager {
         loadedHtml: loaded?.html,
         loadedHtmlWaitUntil: loaded?.waitUntil,
         owner,
+        device: session?.getDevice() ?? undefined,
+        tabId: id,
       });
     }
 
     return { cookies, pages };
+  }
+
+  /**
+   * One tab's localStorage/sessionStorage for saveState(). A failed read
+   * (closed page, opaque origin) is null. A read that times out returns the
+   * last storage this page gave for the same origin: a periodic
+   * BROWSE_PERSIST_STATE snapshot must not replace good storage on disk with
+   * null just because the page is busy.
+   */
+  private async readTabStorage(page: Page, url: string): Promise<TabStorage | null> {
+    const origin = urlOrigin(url);
+    const read = await withinTabBudget(this.sharedTabRead(page, 'storage', () => page.evaluate(() => ({
+      localStorage: { ...localStorage },
+      sessionStorage: { ...sessionStorage },
+    })).catch(() => null)), TAB_STORAGE_READ_TIMEOUT_MS);
+    if (read === undefined) {
+      const last = this.lastTabStorage.get(page);
+      return last?.origin === origin ? last.storage : null;
+    }
+    if (read) this.lastTabStorage.set(page, { origin, storage: read });
+    else this.lastTabStorage.delete(page);
+    return read;
   }
 
   /**
@@ -1609,11 +1939,15 @@ export class BrowserManager {
       const newSession = new TabSession(page);
       this.tabSessions.set(id, newSession);
       this.wirePageEvents(page);
+      if (saved.tabId !== undefined) this.restoredTabIds.set(saved.tabId, id);
 
       // Restore tab ownership for the new ID — preserves scoped-agent isolation
       // across context recreation (viewport --scale, user-agent change, handoff).
       if (saved.owner) {
         this.tabOwnership.set(id, saved.owner);
+      }
+      if (saved.device) {
+        await applyDevice(newSession, saved.device).catch((err: any) => console.warn(`[browse] Failed to re-apply device for tab ${id}: ${err.message}`));
       }
 
       if (saved.loadedHtml) {
@@ -1660,11 +1994,10 @@ export class BrowserManager {
     }
 
     // If no pages were saved, create a blank one
-    if (this.pages.size === 0) {
-      await this.newTab();
-    } else {
-      this.activeTabId = activeId ?? [...this.pages.keys()][0];
-    }
+    if (this.pages.size === 0) await this.newTab();
+    this.activeTabId = activeId ?? [...this.pages.keys()][0];
+    const scope = this.tabScope.getStore();
+    if (scope && !this.pages.has(this.resolveScopeTab(scope))) scope.tabId = scope.picked = this.activeTabId;
 
     // Clear refs — pages are new, locators are stale
     this.clearRefs();
@@ -1678,6 +2011,9 @@ export class BrowserManager {
   async recreateContext(): Promise<string | null> {
     if (this.connectionMode === 'headed') {
       throw new Error('Cannot recreate context in headed mode. Use disconnect first.');
+    }
+    if (this.extensionContext) {
+      throw new Error('Cannot recreate context while BROWSE_EXTENSIONS_DIR extensions are loaded (persistent context). Restart browse with the new settings instead.');
     }
     if (!this.browser || !this.context) {
       throw new Error('Browser not launched');
@@ -1850,8 +2186,12 @@ export class BrowserManager {
       // Same blink-level stealth flags as launch()/launchHeaded(). Without
       // STEALTH_LAUNCH_ARGS the handed-off browser kept the AutomationControlled
       // tell that the other two paths strip.
-      const launchArgs: string[] = ['--hide-crash-restore-bubble', ...STEALTH_LAUNCH_ARGS, ...buildGStackLaunchArgs()];
-      if (extensionPath) {
+      const launchArgs: string[] = ['--hide-crash-restore-bubble', ...STEALTH_LAUNCH_ARGS, ...buildGStackLaunchArgs(), ...this.proxyLaunchArgs()];
+      if (extensionPath && isCustomChromium()) {
+        // Same rule as launchHeaded(): a build that bakes the extension in
+        // crashes when it is loaded twice.
+        console.log('[browse] Handoff: custom Chromium bakes in the extension — skipping --load-extension');
+      } else if (extensionPath) {
         launchArgs.push(`--disable-extensions-except=${extensionPath}`);
         launchArgs.push(`--load-extension=${extensionPath}`);
         // Auth token is served via POST /extension-token (pinned-origin
@@ -1866,30 +2206,35 @@ export class BrowserManager {
       // ignoring $CHROMIUM_PROFILE / $GSTACK_HOME and skipping the lock
       // cleanup — the third shipped drift between the three launch paths.
       const userDataDir = resolveChromiumProfile();
+      ensureProjectProfile(userDataDir);
       fs.mkdirSync(userDataDir, { recursive: true });
       cleanSingletonLocks(userDataDir);
 
-      // Self-heal probe (#2242): handoff always launches the Playwright-cache
-      // bundle (this launchPersistentContext call passes no executablePath),
-      // so a bundle poisoned by the old in-place rebrand would GPU-crash here
-      // exactly like launchHeaded(). Same probe, same contract: a
-      // GSTACK_CHROMIUM_PATH bundle is never passed in. The rethrown typed
-      // error surfaces through the outer catch as the actionable
-      // "Cannot open headed browser" message, headless browser untouched.
-      try {
-        probePoisonedChromiumBundle(chromium.executablePath());
-      } catch (err: unknown) {
-        if (err instanceof PoisonedBundleError) throw err;
-        // Probe failures (no bundle yet, EACCES) fall through to launch.
+      // #3907: same custom-binary support as launch()/launchHeaded().
+      const executablePath = process.env.GSTACK_CHROMIUM_PATH || undefined;
+
+      // Self-heal probe (#2242): without a custom path, handoff launches the
+      // Playwright-cache bundle, so a bundle poisoned by the old in-place
+      // rebrand would GPU-crash here exactly like launchHeaded(). Same probe,
+      // same contract: a GSTACK_CHROMIUM_PATH bundle is never probed. The
+      // rethrown typed error surfaces through the outer catch as the
+      // actionable "Cannot open headed browser" message, headless browser
+      // untouched.
+      if (!executablePath) {
+        try {
+          probePoisonedChromiumBundle(chromium.executablePath());
+        } catch (err: unknown) {
+          if (err instanceof PoisonedBundleError) throw err;
+          // Probe failures (no bundle yet, EACCES) fall through to launch.
+        }
       }
 
       // T1: same automation-tell-stripping defaults as launchHeaded().
       // The handoff path (headless → headed re-launch) takes the same
       // anti-detection posture.
       const { STEALTH_IGNORE_DEFAULT_ARGS } = await import('./stealth');
-      // XProtect self-heal wrapper (P0 #2554): handoff always launches the
-      // Playwright-cache bundle (no executablePath), so the heal applies
-      // exactly as in launch()/launchHeaded().
+      // XProtect self-heal wrapper (P0 #2554), scoped exactly as in
+      // launch()/launchHeaded(): never heals a GSTACK_CHROMIUM_PATH bundle.
       newContext = await launchWithXProtectHeal(() => chromium.launchPersistentContext(userDataDir, {
         headless: false,
         ...(this.xvfb ? { env: { ...process.env, DISPLAY: this.xvfb.display } } : {}),
@@ -1903,10 +2248,11 @@ export class BrowserManager {
         chromiumSandbox: shouldEnableChromiumSandbox(),
         args: launchArgs,
         viewport: null,
+        ...(executablePath ? { executablePath } : {}),
         ...(this.proxyConfig ? { proxy: this.proxyConfig } : {}),
         ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT_ARGS,
         timeout: 15000,
-      }));
+      }), { usesCustomExecutable: Boolean(executablePath) }).catch(explainSandboxFailure);
       if (this.closing) {
         await newContext.close().catch(() => {});
         throw new Error('Browser is shutting down');
@@ -1951,7 +2297,7 @@ export class BrowserManager {
 
       if (this.browser) {
         const browserRef = this.browser;
-        this.browser.on('disconnected', () => {
+        this.onBrowserDisconnected(this.browser, () => {
           if (this.intentionalDisconnect) return;
           void handleChromiumDisconnect(browserRef);
         });
@@ -1965,7 +2311,7 @@ export class BrowserManager {
       catch (err) { console.warn('[browse] Headed promotion callback failed:', err); }
 
       // 4. Close old headless browser (fire-and-forget)
-      previous.browser.removeAllListeners('disconnected');
+      this.detachDisconnectHandlers(previous.browser);
       previous.browser.close().catch(() => {});
 
       return [
@@ -2024,10 +2370,61 @@ export class BrowserManager {
     return null;
   }
 
+  /**
+   * Run a command and surface any navigation the guard blocked while it ran.
+   * The block reason replaces the command's own result or error (often
+   * "navigation interrupted"), so the caller learns why the tab is blank.
+   */
+  async failIfNavigationBlocked<T>(page: Page, work: Promise<T>): Promise<T> {
+    const outcome = await work.then((value) => ({ value }), (error) => ({ error }));
+    const guard = this.navigationGuards.get(page);
+    while (guard && guard.pending.size > 0) await Promise.all([...guard.pending]);
+    const blocked = guard?.blocked ?? null;
+    if (guard) guard.blocked = null;
+    if (blocked) throw new Error(blocked);
+    if ('error' in outcome) throw outcome.error;
+    return outcome.value;
+  }
+
+  /**
+   * D2: validateNavigationUrl only sees explicit navigations. Redirect hops and
+   * page-driven navigations (links, scripts, forms, frames) arrive here as
+   * navigation requests; one that targets a blocked address blanks the tab and
+   * is reported by failIfNavigationBlocked.
+   */
+  private guardNavigations(page: Page): void {
+    if (this.navigationGuards.has(page)) return;
+    const guard = { pending: new Set<Promise<void>>(), blocked: null as string | null };
+    this.navigationGuards.set(page, guard);
+    page.on('request', (req) => {
+      if (!req.isNavigationRequest()) return;
+      const check: Promise<void> = blockedNavigationReason(req.url()).then(async (reason) => {
+        if (!reason || page.isClosed()) return;
+        guard.blocked = reason;
+        console.warn(`[browse] ${reason} (navigation from ${req.frame().url() || 'a new page'}; tab reset to about:blank)`);
+        // A target that fails fast commits its error page around the reset, so
+        // let it settle (bounded; a hanging target is cut off by the reset),
+        // then blank the tab until it stays blank (about:blank loads at once).
+        await Promise.race([req.response().catch(() => null), new Promise((resolve) => setTimeout(resolve, 1_000))]);
+        // Leaving an error page can commit a second about:blank after the reset
+        // resolves; wait for the main frame to stay quiet so the next command's
+        // navigation is not interrupted by it.
+        for (let attempt = 0; attempt < 3 && !page.isClosed(); attempt++) {
+          await page.goto('about:blank', { waitUntil: 'load', timeout: 5_000 }).catch(() => {});
+          const late = await page.waitForEvent('framenavigated', { predicate: (frame) => frame === page.mainFrame(), timeout: 250 })
+            .then(() => true, () => false);
+          if (!late && page.url() === 'about:blank') break;
+        }
+      }).finally(() => { guard.pending.delete(check); });
+      guard.pending.add(check);
+    });
+  }
+
   // ─── Console/Network/Dialog/Ref Wiring ────────────────────
   private wirePageEvents(page: Page) {
     const pages = this.pages;
     const tabSessions = this.tabSessions;
+    this.guardNavigations(page);
     // Track tab close — remove from pages and sessions maps, switch to another tab
     page.on('close', () => {
       for (const [id, p] of pages) {

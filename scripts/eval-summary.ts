@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 /**
  * Aggregate summary of eval runs from the project eval dir
  * (~/.gstack/projects/<slug>/evals; legacy fallback ~/.gstack-dev/evals)
@@ -16,7 +16,7 @@ const EVAL_DIR = getProjectEvalDir();
 const files = listEvalJsonFiles(EVAL_DIR);
 
 if (files.length === 0) {
-  console.log('No eval runs yet. Run: EVALS=1 bun run test:evals');
+  console.log('No eval runs yet. Run: bun run eval:bg:pr');
   process.exit(0);
 }
 

@@ -17,7 +17,7 @@
  *
  * v1 coverage target: the ~30-50 most-common recurring question categories across
  * ship, review, office-hours, plan-ceo-review, plan-eng-review, plan-design-review,
- * plan-devex-review, qa, investigate, and land-and-deploy. One-way doors 100%.
+ * plan-devex-review, qa, and land-and-deploy. One-way doors 100%.
  *
  * Adding a new entry
  * ------------------
@@ -56,7 +56,6 @@ export type StandardOption =
   | 'reject'
   | 'defer'
   | 'skip'
-  | 'investigate'
   | 'approve'
   | 'deny'
   | 'expand'
@@ -133,7 +132,7 @@ export const QUESTIONS = {
     door_type: 'two-way',
     options: ['fix-now', 'ack-and-ship', 'false-positive'],
     signal_key: 'code-quality-care',
-    description: "Greptile flagged a valid issue — fix, ack and ship, or mark false positive?",
+    description: "A review bot flagged a valid issue — fix, ack and ship, or mark false positive?",
   },
   'ship-greptile-comment-false-positive': {
     id: 'ship-greptile-comment-false-positive',
@@ -141,7 +140,7 @@ export const QUESTIONS = {
     category: 'approval',
     door_type: 'two-way',
     options: ['reply', 'fix-anyway', 'ignore'],
-    description: "Greptile comment looks like a false positive — reply to explain, fix anyway, or ignore silently?",
+    description: "A review bot comment looks like a false positive — reply to explain, fix anyway, or ignore silently?",
   },
   'ship-todos-create': {
     id: 'ship-todos-create',
@@ -205,6 +204,14 @@ export const QUESTIONS = {
     door_type: 'one-way',
     options: ['fix-now', 'investigate'],
     description: "LLM trust boundary violation — fix before merge?",
+  },
+  'review-gate-disposition': {
+    id: 'review-gate-disposition',
+    skill: 'review',
+    category: 'approval',
+    door_type: 'one-way',
+    options: ['restore', 'keep-justified', 'keep-other', 'leave-open'],
+    description: "Gate edit (test, threshold, CI or suppression relaxed) — restore the gate, keep it with a reason, or leave it open for a later human?",
   },
 
   // -----------------------------------------------------------------------
@@ -328,6 +335,14 @@ export const QUESTIONS = {
     signal_key: 'scope-appetite',
     description: "Plan touches 8+ files — reduce scope or hold?",
   },
+  'plan-eng-review-structure': {
+    id: 'plan-eng-review-structure',
+    skill: 'plan-eng-review',
+    category: 'routing',
+    door_type: 'two-way',
+    options: ['original-arrangement', 'smaller-arrangement'],
+    description: "Complexity gate — Original arrangement or Smaller arrangement (file/class layout only)?",
+  },
   'plan-eng-review-test-gap': {
     id: 'plan-eng-review-test-gap',
     skill: 'plan-eng-review',
@@ -427,26 +442,6 @@ export const QUESTIONS = {
   },
 
   // -----------------------------------------------------------------------
-  // /investigate — root-cause debugging
-  // -----------------------------------------------------------------------
-  'investigate-hypothesis-confirm': {
-    id: 'investigate-hypothesis-confirm',
-    skill: 'investigate',
-    category: 'approval',
-    door_type: 'two-way',
-    options: ['accept', 'reject', 'refine'],
-    description: "Root-cause hypothesis — accept, reject, or refine before proceeding to fix?",
-  },
-  'investigate-fix-apply': {
-    id: 'investigate-fix-apply',
-    skill: 'investigate',
-    category: 'approval',
-    door_type: 'one-way',
-    options: ['accept', 'reject'],
-    description: "Apply the proposed fix?",
-  },
-
-  // -----------------------------------------------------------------------
   // /land-and-deploy — merge + deploy + verify
   // -----------------------------------------------------------------------
   'land-and-deploy-merge-confirm': {
@@ -466,6 +461,22 @@ export const QUESTIONS = {
     options: ['accept', 'reject'],
     signal_key: 'decision-autonomy',
     description: "Canary detected regressions — roll back the deploy?",
+  },
+  'land-and-deploy-ci-override': {
+    id: 'land-and-deploy-ci-override',
+    skill: 'land-and-deploy',
+    category: 'approval',
+    door_type: 'one-way',
+    options: ['accept', 'reject'],
+    description: "Merge this head while these named non-required CI checks are red or pending?",
+  },
+  'land-and-deploy-no-ci-confirm': {
+    id: 'land-and-deploy-no-ci-confirm',
+    skill: 'land-and-deploy',
+    category: 'approval',
+    door_type: 'one-way',
+    options: ['accept', 'reject'],
+    description: "No CI ran on this head — merge it anyway?",
   },
 
   // -----------------------------------------------------------------------
@@ -516,8 +527,8 @@ export const QUESTIONS = {
     skill: 'preamble',
     category: 'approval',
     door_type: 'two-way',
-    options: ['on', 'off'],
-    description: "Let gstack proactively suggest skills based on conversation context?",
+    options: ['core', 'all', 'off'],
+    description: "Let gstack proactively suggest skills based on conversation context? core (the four core skills, default) / all / off",
   },
   'preamble-routing-injection': {
     id: 'preamble-routing-injection',

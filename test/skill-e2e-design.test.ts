@@ -124,7 +124,7 @@ Write DESIGN.md and CLAUDE.md (or update it) in the working directory.`,
       timeout: CAPTURE_LONG_MS,
       testName: 'design-consultation-core',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/design-consultation core', result);
@@ -298,7 +298,7 @@ Run Phase 0's DESIGN.md format check exactly as written (the gstack bin director
       timeout: CAPTURE_LONG_MS,
       testName: 'design-consultation-existing',
       runId,
-      model: 'claude-opus-4-7',
+      model: resolveEvalModel('capture'),
     });
 
     logCost('/design-consultation existing', result);
@@ -487,13 +487,14 @@ IMPORTANT: Do NOT try to browse any URLs or use a browse binary. This is a plan 
             // Check that the agent produced design ratings (0-10 scale)
             const output = result.output || '';
             const hasRatings = /\d+\/10/.test(output);
-            const hasDesignContent = output.toLowerCase().includes('information architecture') ||
-              output.toLowerCase().includes('interaction state') ||
-              output.toLowerCase().includes('ai slop') ||
-              output.toLowerCase().includes('hierarchy');
 
             // Check that the plan file was edited (the core new behavior)
             const planAfter = fs.readFileSync(path.join(reviewDir, 'plan.md'), 'utf-8');
+            // A rated summary may leave the design terms to the plan it wrote
+            // (census 37179171083); a plan term counts only when the review added it.
+            const count = (text: string, term: string) => text.toLowerCase().split(term).length - 1;
+            const hasDesignContent = ['information architecture', 'interaction state', 'ai slop', 'hierarchy'].some(term =>
+              output.toLowerCase().includes(term) || (hasRatings && count(planAfter, term) > count(planBefore, term)));
             const planWasEdited = planAfter !== planBefore && planAfter.length > 300;
             const planHasDesignAdditions = planAfter.toLowerCase().includes('empty') ||
               planAfter.toLowerCase().includes('loading') ||
@@ -707,12 +708,16 @@ Review the site at ${serverUrl}. Use --quick mode. Skip any AskUserQuestion call
     const reportPath = path.join(qaDesignDir, 'design-audit.md');
     const reportExists = fs.existsSync(reportPath);
 
-    // Check if any design fix commits were made
-    const gitLog = spawnSync('git', ['log', '--oneline'], {
+    // Outcome: the report names a seeded defect, and the page changed (committed
+    // or not) relative to the initial fixture commit. The commit prefix is not required.
+    const report = reportExists ? fs.readFileSync(reportPath, 'utf-8') : '';
+    const namesSeededDefect = /4[78]px|line-height|border-radius|radius|padding|spacing|heading/i.test(report);
+    const initialCommit = spawnSync('git', ['rev-list', '--max-parents=0', 'HEAD'], {
       cwd: qaDesignDir, stdio: 'pipe', timeout: 30_000,
-    });
-    const commits = gitLog.stdout.toString().trim().split('\n');
-    const designFixCommits = commits.filter((c: string) => c.includes('style(design)'));
+    }).stdout.toString().trim();
+    const pageChanged = spawnSync('git', ['diff', '--name-only', initialCommit, '--', 'index.html', 'style.css'], {
+      cwd: qaDesignDir, stdio: 'pipe', timeout: 30_000,
+    }).stdout.toString().trim() !== '';
 
     // The agent must actually drive Aside: an `aside repl` Bash call, a printed sentinel
     // (from a tool_result, never the input), and no reach for the retired browse binary.
@@ -724,7 +729,8 @@ Review the site at ${serverUrl}. Use --quick mode. Skip any AskUserQuestion call
     const usedBrowseBin = bashCommands.some(c => /browse\/dist\/browse|\$B /.test(c));
 
     recordE2E(evalCollector, '/design-review fix', 'Design Review E2E', result, {
-      passed: ['success', 'error_max_turns'].includes(result.exitReason) && droveAside && sentinelPrinted && !usedBrowseBin,
+      passed: ['success', 'error_max_turns'].includes(result.exitReason) && droveAside && sentinelPrinted && !usedBrowseBin
+        && reportExists && namesSeededDefect && pageChanged,
     });
 
     // Accept error_max_turns — the fix loop is complex
@@ -732,15 +738,9 @@ Review the site at ${serverUrl}. Use --quick mode. Skip any AskUserQuestion call
     expect(droveAside).toBe(true);
     expect(sentinelPrinted).toBe(true);
     expect(usedBrowseBin).toBe(false);
-
-    // Report and commits are best-effort — log what happened
-    if (reportExists) {
-      const report = fs.readFileSync(reportPath, 'utf-8');
-      console.log(`Design audit report: ${report.length} chars`);
-    } else {
-      console.warn('No design-audit.md generated');
-    }
-    console.log(`Design fix commits: ${designFixCommits.length}`);
+    expect(reportExists, 'design-audit.md must be written').toBe(true);
+    expect(namesSeededDefect, 'the report names a seeded design defect').toBe(true);
+    expect(pageChanged, 'at least one design issue is fixed in index.html or style.css').toBe(true);
   }, CAPTURE_LONG_MS);
 });
 
@@ -781,7 +781,7 @@ const INSTALL_OR_OVERRIDE = /\bnpx\b|gstack-design-detect\.ts install|\b(?:curl|
 /** A quoted-delimiter heredoc body is literal data, so a report that says
  * "no npx" is not an npx run. Unquoted bodies still expand and stay checked;
  * an unterminated body keeps the whole command checked. */
-function commandRunsInstallOrOverride(command: string): boolean {
+function executedShellText(command: string): string {
   const kept: string[] = [];
   let delimiter: string | undefined, tabs = false;
   for (const line of command.split('\n')) {
@@ -793,8 +793,73 @@ function commandRunsInstallOrOverride(command: string): boolean {
     const quoted = /<<(-)?[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|\\(\w+))/.exec(line);
     if (quoted) { delimiter = quoted[2] ?? quoted[3] ?? quoted[4]; tabs = !!quoted[1]; }
   }
-  return INSTALL_OR_OVERRIDE.test(delimiter === undefined ? kept.join('\n') : command);
+  return delimiter === undefined ? kept.join('\n') : command;
 }
+
+function commandRunsInstallOrOverride(command: string): boolean {
+  return INSTALL_OR_OVERRIDE.test(executedShellText(command));
+}
+
+const SOURCE_SCAN = /gstack-design-detect\.ts scan --changed (?:main|'main'|"main"|"?\$\{?\w+\}?"?)(?=[\s;]|$)/;
+
+/** CI 37111582659 (6fb8ea3d): the model resolved the base through the excerpt's gh fallback and
+ * scanned `--changed "$_BASE"`. The command proves the detector scan ran; the engine's single
+ * invocation over exactly the files changed vs main proves its base resolved to main. */
+function sourceScanAgainstMain(commands: string[], invocations: string[], repoDir: string): boolean {
+  if (!commands.some(command => SOURCE_SCAN.test(executedShellText(command))) || invocations.length !== 1) return false;
+  const argv = (JSON.parse(invocations[0]!) as { argv?: unknown }).argv;
+  if (!Array.isArray(argv) || argv[0] !== 'detect' || argv[1] !== '--json') return false;
+  const root = fs.realpathSync(repoDir);
+  const targets = argv.slice(2).map(target => fs.existsSync(String(target)) ? path.relative(root, fs.realpathSync(String(target))) : '');
+  return targets.join() === 'index.html,styles.css';
+}
+
+/** CI 38980005793: the agent ran the generated DOM block, which scans `"$_REPORT/dom/$_RUN"` with `_RUN="run1"`
+ * assigned in the same command. A DOM scan counts when one of its own arguments, after that command's literal
+ * `_REPORT=`/`_RUN=` assignments are substituted, is the run directory; `scan --changed` (source mode), a scan of
+ * another directory, quoted heredoc text and a non-literal or conflicting assignment never count. */
+function domScanOfRun(command: string, runDir: string): boolean {
+  const shell = executedShellText(command);
+  const assigned = new Map<string, Set<string>>();
+  for (const m of shell.matchAll(/(?<![\w$])(_REPORT|_RUN)=(?:"([^"$`\\]*)"|'([^']*)'|([^\s;&|<>()"'$`\\]*))(?=[\s;&|)]|$)/g)) {
+    assigned.set(m[1]!, (assigned.get(m[1]!) ?? new Set()).add(m[2] ?? m[3] ?? m[4] ?? ''));
+  }
+  const resolved = shell.replace(/\$(?:\{(_REPORT|_RUN)\}|(_REPORT|_RUN)(?!\w))/g, (all, braced?: string, bare?: string) => {
+    const values = assigned.get((braced ?? bare)!);
+    return values?.size === 1 ? [...values][0]! : all;
+  });
+  return [...resolved.matchAll(/gstack-design-detect\.ts scan ([^\n;&|<>]*)/g)].some(scan => {
+    const args = (scan[1]!.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map(arg => arg.replace(/^(["'])(.*)\1$/, '$2').replace(/\/+$/, ''));
+    return !args.includes('--changed') && args.includes(runDir);
+  });
+}
+
+if (!evalsEnabled) test('plugin handoff credits an executed source scan whose base resolved to main', () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-scan-replay-'));
+  try {
+    for (const file of ['index.html', 'styles.css', 'other.css']) fs.writeFileSync(path.join(repoDir, file), '');
+    const engine = (...files: string[]) => JSON.stringify({ argv: ['detect', '--json', ...files.map(file => path.join(repoDir, file))], cwd: repoDir, stdinIsTTY: false });
+    const detect = '/__w/gstack/gstack/bin/gstack-design-detect.ts';
+    // Captured CI 37111582659 command (paths shortened): gh fallback resolved _BASE=main.
+    const captured = `_BASE=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || true); if [ -z "$_BASE" ]; then _BASE=main; fi; git diff --name-only "$_BASE"...HEAD; _DJ=$(mktemp); bun --no-env-file run ${detect} scan --changed "$_BASE" --format gstack --host claude > "$_DJ" 2>/tmp/scan-stderr.txt; echo "DETECT_EXIT_CODE=$?"`;
+    const literal = `_DJ=$(mktemp); bun --no-env-file run ${detect} scan --changed main --format gstack --host claude > "$_DJ"; echo "DETECT_EXIT_CODE=$?"`;
+    const reportOnly = `cat > detector-output.md <<'EOF'\nScan: \`bun --no-env-file run ${detect} scan --changed main --format gstack --host claude\`\nEOF`;
+    expect(sourceScanAgainstMain([captured], [engine('index.html', 'styles.css')], repoDir)).toBe(true);
+    expect(sourceScanAgainstMain([literal, reportOnly], [engine('index.html', 'styles.css')], repoDir)).toBe(true);
+    expect(sourceScanAgainstMain([literal.replace('--changed main', "--changed 'main'")], [engine('index.html', 'styles.css')], repoDir)).toBe(true);
+    // Negative controls: quoted report text, another literal base, a base that resolved elsewhere, no or extra engine runs, a direct engine call.
+    expect(sourceScanAgainstMain([reportOnly], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([literal.replace('--changed main', '--changed HEAD~1')], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [engine('styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [engine('index.html', 'other.css', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([captured], [engine('index.html', 'styles.css'), engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain(['impeccable detect --json index.html styles.css'], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+    expect(sourceScanAgainstMain([literal.replace('--changed main', '--changed mainline')], [engine('index.html', 'styles.css')], repoDir)).toBe(false);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
 
 if (!evalsEnabled) test('plugin handoff counts executed install commands, not quoted report text', () => {
   // PR lane 36794871032: the report heredoc said "no `npx impeccable`" and failed noInstallOrOverride.
@@ -966,7 +1031,7 @@ Write the probe's first line and skill-presence line, then one FINDING-NNN entry
         skillPresent: outputs.includes('IMPECCABLE_SKILL: present'),
         probeReported: report.includes(`IMPECCABLE_READY: ${fixture.engines['4.10.0']}`) && report.includes('IMPECCABLE_SKILL: present'),
         probeExecuted: commands.some(command => /gstack-design-detect\.ts probe/.test(command)),
-        scanExecuted: commands.some(command => /gstack-design-detect\.ts scan --changed main/.test(command)),
+        scanExecuted: sourceScanAgainstMain(commands, invocations, fixture.repoDir),
         noInstallOrOverride: !commands.some(commandRunsInstallOrOverride),
         oneNewEngineInvocation: invocations.length === 1,
         oldEngineNotExecuted: !fs.existsSync(path.join(fixture.dir, '4.3.1.jsonl')),
@@ -1080,7 +1145,9 @@ Then write ${repoDir}/detector-output.md: one FINDING-NNN row per rule in the DE
 
       const bash = result.toolCalls.filter(c => c.tool === 'Bash').map(c => String(c.input?.command ?? ''));
       expect(bash.some(c => c.includes('npx impeccable'))).toBe(false);
-      expect(bash.some(c => /\$B\b|\bbrowse\s|\baside\s+repl\b|\bplaywright\b|\bpuppeteer\b/.test(c))).toBe(false);
+      // `$B` runs the browse binary only in command position; a shell variable
+      // named B (a base branch, say) is not a browser step.
+      expect(bash.some(c => /(?:^|[;&|(\n]|\b(?:then|do|else)\b)\s*"?\$B"?\s+\S|\bbrowse\s|\baside\s+repl\b|\bplaywright\b|\bpuppeteer\b/.test(c))).toBe(false);
       expect(result.toolCalls.some(c => /browser|browse|playwright|puppeteer/i.test(c.tool))).toBe(false);
       const calls: Array<{ argv: string[]; cwd: string; exit: number; engine: Array<{ argv: string[]; cwd: string }> }> =
         fs.readFileSync(receiptPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -1198,7 +1265,7 @@ Do not run npx. Do not fix anything.`,
         expect(result.exitReason).toBe('success');
         const bash = result.toolCalls.filter(c => c.tool === 'Bash').map(c => String(c.input?.command ?? ''));
         expect(bash.some(c => c.includes('dom-dump.js') && c.includes('--out') && c.includes('--raw'))).toBe(true); // $B js '('"$_DUMP"')()' with the file spliced in
-        expect(bash.some(c => /gstack-design-detect\.ts scan /.test(c) && c.includes('dom/run1'))).toBe(true);
+        expect(bash.some(c => domScanOfRun(c, path.join(allowed, 'dom', 'run1')))).toBe(true);
         expect(bash.some(c => /gstack-design-detect\.ts scan --changed/.test(c))).toBe(false);
         const dumps = fs.readdirSync(path.join(allowed, 'dom', 'run1')).filter(f => f.endsWith('.dom.html'));
         expect(dumps.length).toBeGreaterThan(0);
@@ -1249,8 +1316,8 @@ describeIfSelected('Design HTML slop gate E2E', ['design-html-slop-gate'], () =>
   testConcurrentIfSelected('design-html-slop-gate', async () => {
     const result = await runSkillTest({
       prompt: `Read design-html-gate.md: the /design-html detector probe block and its "Slop Gate (bounded, never a loop)" step.
-finalized.html in this directory is the finished page. Run the probe (--host claude), then the slop gate on finalized.html exactly as written: one surgical fix pass over the non-advisory findings, one rescan, then stop.
-Write ${workDir}/gate-output.md listing what you fixed and every remaining finding as accepted-with-reason, each tagged with its [rule-id]. Do not take screenshots, do not run npx, do not scan more than twice.`,
+finalized.html in this directory is the finished page. Run the probe (--host claude), then the slop gate on finalized.html exactly as written: one surgical fix pass over the non-advisory findings, one rescan. Then the design lint line that follows it, the same way, then stop.
+Write ${workDir}/gate-output.md listing what you fixed and every remaining finding as accepted-with-reason, each tagged with its [rule-id] or lint rule id. Do not take screenshots, do not run npx, do not run either check more than twice.`,
       workingDirectory: workDir,
       maxTurns: 20,
       timeout: CAPTURE_MS,
@@ -1265,10 +1332,97 @@ Write ${workDir}/gate-output.md listing what you fixed and every remaining findi
     const scans = result.toolCalls.filter(c => c.tool === 'Bash' && /gstack-design-detect\.ts scan /.test(String(c.input?.command ?? '')));
     expect(scans.length).toBeGreaterThanOrEqual(1);
     expect(scans.length).toBeLessThanOrEqual(2);
+    const lintRuns = result.toolCalls.filter(c => c.tool === 'Bash' && /gstack-design-lint['"]?\s+[^\s;|&]*\.html\b/.test(String(c.input?.command ?? '')));
+    expect(lintRuns.length).toBeGreaterThanOrEqual(1);
+    expect(lintRuns.length).toBeLessThanOrEqual(2);
     const outPath = path.join(workDir, 'gate-output.md');
     expect(fs.existsSync(outPath)).toBe(true);
     const out = fs.readFileSync(outPath, 'utf-8').toLowerCase();
     expect(out).toContain('ai-color-palette');
     expect(out).toContain('accepted');
   }, CAPTURE_MS);
+});
+
+describeIfSelected('Design motion showcase E2E', ['design-motion-showcase'], () => {
+  let workDir: string;
+  let gstackHome: string;
+
+  beforeAll(() => {
+    workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-motion-'));
+    gstackHome = fs.mkdtempSync(path.join(os.tmpdir(), 'skill-e2e-motion-home-'));
+    const run = (cmd: string, args: string[]) => spawnSync(cmd, args, { cwd: workDir, stdio: 'pipe', timeout: 5000 });
+    run('git', ['init', '-b', 'main']);
+    run('git', ['config', 'user.email', 'test@test.com']);
+    run('git', ['config', 'user.name', 'Test']);
+    fs.copyFileSync(path.join(ROOT, 'test', 'fixtures', 'design-motion-finalized.html'), path.join(workDir, 'finalized.html'));
+    run('git', ['add', '.']);
+    run('git', ['commit', '-m', 'finalized page']);
+    const full = fs.readFileSync(path.join(ROOT, 'design-motion', 'SKILL.md'), 'utf-8');
+    const text = full.slice(full.indexOf('# /design-motion:'))
+      .replaceAll('$HOME/.claude/skills/gstack', ROOT).replaceAll('~/.claude/skills/gstack', ROOT);
+    fs.writeFileSync(path.join(workDir, 'design-motion.md'), text);
+  });
+
+  afterAll(() => {
+    for (const d of [workDir, gstackHome]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  });
+
+  testConcurrentIfSelected('design-motion-showcase', async () => {
+    const result = await runSkillTest({
+      prompt: `Read design-motion.md: the /design-motion skill. Run it on finalized.html in this directory, the user's /design-html page, as the source.
+Settled answers, so do not use AskUserQuestion: showcase context; separate cards (the two .card sections); stories: the bars breathe and settle on the design heights, a soft highlight steps down the invoice rows; no camera; a 6 second cycle instead of 12 (scale the phases to it); name "ledgerline"; the frame is 640x400.
+Read each section the skill points to before its step. Build page.html with the capture contract, verify the still, capture with a mask on the cards, run the motion checks, fix and recheck until they pass, then export. Do not open a browser window and do not install anything.
+Finally write ${workDir}/motion-report.md with every MOTION_CHECK line, the MOTION_RESULT line, and each EXPORT_OK line exactly as printed.`,
+      workingDirectory: workDir,
+      maxTurns: 60,
+      timeout: CAPTURE_LONG_MS,
+      testName: 'design-motion-showcase',
+      runId,
+      env: { GSTACK_HOME: gstackHome },
+    });
+
+    logCost('/design-motion showcase', result);
+    recordE2E(evalCollector, '/design-motion showcase', 'Design motion showcase E2E', result);
+    expect(result.exitReason).toBe('success');
+    const sectionRead = (name: string) => {
+      if (result.toolCalls.some(c => c.tool === 'Read' && String(c.input?.file_path ?? '').endsWith(`/design-motion/sections/${name}`))) return true;
+      const printed = result.toolCalls
+        .filter(c => c.tool === 'Bash' && String(c.input?.command ?? '').includes(`design-motion/sections/${name}`))
+        .map(c => String(c.output ?? '')).join('\n');
+      const lines = fs.readFileSync(path.join(ROOT, 'design-motion', 'sections', name), 'utf-8').split('\n').map(l => l.trimEnd()).filter(Boolean);
+      return lines.every(line => printed.includes(line));
+    };
+    expect(sectionRead('fidelity.md')).toBe(true);
+    expect(sectionRead('motion.md')).toBe(true);
+    const commands = result.toolCalls.filter(c => c.tool === 'Bash').map(c => String(c.input?.command ?? '')).join('\n');
+    const after = (re: RegExp, from: number) => { const i = commands.slice(from).search(re); return i < 0 ? -1 : from + i; };
+    const capture = after(/gstack-motion-capture\.ts\b[^\n]*--out\b/, 0);
+    expect(capture).toBeGreaterThanOrEqual(0);
+    const check = after(/gstack-motion-encode['"]?\s+check\b/, capture);
+    expect(check).toBeGreaterThan(capture);
+    expect(after(/gstack-motion-encode['"]?\s+export\b/, check)).toBeGreaterThan(check);
+
+    const designs = path.join(gstackHome, 'projects');
+    const motionDirs = fs.existsSync(designs)
+      ? fs.readdirSync(designs).flatMap(slug => {
+        const d = path.join(designs, slug, 'designs');
+        return fs.existsSync(d) ? fs.readdirSync(d).filter(n => n.includes('-motion-')).map(n => path.join(d, n)) : [];
+      })
+      : [];
+    expect(motionDirs.length).toBe(1);
+    const page = fs.readFileSync(path.join(motionDirs[0]!, 'page.html'), 'utf-8');
+    expect(page).toContain('__start');
+    expect(page).toContain('__tick');
+    const manifest = JSON.parse(fs.readFileSync(path.join(motionDirs[0]!, 'cap', 'capture.json'), 'utf-8'));
+    expect(manifest.windowFrames).toBe(360);
+    expect(manifest.mask).toBe('mask.png');
+
+    const report = fs.readFileSync(path.join(workDir, 'motion-report.md'), 'utf-8');
+    for (const id of ['seam', 'empty-beat', 'rest', 'overflow']) expect(report).toContain(`MOTION_CHECK: ${id} pass`);
+    expect(report).toContain('MOTION_RESULT: clean');
+    for (const file of ['ledgerline-x.mp4', 'ledgerline-loop.gif', 'ledgerline-800x500.gif']) {
+      expect(report).toContain(file);
+      expect(fs.statSync(path.join(motionDirs[0]!, 'cap', file)).size).toBeGreaterThan(10_000);
+    }
+  }, CAPTURE_LONG_MS);
 });

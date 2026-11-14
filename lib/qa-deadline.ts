@@ -1,7 +1,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { bunIsolationArgs } from './bun-isolation';
 import { constants as osConstants } from 'node:os';
 import { initializeWindowsReviewJob } from './claude-code-windows-job';
 
@@ -116,6 +117,17 @@ export function qaDeadlineStatus(state: QaDeadline) {
 export interface QaCommandCapture {
   write(stream: 'stdout' | 'stderr', chunk: Buffer): void;
   complete(result: QaCommandResult): void;
+  spawn?: { cwd?: string; env?: Record<string, string> };
+}
+
+function processGroupEmpty(pgid: number): boolean {
+  try { process.kill(-pgid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true; }
+  const listing = spawnSync('ps', ['-A', '-o', 'pgid=,stat='], { encoding: 'utf8', timeout: 5_000 });
+  if (listing.status !== 0) return false;
+  return !listing.stdout.split('\n').some(line => {
+    const [group, state = ''] = line.trim().split(/\s+/);
+    return Number(group) === pgid && !state.startsWith('Z') && !state.includes('E');
+  });
 }
 
 export async function runQaDeadlineCommand(file: string, command: string, args: string[], emit: Emit, capture?: QaCommandCapture): Promise<number> {
@@ -142,14 +154,16 @@ export async function runQaDeadlineCommand(file: string, command: string, args: 
     }
     let outcome: number | undefined;
     let settled = false;
-    const child = spawn(command, args, { detached: process.platform !== 'win32', stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true });
+    const child = spawn(command, args, { detached: process.platform !== 'win32', stdio: capture ? ['ignore', 'pipe', 'pipe'] : 'inherit', windowsHide: true,
+      cwd: capture?.spawn?.cwd, env: capture?.spawn?.env });
     const kill = () => {
       if (!child.pid) return;
       try {
         if (process.platform === 'win32') child.kill('SIGKILL');
         else process.kill(-child.pid, 'SIGKILL');
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') outcome = 2;
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ESRCH' && !(code === 'EPERM' && process.platform === 'darwin' && processGroupEmpty(child.pid))) outcome = 2;
       }
     };
     const finish = (code: number, signal: NodeJS.Signals | null = null, completed = false) => {
@@ -213,7 +227,7 @@ export async function runQaWindowsWorker(args: string[], emit: Emit, entrypoint:
   captureFiles?: { stdout: number; stderr: number }): Promise<number> {
   try { await initializeWindowsReviewJob(); } catch { throw new QaDeadlineError('Windows process containment is unavailable; no command was started'); }
   return new Promise<number>(resolve => {
-    const worker = spawn(process.execPath, [...process.execArgv, entrypoint, '--receipt-worker', ...args], {
+    const worker = spawn(process.execPath, [...bunIsolationArgs(), ...process.execArgv, entrypoint, '--receipt-worker', ...args], {
       stdio: ['inherit', captureFiles?.stdout ?? 'inherit', captureFiles?.stderr ?? 'inherit', 'ipc'], windowsHide: true,
     });
     const kill = () => { worker.kill('SIGKILL'); };
@@ -221,6 +235,9 @@ export async function runQaWindowsWorker(args: string[], emit: Emit, entrypoint:
     worker.on('message', (message: any) => {
       if (message?.type === messageType && ['stdout', 'stderr'].includes(message.stream)
         && message.receipt && typeof message.receipt === 'object') emit(message.stream, message.receipt, message.completion);
+      if (message?.type === messageType && Number.isSafeInteger(message.seq)) {
+        try { worker.send({ type: `${messageType}-ack`, seq: message.seq }, () => {}); } catch {}
+      }
     });
     worker.once('error', () => {
       process.off('exit', kill);
@@ -241,6 +258,10 @@ export async function withQaReceiptOutput(receiptWorker: boolean, messageType: s
     stderr: fs.createWriteStream('', { fd: 2, autoClose: false }),
   };
   const writes: Promise<void>[] = [];
+  const acks = new Map<number, () => void>();
+  if (receiptWorker) process.on('message', (message: any) => {
+    if (message?.type === `${messageType}-ack`) acks.get(message.seq)?.();
+  });
   let writeFailed = false;
   const failed = () => { writeFailed = true; };
   output.stdout.on('error', failed);
@@ -249,7 +270,11 @@ export async function withQaReceiptOutput(receiptWorker: boolean, messageType: s
     writes.push(new Promise<void>(resolve => {
       const done = (error?: Error | null) => { if (error) writeFailed = true; resolve(); };
       try {
-        if (receiptWorker) process.send!({ type: messageType, stream, receipt, ...(completion ? { completion } : {}) }, done);
+        if (receiptWorker) {
+          const seq = writes.length;
+          acks.set(seq, () => { acks.delete(seq); resolve(); });
+          process.send!({ type: messageType, seq, stream, receipt, ...(completion ? { completion } : {}) }, (error?: Error | null) => { if (error) done(error); });
+        }
         else output[stream].write(format(receipt), done);
       } catch { writeFailed = true; resolve(); }
     }));

@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { runGeneration } from '../scripts/gen-skill-docs';
+import { warmFirstExec } from './helpers/warm-first-exec';
 
 const root = mkdtempSync(join(tmpdir(), 'skill-positional-'));
 const rendered = join(root, 'rendered');
@@ -31,6 +32,9 @@ beforeAll(async () => {
     expect((await runGeneration({ host, outputRoot: rendered })).exitCode).toBe(0);
   }
 }, 120000);
+// Windows Free Tests 40700602081, 41174352235, 41175308095: only the file's first checksum run hit the 5 s kill
+// and serial retries took 0.3 s. The first awk launch is a runner cost, not the rendered literal.
+beforeAll(() => warmFirstExec('bash', ['-c', "printf x | sha256sum | awk '{print $(1)}'"]), 30_000);
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 function substitute(text: string, args: string[]) {
@@ -131,7 +135,7 @@ for (const host of ['claude', 'codex'] as const) for (const args of [[], tenArgu
     const file = backslashPath ? join(root, 'checksum\\path', 'install-script') : join(root, 'install-script');
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, 'synthetic installer bytes\n');
-    for (const name of ['open-gstack-browser', 'pair-agent', 'setup-browser-cookies']) {
+    for (const name of ['open-gstack-browser', 'pair-agent']) {
       const lines = apply(skill(host, name)).split('\n').filter(line => line.includes('actual_sha=$('));
       expect(lines.map(line => line.trim())).toEqual([
         literals.checksum,
@@ -149,9 +153,13 @@ for (const host of ['claude', 'codex'] as const) for (const args of [[], tenArgu
   test(`${label}: upgrade snooze advances the same-version level`, () => {
     mkdirSync(join(root, '.gstack'), { recursive: true });
     writeFileSync(join(root, '.gstack/update-snoozed'), '{new} 1 0\n');
-    const block = skill(host, 'gstack-upgrade').match(/```bash\n((?:eval [^\n]*gstack-paths[^\n]*\n)?_SNOOZE_FILE=[\s\S]*?)```/)![1];
-    // The block resolves the state root first; this fixture has no install, so it supplies the root directly.
-    expect(run(apply(block), { GSTACK_STATE_ROOT: join(root, '.gstack') }).status).toBe(0);
+    const block = skill(host, 'gstack-upgrade').match(/```bash\n((?:\[ -d "\$\{GSTACK_ROOT[^\n]*\n(?:GSTACK_BIN=[^\n]*\n)?)?(?:GSTACK_STATE_ROOT=\$\([^\n]*gstack-paths --get GSTACK_STATE_ROOT[^\n]*\n)?_SNOOZE_FILE=[\s\S]*?)```/)![1];
+    // The block resolves the state root through the installed helper first.
+    const bin = join(root, '.claude/skills/gstack/bin');
+    mkdirSync(bin, { recursive: true });
+    mkdirSync(join(dirname(bin), 'lib'), { recursive: true }); // C1: an exported GSTACK_ROOT needs bin/ and lib/
+    for (const name of ['gstack-paths', 'gstack-state-root.sh']) writeFileSync(join(bin, name), readFileSync(join(import.meta.dir, '../bin', name)), { mode: 0o755 });
+    expect(run(apply(block), { GSTACK_STATE_ROOT: join(root, '.gstack'), GSTACK_BIN: bin, GSTACK_ROOT: dirname(bin) }).status).toBe(0);
     expect(readFileSync(join(root, '.gstack/update-snoozed'), 'utf8')).toMatch(/^\{new\} 2 \d+\n$/);
   });
   test(`${label}: health error preserves its diagnostic argument`, () => {

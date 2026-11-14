@@ -13,9 +13,14 @@ import { createFilePermissionRecorder } from '../plan-count-file-permission';
 import { createAutoplanArtifactRecorder } from '../autoplan-artifact-recorder';
 import { trustDialogInput } from '../pty-trust-dialog';
 import { resolveClaudeBinary } from './binary';
-import { createPtyScreen, stripAnsi } from './screen';
+import { createPtyScreen, screenPanelEnd, stripAnsi } from './screen';
+import { appendSessionLedger, sessionKey } from '../session-ledger';
+import { newTranscriptSessionId, pricedTranscript, ptyTranscriptCostUsd, transcriptFiles } from './transcript-cost';
 
 export interface ClaudePtyOptions {
+  /** Price this session's ledger row from the transcript Claude writes under the hermetic config dir (default true).
+   * false for a caller that must never read model transcripts, such as the native AskUserQuestion capture. */
+  priceTranscript?: boolean;
   /** Register the repo's shipped skills in the child's user scope via
    * hermeticSkillsConfigDir(). Required by any test that types a /skill
    * slash command; without it hermetic claude rejects the command as
@@ -66,6 +71,8 @@ export interface ClaudePtyOptions {
   env?: Record<string, string>;
   /** Total run timeout (ms). Default 240000 (4 min). */
   timeoutMs?: number;
+  /** Append this session's session-ledger row on close (default). runPtySession writes its own. */
+  sessionLedger?: boolean;
 }
 
 export interface ClaudePtySession {
@@ -79,6 +86,13 @@ export interface ClaudePtySession {
   visibleText(): string;
   /** Flush the opted-in terminal parser and return only its current viewport. */
   currentScreen(deadlineAt?: number): Promise<string>;
+  /**
+   * The last non-blank viewport a screen read returned, kept for failure dumps: the tail of visibleText()
+   * can be nothing but spinner redraws after a stall (autoplan-guard-pty, PR gate run 38976253774).
+   * '' before any non-blank read, or when screen observation is off. Never used for matching; optional
+   * because scripted sessions have no viewport history.
+   */
+  lastScreen?(): string;
   /** Same decoded viewport with styles and input epoch for acknowledged paste. */
   currentScreenFrame(deadlineAt?: number): Promise<{ text: string; rawEnd: number;
     styledText: Array<{ row: number; start: number; text: string; dim: boolean; inverse: boolean }> }>;
@@ -119,6 +133,9 @@ export interface ClaudePtySession {
    * the dir name ends in `/.claude` by contract).
    */
   hermeticConfigDir: string | null;
+  /** This session's cost from its transcript (the caller's --session-id, else the one transcript this launch created
+   * for its cwd); undefined when unpriced, ambiguous or opted out. Never throws. */
+  transcriptCostUsd?(): number | undefined;
   /** Owned HOME/.gstack created by the seeded launcher; absent for caller overrides. */
   hermeticSkillStateRoot?: string;
   /** Owned pre-tool identity record, removed by close(). */
@@ -173,7 +190,9 @@ export async function launchClaudePty(
   const cols = opts.cols ?? 120;
   const rows = opts.rows ?? 40;
   const timeoutMs = opts.timeoutMs ?? 240_000;
-  const wallDeadline = performance.now() + timeoutMs;
+  const startedMono = performance.now();
+  const startedAt = new Date().toISOString();
+  const wallDeadline = startedMono + timeoutMs;
   const screenAbort = new AbortController();
   const launch = prepareLaunch(opts);
 
@@ -182,7 +201,7 @@ export async function launchClaudePty(
     deadlineAt: Math.min(opts.screenDeadlineAt ?? wallDeadline, wallDeadline), signal: screenAbort.signal,
   }) : undefined;
   const pty: PtyProcess = { buffer: '', exited: false, closing: false, exitCode: null, outputWaiters: new Set(),
-    screen, screenAbort, screenClosing: undefined, screenFailure: undefined, proc: undefined,
+    screen, screenAbort, screenClosing: undefined, screenFailure: undefined, lastScreen: '', proc: undefined,
     exitedPromise: Promise.resolve(), wallDeadline, recorders: { pendingFiles: [] } };
 
   try {
@@ -228,7 +247,20 @@ export async function launchClaudePty(
     }
   }, Math.max(0, wallDeadline - performance.now()));
   const trust = watchTrustDialog(pty);
-  return sessionHandle(pty, launch, wallTimer, trust);
+  const handle = sessionHandle(pty, launch, wallTimer, trust);
+  if (opts.sessionLedger === false) return handle;
+  const close = handle.close;
+  let recorded = false;
+  return Object.assign(handle, { close: () => {
+    if (!recorded) {
+      recorded = true;
+      const elapsed = performance.now() - startedMono;
+      appendSessionLedger({ key: sessionKey('pty', undefined), runner: 'pty', started_at: startedAt, budget_ms: timeoutMs,
+        elapsed_ms: elapsed, end: elapsed >= timeoutMs ? 'session_timeout' : 'completed', ...screenPanelEnd(handle.visibleText()), billed: false,
+        ...pricedTranscript(handle) });
+    }
+    return close();
+  } });
 }
 
 /** Arguments, child environment and owned state roots, decided before any spawn. */
@@ -239,6 +271,8 @@ interface LaunchSetup {
   hermeticSkillStateRoot: string | undefined;
   autoplanArtifactStateRoot: string | undefined;
   autoplanEngTestPlanStateRoot: string | undefined;
+  /** What prices the transcript: the caller's session id, else the transcripts present before spawn. */
+  transcript: { sessionId: string | undefined; before: Set<string>; cwd: string } | undefined;
 }
 
 function prepareLaunch(opts: ClaudePtyOptions): LaunchSetup {
@@ -295,7 +329,13 @@ function prepareLaunch(opts: ClaudePtyOptions): LaunchSetup {
 
   const autoplanEngTestPlanStateRoot = opts.approveAutoplanArtifactEdits && opts.autoplanArtifactState !== undefined
     ? hermeticSkillStateRoot : undefined;
-  return { args, childEnv, hermetic, hermeticSkillStateRoot, autoplanArtifactStateRoot, autoplanEngTestPlanStateRoot };
+  const extra = opts.extraArgs ?? [];
+  const pinned = extra.findIndex(arg => /^--session-id(=|$)/.test(arg));
+  const sessionId = pinned < 0 ? undefined : extra[pinned].startsWith('--session-id=') ? extra[pinned].slice('--session-id='.length) : extra[pinned + 1];
+  const resumes = extra.some(arg => /^(--resume|--continue|-r|-c)(=|$)/.test(arg));
+  const transcript = hermetic && childEnv.CLAUDE_CONFIG_DIR && opts.priceTranscript !== false && !resumes
+    ? { sessionId, before: transcriptFiles(childEnv.CLAUDE_CONFIG_DIR), cwd: opts.cwd ?? process.cwd() } : undefined;
+  return { args, childEnv, hermetic, hermeticSkillStateRoot, autoplanArtifactStateRoot, autoplanEngTestPlanStateRoot, transcript };
 }
 
 interface LaunchRecorders {
@@ -352,6 +392,7 @@ interface PtyProcess {
   screenAbort: AbortController;
   screenClosing: Promise<void> | undefined;
   screenFailure: unknown;
+  lastScreen: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   proc: any;
   exitedPromise: Promise<void>;
@@ -360,6 +401,13 @@ interface PtyProcess {
 }
 
 function notifyOutput(pty: PtyProcess): void { for (const done of pty.outputWaiters) done(); }
+
+function keepScreen(pty: PtyProcess, text: string): string {
+  if (text.trim()) pty.lastScreen = text;
+  return text;
+}
+
+const lastScreenDump = (pty: PtyProcess) => pty.lastScreen ? `\nLast non-blank screen:\n${pty.lastScreen}` : '';
 
 function disposeScreen(pty: PtyProcess): Promise<void> {
   return pty.screenClosing ??= (pty.screen?.dispose() ?? Promise.resolve()).catch(error => { pty.screenFailure = error; });
@@ -420,7 +468,7 @@ async function waitForAnyOutput(
     if (pty.exited) {
       throw new Error(
         `claude exited (code=${pty.exitCode}) before any pattern matched. ` +
-          `Last visible:\n${stripAnsi(pty.buffer).slice(-2000)}`,
+          `Last visible:\n${stripAnsi(pty.buffer).slice(-2000)}${lastScreenDump(pty)}`,
       );
     }
     const visible = since !== undefined ? stripAnsi(pty.buffer.slice(since)) : stripAnsi(pty.buffer);
@@ -438,7 +486,7 @@ async function waitForAnyOutput(
       .map((p) => (typeof p === 'string' ? JSON.stringify(p) : p.source))
       .join(', ')}\nLast visible (since=${since ?? 'all'}):\n${
       since !== undefined ? stripAnsi(pty.buffer.slice(since)).slice(-2000) : stripAnsi(pty.buffer).slice(-2000)
-    }`,
+    }${lastScreenDump(pty)}`,
   );
 }
 
@@ -476,6 +524,7 @@ async function closePty(pty: PtyProcess, wallTimer: ReturnType<typeof setTimeout
   } finally {
     clearTimeout(cleanupTimer);
     clearTimeout(wallTimer);
+    pty.proc.terminal?.close?.();
   }
 }
 
@@ -509,11 +558,12 @@ function sessionHandle(pty: PtyProcess, launch: LaunchSetup, wallTimer: ReturnTy
     },
     rawOutput: () => pty.buffer,
     visibleText: () => stripAnsi(pty.buffer),
-    currentScreen: async (deadlineAt?: number) => readable().read(deadlineAt),
+    currentScreen: async (deadlineAt?: number) => keepScreen(pty, await readable().read(deadlineAt)),
     currentScreenFrame: async (deadlineAt?: number) => {
       const frame = await readable().readFrame(deadlineAt);
-      return {text: frame.text, rawEnd: frame.inputOffset, styledText: frame.styledText};
+      return {text: keepScreen(pty, frame.text), rawEnd: frame.inputOffset, styledText: frame.styledText};
     },
+    lastScreen: () => pty.lastScreen,
     mark: () => (lastMark = pty.buffer.length),
     waitForOutput: async (since: number, timeoutMs: number) => {
       if (pty.buffer.length > since || pty.exited || pty.closing) return;
@@ -534,6 +584,11 @@ function sessionHandle(pty: PtyProcess, launch: LaunchSetup, wallTimer: ReturnTy
     exited: () => pty.exited,
     exitCode: () => pty.exitCode,
     hermeticConfigDir: launch.hermetic ? launch.childEnv.CLAUDE_CONFIG_DIR ?? null : null,
+    transcriptCostUsd: () => {
+      const { transcript, childEnv } = launch;
+      return transcript && ptyTranscriptCostUsd(childEnv.CLAUDE_CONFIG_DIR,
+        transcript.sessionId ?? newTranscriptSessionId(childEnv.CLAUDE_CONFIG_DIR, transcript.before, transcript.cwd));
+    },
     hermeticSkillStateRoot: launch.hermeticSkillStateRoot,
     pendingPlanReadyFile: pendingExit?.file,
     pendingQuestionFile: pendingQuestion?.file,

@@ -1,5 +1,6 @@
 import type { TemplateContext } from '../types';
 import { getHostConfig } from '../../../hosts/index';
+import { skillStartLines } from '../runtime-root';
 
 /**
  * Preamble bootstrap (token-reduction Phase 1).
@@ -14,26 +15,37 @@ import { getHostConfig } from '../../../hosts/index';
  * emitted by the script, for every host render).
  *
  * Divergences from the old inline bash are deliberate and enumerated in the
- * script header (EOV5): $0-relative paths, --parent-pid for session identity,
- * GSTACK_HOME normalization, SKILL_START_PROTO handshake, passthrough
- * sanitization.
+ * script header (EOV5): $0-relative paths, script-derived harness pid for
+ * session identity, GSTACK_HOME normalization, SKILL_START_PROTO handshake,
+ * passthrough sanitization.
+ *
+ * The start is ONE plain command (#2763): worktree-isolated Claude Code
+ * sessions refuse a command named by a variable, a `[ -x ] ||` fallback, or a
+ * trailing `|| echo`. A missing helper is covered by the degraded-mode prose.
  */
+/**
+ * A loadout chosen for one model (GSTA-161) bakes its name, that model and
+ * the full install root into the start line, so gstack-skill-start can tell
+ * any other model to read the full SKILL.md. An explicit or ad-hoc selection
+ * is bound to no model and adds nothing. The values are validated literals;
+ * nothing from the environment reaches here.
+ */
+function loadoutStartFlags(ctx: TemplateContext): string {
+  const filter = ctx.modules;
+  if (!filter?.boundModel) return '';
+  if (!/^[a-z0-9-]{1,40}$/.test(filter.name)) throw new Error(`loadout name ${JSON.stringify(filter.name)} cannot be baked into a start line`);
+  if (!/^[a-z0-9][a-z0-9._-]{0,79}$/.test(filter.boundModel)) throw new Error(`model id ${JSON.stringify(filter.boundModel.slice(0, 80))} cannot be baked into a start line`);
+  if (!filter.fullRoot || !/^\/[A-Za-z0-9_.@+\/-]*$/.test(filter.fullRoot)) throw new Error('a model-bound loadout needs a plain absolute fullRoot');
+  return ` --loadout '${filter.name}' --loadout-model '${filter.boundModel}' --full-root '${filter.fullRoot}'`;
+}
+
 export function generatePreambleBash(ctx: TemplateContext): string {
   const hostConfig = getHostConfig(ctx.host);
-  const runtimeRoot = hostConfig.usesEnvVars
-    ? `_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
-GSTACK_ROOT="$HOME/${hostConfig.globalRoot}"
-[ -n "$_ROOT" ] && [ -d "$_ROOT/${ctx.paths.localSkillRoot}" ] && GSTACK_ROOT="$_ROOT/${ctx.paths.localSkillRoot}"
-GSTACK_BIN="$GSTACK_ROOT/bin"
-GSTACK_BROWSE="$GSTACK_ROOT/browse/dist"
-GSTACK_DESIGN="$GSTACK_ROOT/design/dist"
-`
-    : '';
+  const start = hostConfig.usesEnvVars ? skillStartLines(ctx) : null;
+  const runtimeRoot = start ? `${start.lookup}\n` : '';
   const brainHealthFlag = ctx.host === 'gbrain' || ctx.host === 'hermes' ? ' --brain-health' : '';
-  // A leading ~ inside double quotes never expands in bash — the primary path
-  // would silently fail -x and every run would take the fallback. Interpolate
-  // through $HOME instead (env-var hosts already use $GSTACK_BIN).
-  const shellPath = (p: string) => p.replace(/^~\//, '$HOME/');
+  const loadoutFlags = loadoutStartFlags(ctx);
+  const startCommand = start ? start.command : `${ctx.paths.binDir}/gstack-skill-start`;
 
   const entry = ['plan-design-review', 'plan-eng-review'].includes(ctx.skillName)
     ? `## Preamble (after scope gate)
@@ -44,10 +56,7 @@ GSTACK_DESIGN="$GSTACK_ROOT/design/dist"
   return `${entry}
 
 \`\`\`bash
-${runtimeRoot}_SS="${shellPath(ctx.paths.binDir)}/gstack-skill-start"
-[ -x "$_SS" ] || _SS="${shellPath(ctx.paths.localSkillRoot)}/bin/gstack-skill-start"
-"$_SS" --skill "${ctx.skillName}" --model "${ctx.model ?? 'none'}" --parent-pid "$PPID"${brainHealthFlag} \\
-  || echo "SKILL_START: unavailable — stale install; run ./setup or /gstack-upgrade (preamble degraded, continue the user's task)"
+${runtimeRoot}${startCommand} --skill "${ctx.skillName}" --model "${ctx.model ?? 'none'}"${loadoutFlags}${brainHealthFlag}
 \`\`\`
 
 Read the echoed \`KEY: value\` STATUS lines — they drive every preamble rule

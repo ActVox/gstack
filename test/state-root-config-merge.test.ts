@@ -20,7 +20,7 @@ const POLICY = path.join(ROOT, 'bin', 'gstack-gbrain-repo-policy');
 let tmp: string, home: string, legacy: string, resolved: string, env: Record<string, string>;
 
 beforeEach(() => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-merge-'));
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "gstack merge's-"));
   home = path.join(tmp, 'home');
   legacy = path.join(home, '.gstack');
   resolved = path.join(tmp, 'custom');
@@ -70,9 +70,24 @@ describe('merged config keys', () => {
     expect(r.stderr).toContain(`gstack-config: set codex_reviews in ${resolved}/config.yaml, but codex_reviews is still 'disabled': ${legacy}/config.yaml sets that more restrictive value`);
     expect(r.stderr).toContain('docs/state-root.md');
     const fix = r.stderr.split('\n').find((l) => l.startsWith('fix: '))!;
-    expect(fix).toContain(`GSTACK_STATE_ROOT='${legacy}'`);
+    const quoted = (v: string) => spawnSync('bash', ['-c', 'printf %q "$1"', '_', v], { encoding: 'utf-8', timeout: 20_000 }).stdout;
+    expect(fix).toContain(`GSTACK_STATE_ROOT=${quoted(legacy)} `);
     const command = fix.slice('fix: '.length).replace(/ \(https:.*\)$/, '');
     expect(spawnSync('bash', ['-c', command], { env, encoding: 'utf-8', timeout: 20_000 }).status).toBe(0);
+    expect(config(['get', 'codex_reviews']).stdout).toBe('enabled');
+  });
+
+  test('the printed recovery command runs from an install path containing a space and an apostrophe', () => {
+    const install = path.join(tmp, "inst all's", 'bin');
+    fs.cpSync(path.join(ROOT, 'bin'), install, { recursive: true });
+    fs.writeFileSync(path.join(legacy, 'config.yaml'), 'codex_reviews: disabled\n');
+    const r = spawnSync('bash', [path.join(install, 'gstack-config'), 'set', 'codex_reviews', 'enabled'], { env, encoding: 'utf-8', timeout: 20_000 });
+    expect(r.status).toBe(0);
+    const fix = r.stderr.split('\n').find((l) => l.startsWith('fix: '))!;
+    const command = fix.slice('fix: '.length).replace(/ \(https:.*\)$/, '');
+    const ran = spawnSync('bash', ['-c', command], { env, encoding: 'utf-8', timeout: 20_000 });
+    expect(ran.stderr).toBe('');
+    expect(ran.status).toBe(0);
     expect(config(['get', 'codex_reviews']).stdout).toBe('enabled');
   });
 
@@ -90,6 +105,8 @@ describe('merged config keys', () => {
     expect(plain).toContain(`telemetry:               off (set, ${legacy})`);
     expect(plain).toContain('proactive:               false (set)');
     expect(plain).not.toContain('root-selecting variables disagree');
+    // Two variables naming the same directory agree, even when the path contains spaces.
+    expect(config(['list'], { GSTACK_STATE_ROOT: resolved }).stdout).not.toContain('root-selecting variables disagree');
     const other = path.join(tmp, 'other');
     const disagree = config(['list'], { GSTACK_STATE_DIR: other }).stdout;
     expect(disagree).toContain(`# note: root-selecting variables disagree: GSTACK_HOME=${resolved} GSTACK_STATE_DIR=${other}; using ${resolved} (GSTACK_HOME wins).`);
@@ -145,5 +162,43 @@ describe('test preload hermeticity', () => {
     expect(r.stderr).toContain('test-setup: stripped inherited GSTACK_STATE_ROOT; tests isolate state via GSTACK_HOME');
     expect(r.stderr).toContain('test-setup: stripped inherited GSTACK_STATE_DIR; tests isolate state via GSTACK_HOME');
     expect(r.stderr.match(/test-setup: stripped/g)?.length).toBe(2);
+  });
+
+  test('bun test strips an inherited live-brain URL, so a temp-HOME gbrain child never sees it (#3466)', () => {
+    const live = path.join(tmp, 'live-gbrain');
+    fs.mkdirSync(live, { recursive: true });
+    fs.writeFileSync(path.join(live, 'config.json'), JSON.stringify({ database_url: 'postgresql://live-config.invalid/brain' }));
+    const childHome = path.join(tmp, 'child-home');
+    fs.mkdirSync(childHome, { recursive: true });
+    const probe = path.join(tmp, 'brain-probe.test.ts');
+    fs.writeFileSync(probe, [
+      "import { test, expect } from 'bun:test';",
+      "import { spawnSync } from 'child_process';",
+      "test('probe', () => {",
+      "  const script = \"const { buildGbrainEnv } = require(\" + JSON.stringify(" + JSON.stringify(path.join(ROOT, 'lib', 'gbrain-exec.ts')) + ") + \"); const e = buildGbrainEnv(); console.log(['GBRAIN_DATABASE_URL','GBRAIN_DIRECT_DATABASE_URL','DATABASE_URL','GBRAIN_HOME'].map(k => k + '=' + (e[k] ?? '<unset>')).join(' '));\";",
+      "  const r = spawnSync(process.execPath, ['--no-env-file', '--config=/dev/null', '-e', script], {",
+      "    env: { ...process.env, HOME: " + JSON.stringify(childHome) + " }, encoding: 'utf-8', timeout: 30_000,",
+      "  });",
+      "  expect(r.stdout.trim()).toBe('GBRAIN_DATABASE_URL=<unset> GBRAIN_DIRECT_DATABASE_URL=<unset> DATABASE_URL=<unset> GBRAIN_HOME=<unset>');",
+      "});",
+    ].join('\n'));
+    const r = spawnSync('bun', ['test', '--preload', path.join(ROOT, 'test-setup.ts'), probe], {
+      cwd: tmp,
+      env: {
+        ...env, GSTACK_HOME: resolved,
+        GBRAIN_DATABASE_URL: 'postgresql://live-brain.invalid/brain',
+        GBRAIN_DIRECT_DATABASE_URL: 'postgresql://live-brain.invalid/direct',
+        DATABASE_URL: 'postgresql://live-brain.invalid/fallback',
+        GBRAIN_HOME: live,
+      },
+      encoding: 'utf-8',
+      timeout: 60_000,
+    });
+    expect(r.stderr).not.toContain('live-brain.invalid');
+    expect(r.stderr).not.toContain('live-config.invalid');
+    expect(r.status).toBe(0);
+    for (const name of ['GBRAIN_DATABASE_URL', 'GBRAIN_DIRECT_DATABASE_URL', 'DATABASE_URL', 'GBRAIN_HOME']) {
+      expect(r.stderr).toContain(`test-setup: stripped inherited ${name}; tests must not reach a live gbrain`);
+    }
   });
 });

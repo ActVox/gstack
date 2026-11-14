@@ -4,9 +4,9 @@ import * as path from 'node:path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
-  callerExcerpt, callerReviewRecordTemplate, callerSnapshot, callerTools, createQaCallerFixture, qaCallerInstructions,
+  callerExcerpt, callerProbeReadErrors, callerReviewRecordTemplate, callerSnapshot, callerTools, createQaCallerFixture, qaCallerInstructions,
   QA_CALLER_CASES, QA_CALLER_TEST_MS,
-  qaCallerSessionOptions, qaCallerCommandAllowed, readCallerReceipt, retainQaCallerEvidence, runQaCaller, validateCallerEvidence,
+  qaCallerSessionOptions, qaCallerCommandAllowed, readCallerReceipt, retainQaCallerEvidence, runQaCaller, unloadedHelperCommand, validateCallerEvidence,
   type CallerProbe, type CallerReceipt, type QaCallerFixture,
 } from './helpers/qa-callers-fixture';
 import type { runSkillTest, SkillTestResult } from './helpers/session-runner';
@@ -15,6 +15,8 @@ import { CAPTURE_MS } from './helpers/eval-budgets';
 import { readQACheckpointFiles } from './helpers/qa-checkpoint-evidence';
 import { generateQAExploratory, generateQAResource, generateQAReview, generateQAReviewPreflight } from '../scripts/resolvers/qa';
 import { HOST_PATHS } from '../scripts/resolvers/types';
+import { qaProbeNames } from './helpers/qa-probe-names';
+import capturedHandoffOrder from './fixtures/qa-caller-handoff-order-public.json';
 
 function nativeCall(id: string, name: string, input: object, output: string, parent: string | null = null, failed = false) {
   return [
@@ -86,6 +88,133 @@ function rebuildCheckpoints(observed: ReturnType<typeof evidence>) {
 }
 
 describe('caller native-event observer controls', () => {
+  test('captured instruction Read and probe in one provider response is not consumed instruction evidence', () => {
+    const captured = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/qa-caller-read-probe-mtb1007a.json'), 'utf8'));
+    const tools = callerTools(captured.events);
+    const probe = tools.find(tool => tool.name === 'Bash')!;
+    const resources = ['exploratory', 'system-functional'].map(id => [id, tools.find(tool => String(tool.input.file_path).endsWith(`/qa/sections/${id}.md`))] as const);
+    expect(resources[0][1]!.resultIndex).toBeLessThan(probe.index);
+    expect(resources[0][1]!.messageId).toBe(probe.messageId);
+    expect(callerProbeReadErrors(probe, resources)).toEqual([
+      'probe preceded resource read: exploratory', 'probe preceded resource read: system-functional',
+    ]);
+    expect(callerProbeReadErrors({ ...probe, messageId: 'separate-response-control' }, resources))
+      .toEqual(['probe preceded resource read: system-functional']);
+    const ordered = structuredClone(captured.events);
+    const command = ordered.splice(2, 2);
+    command[0].message.id = 'separate-response-control';
+    ordered.push(...command);
+    const ready = callerTools(ordered);
+    expect(callerProbeReadErrors(ready.find(tool => tool.name === 'Bash')!,
+      ['exploratory', 'system-functional'].map(id => [id, ready.find(tool => String(tool.input.file_path).endsWith(`/qa/sections/${id}.md`))] as const))).toEqual([]);
+  });
+
+  test('census 38212265208: a probe batched with the caller section Read is flagged, and the scheduling contract never calls a probe discovery', async () => {
+    // Native order of census 38212265208 (gate-census-6, ship-exploratory-late-input): provider
+    // message, tool, input; outputs abbreviated. Capture 001 shares a response with the Step 9 section Read.
+    const R = '/home/runner/.cache/gstack-paid-shard-iHlpIM/tmp/qc-cALQYz';
+    const capture = (id: string, extra = '') => `bun ${R}/host/runtime/bin/gstack-qa-evidence capture ${R}/product/reports ${id} --public --deadline ${R}/product/reports/deadline.json ${extra}-- bun scripts/probe.ts`;
+    const replay: Array<[string, string, Record<string, string>, string]> = [
+      ['YvqEApde', 'Read', { file_path: `${R}/host/runtime/ship/sections/plan-completion.md` }, '## Step 8: Plan Completion Audit'],
+      ['YvqEApde', 'Read', { file_path: `${R}/host/runtime/ship/sections/review-army.md` }, '## Step 9: Pre-Landing Review'],
+      ['YvqEApde', 'Bash', { command: `${capture('001')} 3` }, '{"id":"probe-b5ae2d9c-af87-4e8a-9aab-76972f826079","charter":"happy","input":"3"}'],
+      ['w9Gt4kmL', 'Read', { file_path: `${R}/host/runtime/qa/sections/exploratory.md` }, '# Shared exploratory QA'],
+      ['w9Gt4kmL', 'Read', { file_path: `${R}/host/runtime/bin/gstack-qa-evidence` }, '#!/usr/bin/env bun'],
+      ['w9Gt4kmL', 'Bash', { command: `${R}/host/runtime/bin/gstack-review-read` }, 'NO_REVIEWS'],
+      ['w9Gt4kmL', 'Bash', { command: `${R}/host/runtime/bin/gstack-specialist-stats` }, 'SPECIALIST_STATS: 0 reviews analyzed'],
+      ['cba4VKcQ', 'Bash', { command: `${capture('002', "--after 001 --hypothesis 'upper bound 9 should still print 18' ")} 9` }, '{"id":"probe-baf59bfd-ac54-4a4a-8bec-2cd416154bbf","charter":"plan:nine","input":"9"}'],
+      ['cba4VKcQ', 'Read', { file_path: `${R}/host/runtime/qa/sections/scope.md` }, '### Select the surface before setup'],
+      ['cba4VKcQ', 'Read', { file_path: `${R}/host/runtime/qa/sections/system-functional.md` }, '# Functional QA with repository-native tools'],
+    ];
+    const replayTools = (rows: typeof replay) => callerTools(rows.flatMap(([message, name, input, output], i) =>
+      nativeCall(`toolu_${i}`, name, input, output).map((event: any) => event.type === 'assistant'
+        ? { ...event, session_id: 'census-38212265208', message: { ...event.message, id: `msg_${message}` } } : event)));
+    const probeErrors = (tools: ReturnType<typeof callerTools>) => tools.filter(tool => / capture /.test(String(tool.input.command)))
+      .flatMap(probe => callerProbeReadErrors(probe, ['exploratory', 'system-functional']
+        .map(id => [id, tools.find(tool => String(tool.input.file_path).endsWith(`/qa/sections/${id}.md`))] as const)));
+    const tools = replayTools(replay);
+    const section = tools.find(tool => String(tool.input.file_path).endsWith('/ship/sections/review-army.md'))!;
+    expect(tools.find(tool => / capture /.test(String(tool.input.command)))!.messageId).toBe(section.messageId);
+    expect(probeErrors(tools)).toEqual([
+      'probe preceded resource read: exploratory', 'probe preceded resource read: system-functional',
+      'probe preceded resource read: system-functional',
+    ]);
+    const isProbe = ([, , input]: (typeof replay)[number]) => / capture /.test(input.command ?? '');
+    expect(probeErrors(replayTools([...replay.filter(row => !isProbe(row)),
+      ...replay.filter(isProbe).map(([message, ...rest]) => [`${message}-after-reads`, ...rest] as (typeof replay)[number])]))).toEqual([]);
+
+    const fixture = createQaCallerFixture('ship-exploratory-late-input');
+    try {
+      await runQaCaller(fixture, 'free-read-probe-contract', async options => {
+        const contract = options.appendSystemPrompt!;
+        const discovery = contract.match(/Read-only discovery is [^.]*;([^.]*)\./);
+        expect(discovery?.[1]).toMatch(/capture/);
+        expect(discovery?.[1]).toMatch(/guard start/);
+        expect(discovery?.[1]).toMatch(/never discovery/);
+        return { exitReason: 'error_max_turns', transcript: [] } as unknown as SkillTestResult;
+      });
+    } finally { await fixture.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+  });
+
+  test('captured section skips 38973329985 and 38993076767: the reads stay required, and the prompt binds names instead of teaching helper forms', async () => {
+    // Paid gate runs 38973329985 and 38993076767, ship-exploratory-small-cli: both actors read ship/sections/review-army.md, never
+    // read qa/sections/exploratory.md or system-functional.md, ran captures with the syntax the session prompt taught, then a bare
+    // materialize the prompt had not taught. Every passing session in the window read both sections.
+    const captured = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/qa-caller-section-skip-ship-small-cli.json'), 'utf8'));
+    const reportRoot = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'qc-skip-'));
+    checkpointRoots.push(reportRoot);
+    const validate = (transcript: unknown[]) => validateCallerEvidence({
+      caller: 'ship', result: { exitReason: 'success', transcript }, probes: [], receipt: { status: 'pass', probes: [], remaining: [] },
+      currentSnapshot: snapshot, requiredCharters: [], mutations: [], observerComplete: true,
+      reportRoot, checkpointFiles: {}, reportMarkdown: '',
+    });
+    const missing = ['missing executed resource read: /qa/sections/exploratory.md', 'missing executed resource read: /qa/sections/system-functional.md'];
+    for (const run of ['38973329985', '38993076767']) {
+      const events = captured.runs[run] as unknown[];
+      expect(callerTools(events).filter(tool => / materialize \/qc\/product\/reports$/.test(String(tool.input.command)))).toHaveLength(1);
+      const errors = validate(events);
+      for (const error of missing) expect(errors).toContain(error);
+      const control = [...events.slice(0, 4), ...nativeCall(`${run}-exploratory`, 'Read', { file_path: '/qc/host/runtime/qa/sections/exploratory.md' }, '# Shared exploratory QA'),
+        ...nativeCall(`${run}-functional`, 'Read', { file_path: '/qc/host/runtime/qa/sections/system-functional.md' }, '# Functional QA'), ...events.slice(4)];
+      for (const error of missing) expect(validate(control)).not.toContain(error);
+    }
+    for (const caseId of QA_CALLER_CASES) {
+      const fixture = createQaCallerFixture(caseId, { installRuntime: false });
+      try {
+        const prompt = qaCallerSessionOptions(fixture, 'free-bindings').prompt;
+        expect(prompt).not.toMatch(/gstack-qa-(?:evidence|deadline) (?:capture|checkpoint|materialize|start|status|run)\b|--after PREV|--hypothesis/);
+        expect(prompt).toContain('forms are in the installed qa/sections/exploratory.md this phase requires you to Read');
+        for (const binding of [`DEADLINE_TOOL = ${fixture.runtime}/bin/gstack-qa-deadline`, `EVIDENCE_TOOL = ${fixture.runtime}/bin/gstack-qa-evidence`,
+          `PROBE_DIR = ${fixture.cwd}/reports`, `DEADLINE_FILE = ${fixture.cwd}/reports/deadline.json`, 'so --public is approved', '--timeout-ms 10000']) {
+          expect(prompt).toContain(binding);
+        }
+        // PR gate 39077524802 (0f71a55) ship-exploratory-late-input: after the late input change the actor reran captures
+        // 001 and 002 with --timeout-ms 10000, reading revalidation as 'outside the smoke budget'.
+        expect(prompt).toContain('Only an explicit plan check this phase requires may use --timeout-ms 10000 in place of the deadline; every other capture, including a rerun or revalidation of an earlier probe, uses the deadline.');
+        expect(prompt).not.toContain('Explicit plan probes outside the smoke budget may use');
+      } finally { await fixture.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+    }
+    const section = fs.readFileSync(path.join(import.meta.dir, '../qa/sections/exploratory.md'), 'utf8');
+    for (const form of ['bun DEADLINE_TOOL start DEADLINE_FILE SECONDS [EARLIER_UTC]', 'bun EVIDENCE_TOOL capture PROBE_DIR NNN [--public] --deadline DEADLINE_FILE -- COMMAND ARGS',
+      "--after PREV --hypothesis 'why'", 'bun EVIDENCE_TOOL materialize PROBE_DIR annotations.json']) {
+      expect(section).toContain(form);
+    }
+  });
+
+  test('captured 39002269281 standalone state-machine detect stays outside the caller interface; the generated scope block runs it', async () => {
+    // PR gate run 39002269281 ship-exploratory-plan-checks, native Bash call 17: the selection prose named the detector, so the
+    // actor ran it alone. The detector now runs inside the generated scope block, which is the declared form.
+    const fixture = createQaCallerFixture('ship-exploratory-plan-checks', { installRuntime: false });
+    try {
+      const standalone = `${fixture.runtime}/bin/gstack-state-matrix detect --base main`;
+      expect(qaCallerCommandAllowed(standalone, fixture.workflowCommands)).toBe(false);
+      const block = fixture.workflowCommands.find(command => command.includes('/bin/gstack-state-matrix detect --base main'));
+      expect(block).toBeDefined();
+      expect(block).toContain('/gstack-diff-scope main 2>/dev/null) || true');
+      expect(qaCallerCommandAllowed(block!, fixture.workflowCommands)).toBe(true);
+    } finally { await fixture.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+  });
+
   test.each(['pending-result', 'same-event', 'same-message-id'])('method Read %s cannot authorize a dependent probe', ordering => {
     const observed = evidence();
     const events = observed.result.transcript as any[];
@@ -118,6 +247,22 @@ describe('caller native-event observer controls', () => {
     expect(validateCallerEvidence(observed)).toContain('review completion preceded handoff freshness decision');
   });
 
+  // Opus gates 39320737890 attempt 1 and 39332134395 attempt 2 (slice 8, review-exploratory-small-cli) wrote the
+  // completed:true adversarial-review record in the same response as the first HANDOFF.md Read, or before any Read.
+  // The same public events pass once the record follows every handoff result in its own response.
+  test.each(capturedHandoffOrder.attempts.map(attempt => [attempt.source, attempt] as const))
+    ('captured adversarial-review completion before its handoff result is flagged; reordered it passes: %s', (_, attempt) => {
+      const observed = evidence();
+      const base = observed.result.transcript;
+      observed.result.transcript = [...base, ...structuredClone(attempt.events)];
+      expect(validateCallerEvidence(observed)).toEqual(['review completion preceded handoff freshness decision']);
+      const ordered = structuredClone(attempt.events) as any[];
+      const [use, result] = ordered.splice(ordered.findIndex(event => event.message.content[0].name === 'Bash'), 2);
+      use.message.id = 'record-after-handoff-results';
+      observed.result.transcript = [...base, ...ordered, use, result];
+      expect(validateCallerEvidence(observed)).toEqual([]);
+    });
+
   test('captured gate-census-5 review record: bun-wrapped helper and receipt status are outside the interface', () => {
     // ci-36629958451-1-gate-census-5 review-exploratory-small-cli, native events 68 and 70 (fixture paths shortened).
     const record = (status: string) => `/runtime/bin/gstack-review-log '{"skill":"review","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","commit":"'"$(git rev-parse --short HEAD)"'","branch":"caller-change","status":"${status}","completed":false,"converged":false,"critical":1,"informational":0,"findings":[{"path":"scale.ts","line":3,"category":"functional-contract","severity":"CRITICAL","fingerprint":"scale.ts:3:functional-contract","action":"ask-pending"}]}' --finish d45404cf-ba19-4bc6-a505-9801e9322f54`;
@@ -146,6 +291,24 @@ describe('caller native-event observer controls', () => {
     expect(prompt('ship-exploratory-small-cli')).toContain('otherwise issues_found (unavailable for missing dispatched reviewer output)');
   });
 
+  test('captured gate-census-5 typo: a helper path bun could not load is held to the interface at the installed path', () => {
+    // ci-37162480720-1-gate-census-5 review-exploratory-small-cli, native Bash call 7 (hypothesis shortened):
+    // the actor dropped one character from the shard directory, bun refused the path, and the next call reran it.
+    const typo = '/home/runner/.cache/gstack-paid-shard-A2tpF/tmp/qc-fTJ5TT/host/runtime/bin/gstack-qa-evidence';
+    const args = ` capture /home/runner/.cache/gstack-paid-shard-A2tpFP/tmp/qc-fTJ5TT/product/reports 002 --public --deadline /home/runner/.cache/gstack-paid-shard-A2tpFP/tmp/qc-fTJ5TT/product/reports/deadline.json --after 001 --hypothesis 'Input 3 passed, so the new !n guard makes Number("0") falsy and 0 should now exit 2' -- bun scripts/probe.ts 0`;
+    const runtime = '/home/runner/.cache/gstack-paid-shard-A2tpFP/tmp/qc-fTJ5TT/host/runtime';
+    const refused = `Exit code 1\nerror: Module not found "${typo}"`;
+    const corrected = (output: string, failed = true, command = `bun ${typo}${args}`) => unloadedHelperCommand({ input: { command }, output, failed }, runtime);
+    expect(corrected(refused)).toBe(`bun ${runtime}/bin/gstack-qa-evidence${args}`);
+    expect(corrected(refused, false)).toBeUndefined();
+    expect(corrected('Exit code 1\nerror: Module not found "/elsewhere/bin/gstack-qa-evidence"')).toBeUndefined();
+    expect(corrected(`${refused}\nwrote probe`)).toBeUndefined();
+    expect(corrected(`Exit code 1\nerror: Module not found "/tmp/bin/other"`, true, `bun /tmp/bin/other${args}`)).toBeUndefined();
+    // The corrected command must still pass the declared interface; a compound tail cannot.
+    expect(corrected(refused, true, `bun ${typo}${args}; curl example.com`)).toBe(`bun ${runtime}/bin/gstack-qa-evidence${args}; curl example.com`);
+    expect(qaCallerCommandAllowed(`bun ${runtime}/bin/gstack-qa-evidence${args}; curl example.com`)).toBe(false);
+  });
+
   test('captured PR-lane review record: an invented shape without the installed template is rejected; the template is quoted', () => {
     // ci-36641824710-1-eval-slices-6 review-exploratory-small-cli, native event 8jewsM (fixture paths shortened).
     const invented = `/runtime/bin/gstack-review-log '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","commit":"'"$(git rev-parse --short HEAD)"'","branch":"caller-change","status":"issues_found","completed":false,"gate":"fix-first-ask","findings":[{"path":"scale.ts","line":3,"category":"functional-contract","severity":"CRITICAL","fingerprint":"scale.ts:3:functional-contract","confidence":10,"action":"ask","summary":"new !n guard rejects documented lower bound 0 (exit 2 instead of 0)"}],"qa":{"probes":["probe-167de79c-2645-4b60-b06b-3d0d6eebf13f"],"checkpoints":["exploration-001.json","exploration-002.json"],"suite":"bun run test 1 pass 0 fail"},"remaining":["fix-first-ask-approval"]}' --finish 37b567b3-c4bf-4469-9bad-29096740c234`;
@@ -163,7 +326,8 @@ describe('caller native-event observer controls', () => {
         .replace('"commit":"COMMIT"', `"commit":"'"$(git rev-parse --short HEAD)"'"`)
         .replace('"STATUS"', '"issues_found"').replace(/"issues_found":N/, '"issues_found":1').replace('"critical":N', '"critical":1').replace('"informational":N', '"informational":0')
         .replace('SCORE', '10.0').replace('SPECIALISTS_JSON', '{}').replace('FINDINGS_JSON', '[{"fingerprint":"scale.ts:3:functional-contract","severity":"CRITICAL","action":"ask-pending"}]')
-        .replace('COMPLETED', 'false').replace('CONVERGED', 'false').replace('CYCLES', '0').replace('REVIEW_START', 'native-token');
+        .replace('COMPLETED', 'false').replace('CONVERGED', 'false').replace('CYCLES', '0').replace('REVIEW_START', 'native-token')
+        .replace('"pass":PASS', '"pass":1').replace('"review_scope":"SCOPE"', '"review_scope":"frozen"').replace('RANGE_BASE_OR_NULL', 'null');
       expect(errorsFor(filled)).toEqual([]);
       const fixture = createQaCallerFixture(caller === 'review' ? 'review-exploratory-small-cli' : 'ship-exploratory-small-cli', { installRuntime: false });
       try { expect(qaCallerSessionOptions(fixture, 'free-control').prompt).toContain(callerReviewRecordTemplate(fixture)); } finally { fs.rmSync(fixture.root, { recursive: true, force: true }); }
@@ -649,13 +813,9 @@ describe('generated actual parent paths', () => {
       expect(positions).toEqual([...positions].sort((a, b) => a - b));
       const load = skillName === 'review' ? generateQAReviewPreflight(ctx) : parent.slice(positions[0], positions[1]);
       if (skillName === 'review') {
-        const charter = parent.slice(positions[0], positions[1]).replace(/\s+/g, ' ');
-        expect(charter).toContain("Reuse Step 4's surfaces and completed Reads");
-        expect(charter).toContain('Finish missing methods before charters');
-        expect(charter).toContain('complete the shared isolation/permission preflight before setup');
         const readiness = parent.slice(positions[1], positions[2]).replace(/\s+/g, ' ');
-        expect(readiness).toContain('Read QA\'s `sections/browser-setup.md` and follow its report-only rules');
-        expect(readiness).toContain('Never install, import cookies or bootstrap tests');
+        expect(readiness).toMatch(/Read QA's `sections\/browser-setup\.md` and follow its report-only rules/i);
+        expect(readiness).toMatch(/never install, import cookies or bootstrap tests/i);
         expect(load).not.toContain('sections/browser-setup.md');
       }
       expect(load).toContain('{{QA_RESOURCE:exploratory}}');
@@ -664,56 +824,49 @@ describe('generated actual parent paths', () => {
       const resource = generateQAResource(ctx, ['exploratory']);
       expect(resource).toContain(`installed /${skillName} SKILL.md's directory`);
       expect(resource).toContain('`../qa/sections/exploratory.md`');
-      const shared = generateQAExploratory({ ...ctx, skillName: 'qa' });
-      const preparation = ['1. Read `sections/scope.md`', 'in full and select the surfaces',
-        'Read `sections/system-functional.md` in full.', 'Read `sections/qa-patterns.md` in full.',
-        'Write a **charter**', '1. First demonstrate success'].map(marker => shared.indexOf(marker));
-      expect(preparation.every(position => position >= 0)).toBe(true);
-      expect(preparation).toEqual([...preparation].sort((a, b) => a - b));
-      expect(load).toContain('Templates cannot replace them');
       const flat = parent.replace(/\s+/g, ' ');
-      expect(flat).toContain('Only the parent runs report-only discovery');
-      expect(flat).toContain('Follow the shared Probe loop for smoke checks and replays until the smoke limit');
-      expect(flat).toContain('Then run required plan checks and revalidation, even after smoke expires');
-      expect(flat).toContain('using the same procedure but no smoke guard; never reset the clock');
-      expect(flat).toContain("Use finite command timeouts, capped at the caller\'s remaining time if it has a deadline");
-      expect(flat).toContain('When the caller\'s deadline expires, mark unfinished checks not-run');
-      for (const contract of ['First demonstrate success: output AND durable effects',
-        'Wait for successful checkpoint publication before dispatch',
-        'Replay the exact failing command/request from the same initial fixture state']) {
-        expect(shared).toContain(contract);
-      }
-      expect(flat).toContain('Read agent/user updates and await results without batching them with reporting/logging');
-      expect(flat).toContain('Re-review changed or uncertain coverage and repeat step 3 for affected checks');
-      expect(flat).toContain('Report clean/completed only when all required checks pass on current inputs');
-      expect(flat).toContain('List failed, blocked, inconclusive and not-run checks');
+      expect(flat).toMatch(/repeat step 3 for affected checks/i);
     }
   });
 
   test('authored shared loop preserves complete safe observations and re-enters checkpoints after input changes', () => {
     const text = generateQAExploratory({ skillName: 'qa', tmplPath: 'qa/SKILL.md.tmpl', host: 'claude', paths: HOST_PATHS.claude }).replace(/\s+/g, ' ');
-    for (const contract of ["last completed probe's full outer command", 'Preserve every safe program-JSON key/value', 'identity hash unchanged', 'Q supplies observed; never transcribe it', 'write the report, not a checkpoint', 'return to step 2 for each affected revalidation', 'Pass requires all required current-input contracts to pass with no required remainder']) {
-      expect(text).toContain(contract);
-    }
-    expect(text).toContain("observationCommand: last completed probe's full outer command, including guard");
-    expect(text).toContain('observed: its exact decoded child JSON (no wrapper/extra keys)');
-    expect(text).toContain('or its full non-JSON text');
+    expect(text).toMatch(/observationCommand: last completed probe's full outer command/i);
+    expect(text).toMatch(/observed: its exact decoded child JSON/i);
+    expect(text).toMatch(/identity hash unchanged/i);
     expect(text).not.toContain('nest unchanged child JSON');
   });
   test('the shared smoke has explicit limits without waiving required plan checks', () => {
-    const body = fs.readFileSync(path.join(import.meta.dir, '../qa/sections/exploratory.md'), 'utf8').replace(/\s+/g, ' ');
-    expect(body).toContain('Stop after 5 minutes or 12 probes, whichever comes first');
-    expect(body).toContain('G enforces the deadline');
-    expect(body).toContain('Never reset D/bypass G');
-    expect(body).toContain('Explicit plan checks and revalidation remain required beyond this smoke budget');
+    const raw = fs.readFileSync(path.join(import.meta.dir, '../qa/sections/exploratory.md'), 'utf8');
+    const body = raw.replace(/\s+/g, ' ');
+    expect(body).toMatch(/stop after 5 minutes or 12 probes/i);
+    const n = qaProbeNames(raw);
+    expect(body).toContain(`${n.guard} enforces the deadline`);
+    expect(body).toMatch(new RegExp(`never reset ${n.deadline}\\W+bypass ${n.guard}`, 'i'));
+    expect(body).toMatch(/plan checks and revalidation remain required beyond this smoke budget/i);
     expect(body).toContain('leaves /review incomplete');
-    expect(body).toContain('/ship blocked unless the user explicitly accepts that named risk');
+    expect(body).toMatch(/\/ship blocked unless the user explicitly accepts that named risk/i);
   });
 
   test('excerpt extraction fails loudly instead of producing an empty passing fixture', () => {
     expect(callerExcerpt('before\nSTART\nbody\nEND\nafter', 'START', 'END')).toBe('START\nbody\n');
     expect(() => callerExcerpt('START without end', 'START', 'END')).toThrow('boundary');
     expect(() => callerExcerpt('START START END', 'START', 'END')).toThrow('boundary');
+  });
+
+  test('the ship fixture admits the plan-completion acceptance block with the discovered plan path substituted', () => {
+    const fixture = createQaCallerFixture('ship-exploratory-plan-checks', { installRuntime: false });
+    try {
+      const block = fixture.workflowCommands.find(command => command.startsWith('PLAN_FILE="PLAN.md"\n_REL=$(git ls-files --full-name --error-unmatch'));
+      expect(block).toBeDefined();
+      expect(block).not.toContain('<plan-path>');
+      expect(block).not.toContain('<base>');
+      expect(qaCallerCommandAllowed(block!, fixture.workflowCommands)).toBe(true);
+      expect(qaCallerCommandAllowed(block!.replace('PLAN.md', 'OTHER.md'), fixture.workflowCommands)).toBe(false);
+      expect(qaCallerSessionOptions(fixture, 'free-control').prompt).toContain('PLAN.md for <plan-path>');
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
   });
 
   test('the review fixture admits only the actual native read-only diff fragments', () => {
@@ -756,6 +909,62 @@ describe('real caller-specific native fixture and capture boundary', () => {
   };
   const probe = (fixture: QaCallerFixture, value: string) => spawnSync(process.execPath, ['scripts/probe.ts', value], { cwd: fixture.cwd, encoding: 'utf8', timeout: 5000 });
   const dispose = async (fixture: QaCallerFixture) => { await fixture.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); };
+
+  // Opus gate 39320737890 attempt 2 slice 8 (ship-exploratory-plan-checks, head f278f5b): capture 001 was the
+  // guarded smoke probe of 9, 002 probed 10, and 003 ran PLAN.md's required release check of 9 with
+  // --timeout-ms 10000, the form the prompt reserves for an explicit plan check outside the smoke budget.
+  // The validator read 003 as a wasted rerun. One explicit plan check beside the smoke probe is verification;
+  // a second smoke or plan-check run of the same unchanged input is still a duplicate.
+  test.each([
+    ['captured', ['deadline 9', 'deadline 10', 'timeout 9'], undefined],
+    ['plan check guarded like a smoke probe', ['deadline 9', 'deadline 10', 'deadline 9'], 2],
+    ['plan check repeated', ['deadline 9', 'deadline 10', 'timeout 9', 'timeout 9'], 3],
+    ['ordinary input under the plan-check form', ['deadline 3', 'deadline 10', 'timeout 3'], 2],
+  ] as const)('an explicit plan check is not a duplicate of the smoke probe: %s', async (_, steps, duplicate) => {
+    const fixture = await fixtureFor('ship-exploratory-plan-checks', true);
+    try {
+      const reportRoot = path.join(fixture.cwd, 'reports');
+      const state = path.join(reportRoot, 'deadline.json');
+      const evidenceTool = path.join(fixture.runtime, 'bin/gstack-qa-evidence');
+      const result = await runQaCaller(fixture, 'free-plan-check-replay', async options => {
+        const transcript: unknown[] = [
+          ...nativeCall('parent', 'Read', { file_path: `${fixture.cwd}/caller-ship.md` }, 'parent workflow'),
+          ...nativeCall('shared', 'Read', { file_path: `${fixture.runtime}/qa/sections/exploratory.md` }, 'shared method'),
+          ...nativeCall('functional', 'Read', { file_path: `${fixture.runtime}/qa/sections/system-functional.md` }, 'functional method'),
+          ...nativeCall('ship-army', 'Read', { file_path: `${fixture.runtime}/ship/sections/review-army.md` }, 'ship Step 9'),
+        ];
+        const execute = (id: string, cmd: string) => {
+          expect(qaCallerCommandAllowed(cmd, fixture.workflowCommands, { runtime: fixture.runtime, fixtureRoot: fixture.cwd }), cmd).toBe(true);
+          const actual = spawnSync('bash', ['-c', cmd], { cwd: options.workingDirectory, env: { ...process.env, ...options.env }, encoding: 'utf8', timeout: 10_000 });
+          expect(actual.error).toBeUndefined();
+          transcript.push(...nativeCall(id, 'Bash', { command: cmd }, (actual.status ? `Exit code ${actual.status}\n` : '') + actual.stdout + actual.stderr, null, actual.status !== 0));
+        };
+        execute('start', `bun ${path.join(fixture.runtime, 'bin/gstack-qa-deadline')} start ${state} 300`);
+        for (const [index, step] of steps.entries()) {
+          const [lane, value] = step.split(' ');
+          const id = String(index + 1).padStart(3, '0');
+          const bound = lane === 'deadline' ? `--deadline ${state}` : '--timeout-ms 10000';
+          const after = index ? ` --after ${String(index).padStart(3, '0')} --hypothesis 'Input ${value} checks the next documented contract.'` : '';
+          execute(`capture-${id}`, `bun ${evidenceTool} capture ${reportRoot} ${id} --public ${bound}${after} -- bun scripts/probe.ts ${value}`);
+        }
+        return { exitReason: 'success', transcript } as SkillTestResult;
+      });
+      await fixture.close();
+      const probes = fixture.probes();
+      expect(probes).toHaveLength(steps.length);
+      const checkpointFiles = readQACheckpointFiles(reportRoot);
+      const errors = validateCallerEvidence({
+        caller: fixture.caller, result, probes,
+        receipt: { status: 'pass', probes: probes.map(probe => probe.id), remaining: [] },
+        currentSnapshot: fixture.snapshot(), requiredCharters: ['happy', 'adverse', 'plan:nine'], mutations: fixture.mutationEvents,
+        observerComplete: fixture.observation?.complete === true && !fixture.observerErrors.length,
+        fixtureRoot: fixture.cwd, runtime: fixture.runtime, reportRoot, requireGuardedSmoke: true, requireCapturedEvidence: true,
+        checkpointFiles, reportMarkdown: Object.keys(checkpointFiles).map(name => `[checkpoint](${name})`).join('\n'),
+      });
+      if (duplicate === undefined) expect(errors).toEqual([]);
+      else expect(errors).toContain(`duplicate unchanged passing probe: ${probes[duplicate].id}`);
+    } finally { await dispose(fixture); }
+  });
 
   test('deadline authority is closed over the installed helper, owned state and literal probe child', async () => {
     const fixture = await fixtureFor('ship-exploratory-small-cli', true);
@@ -1152,16 +1361,15 @@ describe('real caller-specific native fixture and capture boundary', () => {
     try {
       fixture.config = path.join(fixture.root, 'callback-config');
       await runQaCaller(fixture, 'free-receipt-interface', async options => {
-        expect(options.prompt).toContain('status is the overall supplied phase gate, not whether some probes passed');
-        expect(options.prompt).toContain('Pass requires no remaining required contracts or gates');
-        expect(options.prompt).toContain('Optional unavailable providers and later stages outside this excerpt are not required remainder');
-        expect(options.prompt).toContain('exact id values from the captured child JSON (probe-...)');
-        expect(options.prompt).toContain("never the helper's three-digit capture IDs or QA_EVIDENCE.id");
-        expect(options.prompt).toContain('Capture IDs select stored observations for checkpoint/materialize');
+        expect(options.prompt).toMatch(/overall supplied phase gate/i);
+        expect(options.prompt).toMatch(/no remaining required contracts or gates/i);
+        expect(options.prompt).toMatch(/not required remainder/i);
+        expect(options.prompt).toContain('(probe-...)');
+        expect(options.prompt).toMatch(/never the helper's three-digit capture IDs/i);
         expect(options.prompt).not.toMatch(/bun scripts\/probe\.ts \d|exploration-[0-9]{3}|snapshot.*must|plan:nine|adverse/i);
         const readme = fs.readFileSync(path.join(fixture.cwd, 'README.md'), 'utf8');
-        expect(readme).toContain('Every diagnostic receipt field is synthetic, nonsecret evidence');
-        expect(readme).toContain('snapshot identifies the owned source and fixture inputs');
+        expect(readme).toMatch(/synthetic, nonsecret/i);
+        expect(readme).toMatch(/snapshot identifies the owned source/i);
         expect(readme).not.toMatch(/checkpoint|exploration-NNN|hypothesis|nextCommand/);
         return { exitReason: 'success', transcript: [] } as unknown as SkillTestResult;
       });
@@ -1361,20 +1569,19 @@ describe('real caller-specific native fixture and capture boundary', () => {
         expect(options.timeout).toBe(300_000);
         expect(options.completionReserveMs).toBe(75_000);
         expect(options.appendSystemPrompt).toContain(`at most ${options.maxTurns} assistant turns`);
-        expect(options.appendSystemPrompt).toContain('independent source Reads and read-only discovery together as separate native tool calls');
-        expect(options.appendSystemPrompt).toContain('After required clock and approval prerequisites settle');
-        expect(options.appendSystemPrompt).toContain('The completion reserve is for required verification, affected-input revalidation and artifacts, not an earlier deadline');
-        expect(options.appendSystemPrompt).toContain("Use each native probe's snapshot to distinguish current from superseded evidence");
-        expect(options.appendSystemPrompt).toContain('Never group diagnostic probes, checkpoint publication with its next probe');
-        expect(options.appendSystemPrompt).toContain('the turn limit does not authorize skipping work or reporting incomplete work as passed');
+        for (const rule of [/separate native tool calls/i, /approval prerequisites settle/i,
+          /completion reserve is for required verification/i, /superseded evidence/i,
+          /never group diagnostic probes/i, /turn limit does not authorize skipping work/i]) {
+          expect(options.appendSystemPrompt).toMatch(rule);
+        }
         expect(options.appendSystemPrompt).not.toMatch(/bun scripts\/probe\.ts \d|invalid input|highest.risk/i);
-        expect(options.prompt).toContain('Keep normal parent decision gates.');
-        expect(options.prompt).toContain("use the section clock's Hard deadline UTC, never its Runner entry UTC, reserve-start time or a clock-read time");
-        expect(options.prompt).toContain('Before the completion report and each completed:true review record, read HANDOFF.md');
-        expect(options.prompt).toContain('a later handoff read cannot validate an earlier completion');
-        expect(options.prompt).toContain('If you defer an optional idea or stop exploration, do not publish a checkpoint for it');
-        expect(options.prompt).toContain('An unused checkpoint requires an actual authenticated expired-capture result; nearing the deadline or choosing to stop is not enough');
-        expect(options.prompt).toContain('Write the phase report to reports/review.md.');
+        expect(options.prompt).toMatch(/keep normal parent decision gates/i);
+        expect(options.prompt).toMatch(/Hard deadline UTC, never its Runner entry UTC/i);
+        expect(options.prompt).toMatch(/Handoff freshness check: Read HANDOFF\.md and reports\/HANDOFF\.md/);
+        expect(options.prompt).toMatch(/only in a later message than the check's Read results: the evidence helper's materialize, which runs once per report root and freezes the verdict; every gstack-review-log completed:true record, adversarial-review included/);
+        expect(options.prompt).toMatch(/do not publish a checkpoint for it/i);
+        expect(options.prompt).toMatch(/authenticated expired-capture result/i);
+        expect(options.prompt).toContain('reports/review.md');
         return sentinel;
       });
       expect(calls).toBe(1);

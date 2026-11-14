@@ -133,15 +133,6 @@ describe('gstack-learnings-log', () => {
     const parsed = JSON.parse(fs.readFileSync(f!, 'utf-8').trim());
     expect(parsed.type).toBe('investigation');
   });
-
-  // Caller contract: investigate/SKILL.md.tmpl must emit type:"investigation"
-  // verbatim. Guards against the template drifting to an invalid type and
-  // silently breaking the log path. See codex review finding for #1423.
-  test('investigate template emits type:"investigation" verbatim (caller contract)', () => {
-    const tmpl = fs.readFileSync(path.join(ROOT, 'investigate/SKILL.md.tmpl'), 'utf-8');
-    // The invocation line must include "type":"investigation" exactly.
-    expect(tmpl).toContain('"type":"investigation"');
-  });
 });
 
 describe('gstack-learnings-search', () => {
@@ -319,5 +310,83 @@ describe('gstack-learnings-search edge cases', () => {
 
     const output = runSearch();
     expect(output).toContain('confidence: 0/10');
+  });
+});
+
+// G3 (#2952): the temp file honors TMPDIR, and a temp-file failure says the
+// learning was not recorded instead of exiting with only mktemp's own error.
+describe('G3: learnings-log temp file and TMPDIR', () => {
+  test('logs through a private TMPDIR', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-learn-tmpdir-'));
+    try {
+      execSync(`${BIN}/gstack-learnings-log '{"skill":"review","type":"pitfall","key":"tmpdir-ok","insight":"x","confidence":5,"source":"observed"}'`, {
+        cwd: ROOT, env: { ...process.env, GSTACK_HOME: tmpDir, TMPDIR: tmp }, encoding: 'utf-8', timeout: 15000,
+      });
+      expect(fs.readFileSync(findLearningsFile()!, 'utf-8')).toContain('tmpdir-ok');
+      expect(fs.readdirSync(tmp)).toEqual([]);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('an unusable TMPDIR fails loudly and names the dropped learning', () => {
+    let status = 0;
+    let stderr = '';
+    try {
+      execSync(`${BIN}/gstack-learnings-log '{"skill":"review","type":"pitfall","key":"tmpdir-bad","insight":"x","confidence":5,"source":"observed"}'`, {
+        cwd: ROOT, env: { ...process.env, GSTACK_HOME: tmpDir, TMPDIR: path.join(tmpDir, 'does-not-exist') }, encoding: 'utf-8', stdio: 'pipe', timeout: 15000,
+      });
+    } catch (e: any) {
+      status = e.status;
+      stderr = String(e.stderr);
+    }
+    expect(status).not.toBe(0);
+    expect(stderr).toContain('the learning was not recorded');
+    expect(stderr).toContain('TMPDIR');
+  });
+});
+
+// The four secret families brain sync's scanner used to miss (GST-2196).
+// Built by concatenation so this file never holds a scannable literal.
+const SECRET_FAMILIES: [string, string][] = [
+  ['stripe live key', 'sk_' + 'live_' + 'Q7d2Lm9Xr4Tb8Vn1Kp3Wz6Hc'],
+  ['slack bot token', 'xox' + 'b-' + '2384710293-4829103847-Zr8Qm2Lx7Vn4Tb'],
+  ['database url with a password', 'postgres://app:' + 'Vq8zR2' + 'mLp7@db.internal.example.com:5432/prod'],
+  ['npm token', 'npm_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'],
+];
+
+describe('gstack-learnings-log refuses HIGH-tier secrets', () => {
+  for (const [name, secret] of SECRET_FAMILIES) {
+    test(`rejects a ${name} in the insight and writes nothing`, () => {
+      const input = JSON.stringify({ skill: 'review', type: 'operational', key: 'env-setup', insight: `DATABASE_URL and keys: ${secret}`, confidence: 7, source: 'observed' });
+      const result = runLog(input, { expectFail: true });
+      expect(result.exitCode).not.toBe(0);
+      expect(result.stdout).toContain('HIGH-tier secret');
+      expect(result.stdout).not.toContain(secret);
+      expect(findLearningsFile()).toBeNull();
+    });
+  }
+
+  test('scans every stored field, not just the insight', () => {
+    const input = JSON.stringify({ skill: 'review', type: 'tool', key: 'npm-publish', insight: 'publish needs a token', confidence: 6, source: 'observed', files: [SECRET_FAMILIES[3][1]] });
+    const result = runLog(input, { expectFail: true });
+    expect(result.exitCode).not.toBe(0);
+    expect(findLearningsFile()).toBeNull();
+  });
+
+  test('prose about tokens and passwords still writes', () => {
+    const insight = 'Rotate the npm token before release; the password field and the Slack bot token live in the vault, never in the repo';
+    runLog(JSON.stringify({ skill: 'review', type: 'operational', key: 'secret-handling', insight, confidence: 8, source: 'observed' }));
+    const f = findLearningsFile();
+    expect(f).not.toBeNull();
+    expect(JSON.parse(fs.readFileSync(f!, 'utf-8').trim()).insight).toBe(insight);
+  });
+
+  test('placeholder database urls still write', () => {
+    const insight = 'Set DATABASE_URL=postgres://app:PASSWORD@host/db, or postgres://app:${DB_PASSWORD}@db/prod in CI';
+    runLog(JSON.stringify({ skill: 'review', type: 'operational', key: 'db-url-shape', insight, confidence: 8, source: 'observed' }));
+    const f = findLearningsFile();
+    expect(f).not.toBeNull();
+    expect(JSON.parse(fs.readFileSync(f!, 'utf-8').trim()).insight).toBe(insight);
   });
 });

@@ -153,9 +153,12 @@ const REQUIRED_KEYS = [
   'USER_STREAK',
   'RETRO_CONTEXT',
   'GREPTILE_HISTORY',
+  'REVIEW_BOT_HISTORY',
   'TODOS_FILE',
   'SKILL_USAGE_LOG',
   'EUREKA_LOG',
+  'FRICTION_SOURCES',
+  'FRICTION',
   'RETRO_METRICS_END',
 ] as const;
 
@@ -173,7 +176,8 @@ describe('gstack-retro-metrics contract', () => {
 
   test('the skill fence invokes the script with primary path + degraded fallback', () => {
     const tmpl = fs.readFileSync(path.join(ROOT, 'retro', 'SKILL.md.tmpl'), 'utf-8');
-    expect(tmpl).toContain('$HOME/.claude/skills/gstack/bin/gstack-retro-metrics');
+    expect(tmpl).toContain('"{{RUNTIME_ROOT}}/bin/gstack-retro-metrics"');
+    expect(fs.readFileSync(path.join(ROOT, 'retro', 'SKILL.md'), 'utf-8')).toContain('$HOME/.claude/skills/gstack/bin/gstack-retro-metrics');
     expect(tmpl).toContain('".claude/skills/gstack/bin/gstack-retro-metrics"');
     expect(tmpl).toContain('--base "<default>" --since "<since>"');
     expect(tmpl).toContain(
@@ -247,17 +251,77 @@ describe('gstack-retro-metrics behavior', () => {
 
   test('aux inputs report present when the files exist under GSTACK_HOME', () => {
     fs.writeFileSync(path.join(tmpGstackHome, 'greptile-history.md'), '# history\n');
+    fs.writeFileSync(path.join(tmpGstackHome, 'review-bot-history.md'), '# history\n');
     fs.mkdirSync(path.join(tmpGstackHome, 'analytics'), { recursive: true });
     fs.writeFileSync(path.join(tmpGstackHome, 'analytics', 'skill-usage.jsonl'), '{}\n');
     try {
       const out = runMetrics(['--base', 'main', '--since', '2026-03-09T00:00:00']);
       expect(out).toMatch(/^GREPTILE_HISTORY: present /m);
+      expect(out).toMatch(/^REVIEW_BOT_HISTORY: present /m);
       expect(out).toMatch(/^SKILL_USAGE_LOG: present /m);
       expect(out).toMatch(/^RETRO_CONTEXT: absent$/m);
       expect(out).toMatch(/^EUREKA_LOG: absent$/m);
     } finally {
       fs.rmSync(path.join(tmpGstackHome, 'greptile-history.md'), { force: true });
+      fs.rmSync(path.join(tmpGstackHome, 'review-bot-history.md'), { force: true });
       fs.rmSync(path.join(tmpGstackHome, 'analytics'), { recursive: true, force: true });
+    }
+  });
+
+  test('friction lines count this project only, within the window', () => {
+    const slug = execFileSync(path.join(ROOT, 'bin', 'gstack-slug'), ['--get', 'SLUG'], {
+      encoding: 'utf-8', cwd: repoDir, env: hermeticEnv(), timeout: 10_000,
+    }).trim();
+    const projects = path.join(tmpGstackHome, 'projects');
+    const line = (o: Record<string, unknown>) => JSON.stringify(o) + '\n';
+    fs.mkdirSync(path.join(projects, slug), { recursive: true });
+    fs.mkdirSync(path.join(projects, 'other-project'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projects, slug, 'timeline.jsonl'),
+      line({ skill: 'ship', event: 'started', session: 's1', ts: '2026-03-10T12:00:00Z' }) +
+        line({ skill: 'ship', event: 'completed', outcome: 'abort', session: 's1', ts: '2026-03-10T12:30:00Z' }) +
+        line({ skill: 'ship', event: 'completed', outcome: 'error', ts: '2020-01-01T00:00:00Z' }),
+    );
+    fs.writeFileSync(
+      path.join(projects, slug, 'question-log.jsonl'),
+      line({ skill: 'ship', source: 'agent', session_id: 'A', question_id: 'ship-x', ts: '2026-03-10T12:10:00Z' }) +
+        line({ skill: 'unknown', source: 'hook', session_id: 'claude-uuid', tool_use_id: 't1', ts: '2026-03-10T12:10:00Z' }),
+    );
+    fs.writeFileSync(
+      path.join(projects, 'other-project', 'timeline.jsonl'),
+      line({ skill: 'qa', event: 'completed', outcome: 'error', ts: '2026-03-10T12:00:00Z' }),
+    );
+    try {
+      const untracked = runMetrics(['--base', 'main', '--since', '2026-03-09T00:00:00']);
+      expect(untracked).toMatch(/^FRICTION_SOURCES: timeline=present questions=absent$/m);
+      expect(untracked).toMatch(/^FRICTION: \/ship score=1 runs=1 questions=0 typed=0 errors=0 aborts=1$/m);
+      execFileSync(path.join(ROOT, 'bin', 'gstack-config'), ['set', 'question_tuning', 'true'], {
+        encoding: 'utf-8', cwd: repoDir, env: hermeticEnv(), timeout: 10_000,
+      });
+      const out = runMetrics(['--base', 'main', '--since', '2026-03-09T00:00:00']);
+      expect(out).toMatch(/^FRICTION_SOURCES: timeline=present questions=present$/m);
+      expect(out).toMatch(/^FRICTION: \/ship score=2 runs=1 questions=1 typed=0 errors=0 aborts=1$/m);
+      expect(out).not.toMatch(/^FRICTION: \/qa /m);
+      expect(out).not.toMatch(/^FRICTION: \/unknown /m);
+      const prior = runMetrics(['--base', 'main', '--since', '2026-03-01T00:00:00', '--until', '2026-03-08T00:00:00']);
+      expect(prior).toMatch(/^FRICTION: none$/m);
+    } finally {
+      fs.rmSync(projects, { recursive: true, force: true });
+      fs.rmSync(path.join(tmpGstackHome, 'config.yaml'), { force: true });
+    }
+  });
+
+  test('a failing bun prints FRICTION: unavailable and the script still ends ok', () => {
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-rm-fakebun-'));
+    fs.writeFileSync(path.join(fakeBin, 'bun'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    try {
+      const out = execFileSync(SCRIPT, ['--base', 'main', '--since', '2026-03-09T00:00:00'], {
+        encoding: 'utf-8', cwd: repoDir, env: { ...hermeticEnv(), PATH: `${fakeBin}:${process.env.PATH}` }, timeout: 30_000,
+      });
+      expect(out).toMatch(/^FRICTION: unavailable \(friction helper failed\)$/m);
+      expect(out).toMatch(/^RETRO_METRICS_END: ok$/m);
+    } finally {
+      fs.rmSync(fakeBin, { recursive: true, force: true });
     }
   });
 
@@ -310,5 +374,60 @@ describe('gstack-retro-metrics edges', () => {
     const script = fs.readFileSync(SCRIPT, 'utf-8');
     expect(script).not.toMatch(/(^|[;|&`($!]|\s)git(\s+-C\s+\S+)?\s+(push|pull|fetch|clone|ls-remote)\b/m);
     expect(script).not.toMatch(/(^|[|&;(`]|\s|\$\()curl\s/);
+  });
+});
+
+// G6 riders #2812, #2809, #2037: the test census only knew JS/TS-style names,
+// so pytest, minitest, XCTest, Terraform and Bats suites counted as zero, while
+// a committed build directory counted as authored (and test) code.
+describe('gstack-retro-metrics test census beyond JS/TS', () => {
+  function fixtureRepo(prefix: string, files: Record<string, string>): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    git(dir, ['init', '-b', 'main']);
+    git(dir, ['config', 'user.email', 'dev@example.com']);
+    git(dir, ['config', 'user.name', 'Dev']);
+    for (const [rel, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      write(dir, rel, body);
+    }
+    commit(dir, 'feat: suite', '2026-03-10T09:00:00');
+    return dir;
+  }
+
+  test('pytest/minitest test_*.py|rb, Terraform and Bats files count; dir-homed helpers do not', () => {
+    const dir = fixtureRepo('gstack-rm-py-', {
+      'tests/test_login.py': 'def test_login():\n    assert True\n',
+      'tests/test_signup.rb': "require 'minitest'\n",
+      'tests/helper_test.rb': "require 'minitest'\n",
+      'infra/main.tftest.hcl': 'run "plan" {}\n',
+      'scripts/cli.bats': '@test "runs" { true; }\n',
+      'tests/utils.py': 'HELPER = 1\n',
+      'app/testing.py': 'MODE = 1\n',
+    });
+    try {
+      expect(runMetrics(['--base', 'main', '--since', '2026-03-09T00:00:00'], dir)).toMatch(/^TEST_FILES_TOTAL: 5$/m);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Swift/XCTest naming counts; generated output and prose specs do not', () => {
+    const dir = fixtureRepo('gstack-rm-swift-', {
+      'App/Store.swift': 'struct Store {}\n',
+      'AppTests/StoreTests.swift': 'import XCTest\nfinal class StoreTests: XCTestCase {}\n',
+      '.build/Logs/Test/manifest.plist': 'generated\ngenerated\ngenerated\n',
+      'docs/specs/design.md': '# Design\nprose\nprose\n',
+    });
+    try {
+      const out = runMetrics(['--since', '2026-03-01T00:00:00'], dir);
+      expect(out).toMatch(/^TEST_FILES_TOTAL: 1$/m);
+      expect(out).toMatch(/^TEST_FILES_CHANGED: 1$/m);
+      expect(out).toMatch(/^TEST_INSERTIONS: 2$/m);
+      // 1 production + 2 test + 3 prose lines; the 3 generated lines are dropped.
+      expect(out).toMatch(/^INSERTIONS: 6$/m);
+      expect(out).not.toMatch(/^FOCUS_SCORE: .*\.build/m);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

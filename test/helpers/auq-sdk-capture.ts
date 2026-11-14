@@ -43,6 +43,23 @@ export function scoreAuqFormat(text: string): { present: number; total: number; 
 }
 
 /**
+ * Format problems that fail a first-question matrix run: only the fields
+ * software reads. The question text needs a `Recommendation:` line, and
+ * exactly one option label ends in `(recommended)`, the suffix the AUTO_DECIDE
+ * hook parses from labels (hosts/claude/hooks/question-preference-hook.ts).
+ * The format's `Pros / cons:` block in the question text repeats the marker
+ * by design, so it is not counted. ELI10, Pros / cons, ✅/❌ and Net: are
+ * reported, not failed.
+ */
+export function auqMachineFormatProblems(question: NativePlanQuestion): string[] {
+  const problems: string[] = [];
+  if (!/^[*_]*[ \t]*recommendation[ \t]*[*_]*[ \t]*:[*_ \t]*\S/im.test(question.question)) problems.push('missing Recommendation: line');
+  const recommended = question.options.filter(option => /\(recommended\)\s*$/i.test(option.label)).length;
+  if (recommended !== 1) problems.push(`expected exactly one (recommended) option label, found ${recommended}`);
+  return problems;
+}
+
+/**
  * Grade recommendation substance ROBUST to the connective. judgeRecommendation()
  * keys on the literal "because" (correct for the spec, pinned by
  * llm-judge-recommendation.test.ts), but skills routinely write equally
@@ -95,6 +112,8 @@ export function setupPlanCeoDir(opts: {
   run('git', ['init', '-b', 'main']);
   run('git', ['config', 'user.email', 'test@test.com']);
   run('git', ['config', 'user.name', 'Test']);
+  run('git', ['config', 'maintenance.auto', 'false']);
+  run('git', ['config', 'gc.auto', '0']);
   fs.writeFileSync(
     path.join(dir, 'plan.md'),
     [
@@ -112,7 +131,8 @@ export function setupPlanCeoDir(opts: {
     ].join('\n'),
   );
   fs.mkdirSync(path.join(dir, 'plan-ceo-review'), { recursive: true });
-  fs.writeFileSync(path.join(dir, 'plan-ceo-review', 'SKILL.md'), opts.skillMd);
+  fs.writeFileSync(path.join(dir, 'plan-ceo-review', 'SKILL.md'),
+    opts.skillMd.replaceAll('~/.claude/skills/gstack/plan-ceo-review/sections/', path.join(dir, 'plan-ceo-review', 'sections') + '/'));
   if (opts.sectionsFrom && fs.existsSync(opts.sectionsFrom)) {
     fs.cpSync(opts.sectionsFrom, path.join(dir, 'plan-ceo-review', 'sections'), { recursive: true });
   }
@@ -144,7 +164,8 @@ export function setupSkillDir(opts: {
     fs.writeFileSync(p, content);
   }
   fs.mkdirSync(path.join(dir, opts.skillName), { recursive: true });
-  fs.writeFileSync(path.join(dir, opts.skillName, 'SKILL.md'), opts.skillMd);
+  fs.writeFileSync(path.join(dir, opts.skillName, 'SKILL.md'),
+    opts.skillMd.replaceAll(`~/.claude/skills/gstack/${opts.skillName}/sections/`, path.join(dir, opts.skillName, 'sections') + '/'));
   if (opts.sectionsFrom && fs.existsSync(opts.sectionsFrom)) {
     fs.cpSync(opts.sectionsFrom, path.join(dir, opts.skillName, 'sections'), { recursive: true });
   }
@@ -211,9 +232,11 @@ export function hasDisabledOutsideReview(output: string): boolean {
 
 /**
  * Sections a capture loaded: a Read of the section file, or a Bash print of it
- * (cat/sed ranges, as in run 36776104571) whose outputs together contain every
- * line of the section as it stood before the run. A command without that
- * printed content, such as head or grep, is not a read.
+ * (cat/sed ranges, as in run 36776104571; byte ranges such as head -c/tail -c,
+ * as in census 37178143007) whose outputs together contain every line of the
+ * section as it stood before the run. Byte ranges split lines at their edges,
+ * so consecutive outputs are also joined on their overlap. A command without
+ * that printed content, such as head or grep, is not a read.
  */
 export function detectSectionReads(toolCalls: SkillTestResult['toolCalls'], sections: Map<string, string>): Set<string> {
   const readSections = new Set<string>();
@@ -225,9 +248,15 @@ export function detectSectionReads(toolCalls: SkillTestResult['toolCalls'], sect
   }
   for (const [name, content] of sections) {
     const lines = content.split('\n').map(line => line.trimEnd()).filter(Boolean);
-    const printed = new Set(toolCalls.filter(c => c.tool === 'Bash' && String(c.input?.command ?? '').includes(`sections/${name}`))
-      .flatMap(c => c.output.split('\n').map(line => line.trimEnd())));
-    if (lines.length && lines.every(line => printed.has(line))) readSections.add(name);
+    const outputs = toolCalls.filter(c => c.tool === 'Bash' && String(c.input?.command ?? '').includes(`sections/${name}`)).map(c => c.output);
+    const printed = new Set(outputs.flatMap(output => output.split('\n').map(line => line.trimEnd())));
+    const joined = outputs.reduce((text, next) => {
+      let overlap = Math.min(text.length, next.length, 256);
+      while (overlap > 0 && !text.endsWith(next.slice(0, overlap))) overlap--;
+      return text + next.slice(overlap);
+    }, '');
+    const abutted = outputs.join('');
+    if (lines.length && lines.every(line => printed.has(line) || joined.includes(line) || abutted.includes(line))) readSections.add(name);
   }
   return readSections;
 }
@@ -442,11 +471,11 @@ export async function captureModeSelectionAuq(opts: {
   // which silently invalidates a carved-vs-verbose A/B (both sides end up
   // reading the same global skill). Absolute path + no-wander instruction +
   // Bash disallowed (so `find /` is impossible) locks it to the planted file.
-  const prompt = `Review the plan using ONLY these two files:
+  const prompt = `Review the plan with this skill and plan:
   - The skill to follow: ${skillPath}
   - The plan to review: ${planPath}
 
-Read ${skillPath} for the review workflow. Do NOT search for, Glob, find, or read any OTHER SKILL.md anywhere on the system — especially nothing under ~/.claude or /Users. The ONLY skill file you may read is the absolute path above.
+Read ${skillPath} for the review workflow. Do NOT search for, Glob, find, or read any OTHER SKILL.md anywhere on the system — especially nothing under ~/.claude or /Users. The ONLY SKILL.md you may read is the absolute path above; the files in its sections/ directory that it tells you to Read are part of this skill.
 
 Read ${planPath} — that is the plan to review. It is a standalone plan document, not a codebase. Skip any codebase exploration or system-audit steps.
 

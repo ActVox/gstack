@@ -2,61 +2,18 @@
  * Paid-lane planner: duration seeds, slice packing, the run manifest and its verification. Moved from scripts/test-paid-shards.ts.
  */
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { createBootstrapRetentionScope } from '../../test/helpers/bootstrap-retention';
-import {
-  BunTestOutputClassifier,
-  createShardSandbox,
-  exactTestFileSelectors,
-  forwardAndClassify,
-  isTerminationRequested,
-  nextShardLogPath,
-  normalizeRelativePath,
-  openShardLog,
-  parseCliFlags,
-  readDurationSeed,
-  removeShardSandbox,
-  runShardChild,
-  strictShardStatus,
-  writeDurationSeed,
-  zeroExecutionVerdict,
-  type LanePolicy,
-  type ShardChildResult,
-  type ShardLog,
-} from './shard-engine';
-import { PAID_TEST_GLOBS, isPaidTestFile } from '../../test/helpers/paid-test-set';
-import { CASE_CI_EXCLUDE, CASE_QUARANTINE, EVAL_POLICY, PERIODIC_CI_EXCLUDE } from '../../test/helpers/periodic-exclude-data';
+import { normalizeRelativePath } from './shard-engine';
+import { CASE_QUARANTINE } from '../../test/helpers/periodic-exclude-data';
 import { FILE_RETRY_BUDGETS, STRICT_RETRY_CASE_BUDGETS } from '../../test/helpers/eval-budgets';
-import {
-  getProjectEvalDir, getClaudeCliVersion, isFinalizedEvalResultFile, evalEntryOutcome, failureClassOf, panelVerdict,
-  sanitizeTrialError, formatTrialOutcomes, CONTRACT_VIOLATIONS_FILE, TRIAL_ENV, TRIAL_OUTCOME_SCHEMA, TRIAL_OUTCOMES_FILE,
-  type EvalCaseKind, type PanelShape, type PanelVerdict, type TrialFailureClass, type TrialOutcome, type TrialOutcomeRecord,
-} from '../../test/helpers/eval-store';
+import { evalEntryOutcome, type EvalCaseKind } from '../../test/helpers/eval-store';
 import { E2E_KINDS } from '../../test/helpers/touchfiles-data';
-import { manualReviewProblem } from '../../test/helpers/cookie-workflow-manual-review';
-import { preflightAnthropicApi } from '../../test/helpers/anthropic-preflight';
-import { OVERLAY_MIN_FILE_WALL_MS } from '../../test/helpers/overlay-case-policy';
-import { PR_PROFILE_CASE_IDS, PR_PROFILE_FILES, packageChangeOnlyVersion, selectPrProfile, type PrProfileSelection } from '../test-pr-profile';
-import { e2eReuseLaneProblem, prepareE2EShardReuse, selectPlanReceipts, writeNegativeReceipt, writePanelReceipt } from '../e2e-shard-reuse';
-
-import {
-  detectBaseBranch,
-  getChangedFiles,
-  selectTests,
-  E2E_TOUCHFILES,
-  E2E_TIERS,
-  LLM_JUDGE_TOUCHFILES,
-  GLOBAL_TOUCHFILES,
-} from '../../test/helpers/touchfiles';
-
-export { PAID_TEST_GLOBS, isPaidTestFile };
-export { PERIODIC_CI_EXCLUDE };
-
-type E2EShardReuse = NonNullable<ReturnType<typeof prepareE2EShardReuse>>;
-import { CASE_KEY_SEPARATOR, CASE_SHARDED_FILES, type CaseTrialPlan, caseTrialPlan, expandCaseShards, expandTrialShards, isIsolatedCase, partitionCaseExclusions, sameTrialPlan, shardCaseId, shardFile, shardTrial } from './paid-cases';
-import { DEFAULT_JOBS, OVERLAY_MAX_ACTIVE_SHARDS, PAID_TIERS, type PaidCaseSelection, type PaidProfile, type PaidShardBudget, type PaidTier, ROOT, type ShardOutcome, type ShardStatus, type ShardTrialRecord, collectPaidTestFiles, computePaidCaseSelection, expectedPrCaseCount, isAllSkippedPass, isOverlayTestFile, paidShardWallUpperBoundMs, partitionShardsByDiffSelection, planPaidShards, prProfileFileSelected, resolvePaidShardBudget, resolvePaidShardTimeoutMs, sameBudget, selectPaidTestFiles, shardSlug, validatedProfile } from '../test-paid-shards';
+import { prProfileCaseAllowed, prProfileFileMap, type PrProfileSelection } from '../test-pr-profile';
+import { E2E_TOUCHFILES, E2E_TIERS, LLM_JUDGE_TOUCHFILES } from '../../test/helpers/touchfiles';
+import { CASE_KEY_SEPARATOR, CASE_SHARDED_FILES, type CaseTrialPlan, caseTrialPlan, codexShardAccess, expandCaseShards, expandTrialShards, isIsolatedCase, partitionCaseExclusions, partitionHostExclusions, sameTrialPlan, shardCaseId, shardFile, shardTrial } from './paid-cases';
+import { EVAL_HOSTS, type EvalHost, resolveEvalHost } from '../../test/helpers/e2e-hosts';
+import { DEFAULT_JOBS, OVERLAY_MAX_ACTIVE_SHARDS, PAID_TIERS, SLICE_UPLOAD_RESERVE_MS, type PaidCaseSelection, type PaidProfile, type PaidShardBudget, type PaidTier, ROOT, type ShardOutcome, type ShardStatus, type ShardTrialRecord, isOverlayTestFile } from './paid-types';
+import { collectPaidTestFiles, computePaidCaseSelection, expectedPrCaseCount, isAllSkippedPass, paidShardWallUpperBoundMs, partitionShardsByDiffSelection, planPaidShards, prProfileFileSelected, resolvePaidShardBudget, resolvePaidShardTimeoutMs, sameBudget, selectPaidTestFiles, shardSlug, validatedProfile } from './paid-select';
 
 // ─── Planner / executor / report (the CI re-platform surface) ──────────────
 // One PLANNER computes selection and the slice plan ONCE; K executor jobs
@@ -88,7 +45,12 @@ export interface PaidSlicePlan {
   sliceBudgetMs: number;
   jobs: number;
   estimatedSliceMs: number[];
+  /** The largest per-slice ceiling: one number for executors that use a single job timeout. */
   ciTimeoutMinutes: number;
+  /** Per-slice CI job ceilings (sliceCiTimeoutMinutes); absent in plans written before W2c. */
+  sliceCiTimeoutMinutes?: number[];
+  /** Slices that run only Codex shards; CI executes them on the host-run Codex job, where bubblewrap can start. */
+  codexSlices?: number[];
 }
 
 export interface PaidRunManifest {
@@ -97,19 +59,24 @@ export interface PaidRunManifest {
   evalsAll: boolean;
   sliceCount: number;
   selectionReason: string;
+  /** The agent host every session runs on (EVALS_HOST); absent means claude. */
+  host?: EvalHost;
   /** Legacy v1 manifests omit these; new plans bind case-level execution. */
   profile?: PaidProfile;
   selection?: PaidCaseSelection;
   prCoverage?: PrProfileSelection;
   plan?: PaidSlicePlan;
+  /** A rule-16 rerun manifest (scripts/lib/paid-rerun.ts): the run attempt whose reds it reruns once, and those cases. */
+  rerun?: { attempt: number; cases: string[] };
   entries: ManifestEntry[];
 }
 
 /**
- * Paid evals never retry (approved 2026-09-29): a failed verdict is final for
- * its run, and trials are fixed by kind before the run (EVAL_POLICY). The
- * function stays the single statement of that policy for the Bun arguments
- * and the reuse identity.
+ * Bun never retries a paid case inside a shard (approved 2026-09-29): trials
+ * are fixed by kind before the run (EVAL_POLICY). The one rule-16 rerun of a
+ * red case (CREW rule 16, scripts/lib/paid-rerun.ts) is a separate,
+ * reported execution, never a Bun retry. The function stays the single
+ * statement of that policy for the Bun arguments and the reuse identity.
  */
 export function retriesForFiles(_files: string[]): number {
   return 0;
@@ -157,6 +124,17 @@ export function recordedShardMs(recorded: Record<string, number>, key: string): 
   return recorded[durationKey(rel)] ?? (shardTrial(rel) === null ? undefined : recorded[shardFile(rel)]);
 }
 
+/** Longest recorded wall a PR-lane (gate) shard may have: the lane's ~10-minute case target. */
+export const PR_LANE_SHARD_LIMIT_MS = 600_000;
+
+/** One line per planned shard whose recorded wall exceeds `limitMs` (split or shorten it; never raise the limit). */
+export function shardDurationViolations(keys: readonly string[], recorded: Record<string, number>, limitMs = PR_LANE_SHARD_LIMIT_MS): string[] {
+  return keys.flatMap(key => {
+    const ms = recorded[durationKey(key)];
+    return ms !== undefined && ms > limitMs ? [`${key}: recorded ${Math.round(ms / 1000)}s > ${limitMs / 1000}s`] : [];
+  });
+}
+
 /**
  * Merge a report's executed single-file outcomes into the seed; all-skipped
  * shards carry no cost signal. Trials of one case record their longest wall
@@ -176,6 +154,16 @@ export function mergePaidTestDurations(seed: Record<string, number>, results: Sl
   return Object.fromEntries(Object.entries(merged).sort(([a], [b]) => (a < b ? -1 : 1)));
 }
 
+/** True when a shard key's file sees the CI Codex install in `tier` (scripts/lib/paid-cases.ts codexShardAccess). */
+export function isCodexShard(key: string, tier: PaidTier): boolean {
+  return codexShardAccess([shardFile(key)], tier) !== 'none';
+}
+
+/** Sorted slices holding at least one planned Codex shard. */
+export function codexSlicesOf(tier: PaidTier, entries: readonly ManifestEntry[]): number[] {
+  return [...new Set(entries.filter(entry => entry.status === 'planned' && isCodexShard(entry.file, tier)).map(entry => entry.slice))].sort((a, b) => a - b);
+}
+
 /** Panel identity of a trial shard key (`<file>#<id>`), else null. */
 export function trialPanelKey(key: string): string | null {
   return shardTrial(key) === null ? null : durationKey(key);
@@ -189,6 +177,32 @@ function sharesPanel(planned: readonly string[], key: string): boolean {
 
 /** Setup, image pull and artifact upload allowance on top of a slice's supervised wall. */
 export const CI_SETUP_ALLOWANCE_MINUTES = 20;
+
+/**
+ * CI job ceiling of one slice (W2c, ENG-2): its envelope is the larger of twice
+ * the slice budget, the longest single shard's supervised wall, and, for the
+ * overlay slice, the serialized overlay group; plus the setup allowance. A hang
+ * fails within this bound instead of holding a runner for the sum of every
+ * shard's worst case; the executor's in-process deadline (sliceDeadlineMs)
+ * stops starting work 5 minutes earlier so results still upload. Same cases run.
+ */
+export function sliceCiTimeoutMinutes(files: string[], budgetMs: number, jobs: number, timeoutMs?: number): number {
+  const longestShardMs = Math.max(0, ...files.map(file => resolvePaidShardTimeoutMs([file], timeoutMs)));
+  const overlayEnvelopeMs = files.some(isOverlayTestFile) ? sliceSupervisedWallMs(files, jobs, timeoutMs) : 0;
+  return Math.ceil(Math.max(2 * budgetMs, longestShardMs, overlayEnvelopeMs) / 60_000) + CI_SETUP_ALLOWANCE_MINUTES;
+}
+
+/**
+ * The executor's in-process deadline: job start (the workflow's first step
+ * records it in GSTACK_SLICE_JOB_STARTED_AT, epoch seconds) plus the slice's
+ * job ceiling, minus the upload reserve. Without a recorded job start (local
+ * runs) the executor's own start stands in.
+ */
+export function sliceDeadlineMs(ceilingMinutes: number, jobStartedAtSeconds: string | undefined, fallbackStartMs: number): number {
+  const recorded = Number(jobStartedAtSeconds);
+  const start = Number.isSafeInteger(recorded) && recorded > 0 ? recorded * 1000 : fallbackStartMs;
+  return start + ceilingMinutes * 60_000 - SLICE_UPLOAD_RESERVE_MS;
+}
 
 /** Estimated wall of one executor running `files` in order on `jobs` FIFO workers. */
 export function estimatedSliceMs(files: string[], weight: (file: string) => number, jobs: number): number {
@@ -217,12 +231,12 @@ export function sliceSupervisedWallMs(files: string[], jobs: number, overrideMs?
  * within the budget (best fit), else into a new slice. A file with no recorded
  * wall weighs the whole budget, so unknown cost gets a runner of its own. A
  * file longer than the budget runs alone. Overlay wrappers keep one shared
- * final slice (one wrapper at a time). The CI timeout covers every slice's
- * supervised worst case plus the setup allowance.
+ * final slice (one wrapper at a time). Codex shards never share a slice with
+ * other shards. Each slice gets its own CI job ceiling (sliceCiTimeoutMinutes).
  */
 export function packBySliceBudget(files: string[], budgetMs: number, jobs: number,
-  recorded: Record<string, number>, timeoutMs?: number): {
-  slices: string[][]; estimates: Record<string, number>; estimatedSliceMs: number[]; ciTimeoutMinutes: number;
+  recorded: Record<string, number>, timeoutMs?: number, codexShard: (file: string) => boolean = () => false): {
+  slices: string[][]; estimates: Record<string, number>; estimatedSliceMs: number[]; ciTimeoutMinutes: number; sliceCiTimeoutMinutes: number[];
 } {
   const estimates = Object.fromEntries(files.map(file => [file, recordedShardMs(recorded, file) ?? budgetMs]));
   const weight = (file: string) => estimates[file]!;
@@ -233,6 +247,8 @@ export function packBySliceBudget(files: string[], budgetMs: number, jobs: numbe
       // Trials of one case never share a runner: independent machines, and
       // the panel's wall stays one trial long.
       if (sharesPanel(planned, file)) return;
+      // Codex shards run on the host-run Codex job; other shards keep the default container sandbox.
+      if (codexShard(planned[0]!) !== codexShard(file)) return;
       const ms = estimatedSliceMs([...planned, file], weight, jobs);
       if (ms <= budgetMs && ms > bestMs) { best = index; bestMs = ms; }
     });
@@ -244,9 +260,8 @@ export function packBySliceBudget(files: string[], budgetMs: number, jobs: numbe
   if (!slices.length) slices.push([]);
   const estimatedSliceMsList = slices.map(planned => planned.some(isOverlayTestFile)
     ? estimatedSliceMs(planned, weight, Math.min(jobs, OVERLAY_MAX_ACTIVE_SHARDS)) : estimatedSliceMs(planned, weight, jobs));
-  const worst = Math.max(0, ...slices.map(planned => sliceSupervisedWallMs(planned, jobs, timeoutMs)));
-  return { slices, estimates, estimatedSliceMs: estimatedSliceMsList,
-    ciTimeoutMinutes: Math.ceil(worst / 60_000) + CI_SETUP_ALLOWANCE_MINUTES };
+  const ceilings = slices.map(planned => sliceCiTimeoutMinutes(planned, budgetMs, jobs, timeoutMs));
+  return { slices, estimates, estimatedSliceMs: estimatedSliceMsList, ciTimeoutMinutes: Math.max(...ceilings), sliceCiTimeoutMinutes: ceilings };
 }
 
 /** Worker counts whose worst-case slice wall duration packing may never worsen. */
@@ -298,16 +313,18 @@ export function buildRunManifest(opts: {
   const profile = opts.profile ?? validatedProfile(env.EVALS_PROFILE, 'EVALS_PROFILE');
   if (profile === 'pr' && opts.tier !== 'gate') throw new Error('PR profile requires gate tier; use --profile full for periodic coverage');
   const discovered = opts.discovered ?? collectPaidTestFiles(rootDir);
-  const tierSelection = selectPaidTestFiles(discovered, opts.tier, rootDir, env);
+  const tierSelection = selectPaidTestFiles(discovered, opts.tier, rootDir);
   const judge = (file: string) => /^test\/skill-llm-eval[^/]*\.test\.ts$/.test(normalizeRelativePath(file));
   const selected = opts.skipJudges ? tierSelection.selected.filter(file => !judge(file)) : tierSelection.selected;
   const kinds = opts.kinds ?? E2E_KINDS;
   const quarantine = opts.quarantine ?? CASE_QUARANTINE;
   const notLive = [...Object.keys(kinds).filter(id => kinds[id] === 'behavior'), ...Object.keys(quarantine)].filter(id => !Object.hasOwn(E2E_TIERS, id));
   if (notLive.length) throw new Error(`Only live E2E cases can be behavior or quarantined (judges sample their panel inside the case): ${notLive.join(', ')}`);
-  const caseKeys = partitionCaseExclusions(expandCaseShards(selected, opts.tier, rootDir));
+  const host = resolveEvalHost(env);
+  const ciKeys = partitionCaseExclusions(expandCaseShards(selected, opts.tier, rootDir));
+  const caseKeys = partitionHostExclusions(ciKeys.runnable, opts.tier, host, rootDir);
   const excluded = [...tierSelection.excluded, ...(opts.skipJudges ? tierSelection.selected.filter(judge)
-    .map(file => ({ file, reason: 'skipped: LLM judges run in the periodic census and PR gate lanes' })) : []), ...caseKeys.excluded];
+    .map(file => ({ file, reason: 'skipped: LLM judges run in the periodic census and PR gate lanes' })) : []), ...ciKeys.excluded, ...caseKeys.excluded];
   const expansion = expandTrialShards(caseKeys.runnable, opts.tier, rootDir, { kinds, quarantine });
   const excludeOf = (key: string) => expansion.excludeCases[normalizeRelativePath(key)] ?? [];
   const shards = planPaidShards(expansion.keys, { maxFilesPerShard: 1 });
@@ -328,7 +345,7 @@ export function buildRunManifest(opts: {
   const entries: ManifestEntry[] = [];
   if (budgetMode) {
     const plan = packBySliceBudget(runnable.map(files => files[0]!), opts.sliceBudgetMs!, opts.jobs!,
-      opts.durations ?? loadPaidTestDurations(rootDir, opts.tier), opts.timeoutMs);
+      opts.durations ?? loadPaidTestDurations(rootDir, opts.tier), opts.timeoutMs, file => isCodexShard(file, opts.tier));
     plan.slices.forEach((files, index) => files.forEach(file => entries.push({ file, slice: index + 1, status: 'planned',
       estimatedMs: plan.estimates[file]!, ...extras(file),
       ...(FILE_RETRY_BUDGETS.some(budget => budget.file === shardFile(file)) ? { budget: resolvePaidShardBudget([file], opts.timeoutMs) } : {}) })));
@@ -337,9 +354,10 @@ export function buildRunManifest(opts: {
     entries.sort((a, b) => (a.file < b.file ? -1 : 1));
     return parseRunManifest(JSON.stringify({
       version: 1, tier: opts.tier, evalsAll: opts.evalsAll, sliceCount: plan.slices.length,
-      selectionReason: cases.reason, profile, selection: cases.selection,
+      selectionReason: cases.reason, ...(host !== 'claude' ? { host } : {}), profile, selection: cases.selection,
       ...(cases.coverage ? { prCoverage: cases.coverage } : {}),
-      plan: { sliceBudgetMs: opts.sliceBudgetMs!, jobs: opts.jobs!, estimatedSliceMs: plan.estimatedSliceMs, ciTimeoutMinutes: plan.ciTimeoutMinutes },
+      plan: { sliceBudgetMs: opts.sliceBudgetMs!, jobs: opts.jobs!, estimatedSliceMs: plan.estimatedSliceMs, ciTimeoutMinutes: plan.ciTimeoutMinutes,
+        sliceCiTimeoutMinutes: plan.sliceCiTimeoutMinutes, codexSlices: codexSlicesOf(opts.tier, entries) },
       entries,
     } satisfies PaidRunManifest));
   }
@@ -456,6 +474,7 @@ export function buildRunManifest(opts: {
     evalsAll: opts.evalsAll,
     sliceCount,
     selectionReason: cases.reason,
+    ...(host !== 'claude' ? { host } : {}),
     profile,
     selection: cases.selection,
     ...(cases.coverage ? { prCoverage: cases.coverage } : {}),
@@ -464,26 +483,12 @@ export function buildRunManifest(opts: {
   return parseRunManifest(JSON.stringify(manifest));
 }
 
-/**
- * Narrow a built manifest to a curated case subset (validation phases): the
- * selection binds every child, and a case shard outside it can execute
- * nothing, so it becomes skipped instead of an empty planned shard.
- */
-export function restrictManifestSelection(manifest: PaidRunManifest, selection: PaidCaseSelection, reason: string): PaidRunManifest {
-  const entries = manifest.entries.map(entry => {
-    const caseId = shardCaseId(entry.file);
-    if (entry.status !== 'planned' || caseId === null || selection.e2e === null || selection.e2e.includes(caseId)) return entry;
-    const { estimatedMs: _estimate, budget: _budget, ...rest } = entry;
-    return { ...rest, slice: 0, status: 'skipped-by-diff' as const, reason };
-  });
-  return parseRunManifest(JSON.stringify({ ...manifest, selection, entries }));
-}
-
 export function parseRunManifest(raw: string): PaidRunManifest {
   const parsed = JSON.parse(raw) as PaidRunManifest;
   if (parsed.version !== 1) throw new Error(`unsupported manifest version: ${(parsed as { version?: unknown }).version}`);
   if (!PAID_TIERS.includes(parsed.tier)) throw new Error(`manifest tier invalid: ${parsed.tier}`);
   if (parsed.profile !== undefined && parsed.profile !== 'pr' && parsed.profile !== 'full') throw new Error('manifest profile invalid');
+  if (parsed.host !== undefined && (parsed.host === 'claude' || !EVAL_HOSTS.includes(parsed.host))) throw new Error(`manifest host invalid: ${parsed.host}`);
   if (parsed.selection !== undefined) {
     for (const [key, inventory] of [['e2e', E2E_TOUCHFILES], ['judges', LLM_JUDGE_TOUCHFILES]] as const) {
       const ids = parsed.selection?.[key];
@@ -495,7 +500,7 @@ export function parseRunManifest(raw: string): PaidRunManifest {
   if (parsed.profile === 'pr') {
     const coverage = parsed.prCoverage;
     if (parsed.tier !== 'gate' || !parsed.selection || !coverage ||
-        !['pr', 'full-fallback'].includes(coverage.mode) || !Array.isArray(coverage.deferred) ||
+        !['pr', 'dependents', 'full-fallback'].includes(coverage.mode) || !Array.isArray(coverage.deferred) ||
         !Array.isArray(coverage.unknownFiles) || !Array.isArray(coverage.missingCoverage) ||
         !Array.isArray(coverage.deferredPromptFiles) || coverage.deferredPromptFiles.some(file => typeof file !== 'string') ||
         !Array.isArray(coverage.e2e) || !Array.isArray(coverage.judges) ||
@@ -505,12 +510,16 @@ export function parseRunManifest(raw: string): PaidRunManifest {
         JSON.stringify(parsed.selection.judges) !== JSON.stringify(coverage.judges)) {
       throw new Error('manifest PR coverage/selection invalid or requires full validation');
     }
-    if (coverage.mode === 'pr' && coverage.e2e.some(id => !(PR_PROFILE_CASE_IDS as readonly string[]).includes(id))) {
+    if (coverage.mode === 'pr' && coverage.e2e.some(id => !prProfileCaseAllowed(id, coverage.directCases ?? []))) {
       throw new Error('manifest PR selection contains a broad-only case');
     }
     if (coverage.deferred.some(item => !Object.hasOwn(E2E_TOUCHFILES, item.id) || E2E_TIERS[item.id] !== item.tier || typeof item.reason !== 'string')) {
       throw new Error('manifest deferred case is outside the broad census');
     }
+  }
+  if (parsed.rerun !== undefined && (!Number.isSafeInteger(parsed.rerun?.attempt) || parsed.rerun.attempt < 1 || !Array.isArray(parsed.rerun.cases)
+    || parsed.rerun.cases.length === 0 || parsed.rerun.cases.some(id => typeof id !== 'string') || new Set(parsed.rerun.cases).size !== parsed.rerun.cases.length)) {
+    throw new Error('manifest rerun block invalid');
   }
   if (!Number.isInteger(parsed.sliceCount) || parsed.sliceCount <= 0) throw new Error('manifest sliceCount invalid');
   if (!Array.isArray(parsed.entries)) throw new Error('manifest entries missing');
@@ -578,7 +587,7 @@ export function parseRunManifest(raw: string): PaidRunManifest {
   }
   if (parsed.prCoverage?.mode === 'pr') {
     const planned = parsed.entries.filter(entry => entry.status === 'planned').map(entry => normalizeRelativePath(entry.file));
-    const required: string[][] = Object.entries(PR_PROFILE_FILES).flatMap(([file, ids]) => {
+    const required: string[][] = Object.entries(prProfileFileMap(parsed.selection!.e2e)).flatMap(([file, ids]) => {
       const selected = ids.filter(id => parsed.selection!.e2e!.includes(id));
       if (!selected.length) return [];
       const owners = new Set(selected.flatMap(id => {
@@ -602,9 +611,18 @@ export function parseRunManifest(raw: string): PaidRunManifest {
     if (!plan || typeof plan !== 'object' || !count(plan.sliceBudgetMs) || !count(plan.jobs) || !count(plan.ciTimeoutMinutes)
       || !Array.isArray(plan.estimatedSliceMs) || plan.estimatedSliceMs.length !== parsed.sliceCount
       || !plan.estimatedSliceMs.every(ms => Number.isSafeInteger(ms) && ms >= 0)
-      || parsed.entries.some(entry => entry.status === 'planned' && entry.estimatedMs === undefined)) {
+      || parsed.entries.some(entry => entry.status === 'planned' && entry.estimatedMs === undefined)
+      || (plan.sliceCiTimeoutMinutes !== undefined && (!Array.isArray(plan.sliceCiTimeoutMinutes)
+        || plan.sliceCiTimeoutMinutes.length !== parsed.sliceCount || !plan.sliceCiTimeoutMinutes.every(count)
+        || Math.max(...plan.sliceCiTimeoutMinutes) !== plan.ciTimeoutMinutes))) {
       throw new Error('manifest slice plan malformed');
     }
+    const codexSlices = codexSlicesOf(parsed.tier, parsed.entries);
+    if (JSON.stringify(plan.codexSlices ?? []) !== JSON.stringify(codexSlices)) {
+      throw new Error(`manifest Codex slices must be exactly the slices holding Codex shards: ${JSON.stringify(codexSlices)}`);
+    }
+    const mixed = parsed.entries.find(entry => entry.status === 'planned' && codexSlices.includes(entry.slice) && !isCodexShard(entry.file, parsed.tier));
+    if (mixed) throw new Error(`Codex slice ${mixed.slice} also holds ${mixed.file}; only Codex shards run on the host-run Codex job`);
   }
   const keys = parsed.entries.map(entry => normalizeRelativePath(entry.file));
   if (new Set(keys).size !== keys.length) throw new Error('Duplicate manifest entry');
@@ -652,7 +670,11 @@ export interface SliceResult {
   /** Epoch ms bounds of the slice's shard execution (lane wall time). */
   startedAt?: number;
   finishedAt?: number;
-  outcomes: Array<Pick<ShardOutcome, 'files' | 'status' | 'exitCode' | 'elapsedMs' | 'executedTests' | 'skippedTests' | 'budget' | 'reused' | 'runnerError' | 'trial' | 'inputKey'>>;
+  /** A progress checkpoint the executor never replaced: the job ended (ceiling or cancellation) before its final result. */
+  checkpoint?: true;
+  /** Produced from a rule-16 rerun manifest (`manifest.rerun`), never a first-attempt slice. */
+  rerun?: true;
+  outcomes: Array<Pick<ShardOutcome, 'files' | 'status' | 'exitCode' | 'elapsedMs' | 'executedTests' | 'skippedTests' | 'budget' | 'reused' | 'runnerError' | 'trial' | 'inputKey' | 'sliceDeadline'>>;
 }
 
 /**
@@ -661,11 +683,18 @@ export interface SliceResult {
  * isolated trial shard fails it only when the harness produced no trial
  * record. Failed, timed-out or crashed trials are verdict input for the
  * report's panelVerdict(), so a 2/3 PASS panel never reds its runner.
+ * `caseVerdicts` (the gate lane's CI slices, rule 16): a rule shard that ran
+ * to completion and reported executed cases is verdict input too, so its red
+ * cases stay in the report (which still fails closed on them) and the run's
+ * conclusion follows the report, where a flaky case can resolve green.
  */
-export function sliceExitCode(outcomes: ReadonlyArray<Pick<ShardOutcome, 'status' | 'trial'>>): number {
+export function sliceExitCode(outcomes: ReadonlyArray<Pick<ShardOutcome, 'status' | 'trial'> & Partial<Pick<ShardOutcome, 'exitCode' | 'executedTests' | 'skippedTests' | 'runnerError' | 'sliceDeadline'>>>,
+  options: { caseVerdicts?: boolean } = {}): number {
+  const completedRed = (o: (typeof outcomes)[number]) => !!options.caseVerdicts && o.status === 'failed' && o.exitCode !== null && o.exitCode !== undefined
+    && typeof o.executedTests === 'number' && o.executedTests - (o.skippedTests ?? 0) > 0 && o.runnerError === undefined && !o.sliceDeadline;
   return outcomes.every(outcome => outcome.trial !== undefined
     ? outcome.trial.outcome !== null
-    : outcome.status === 'passed' || outcome.status === 'skipped-by-diff') ? 0 : 1;
+    : outcome.status === 'passed' || outcome.status === 'skipped-by-diff' || completedRed(outcome)) ? 0 : 1;
 }
 
 /** A hollow-guarded trial shard has no trial record: the guard's verdict is a harness problem. */
@@ -684,8 +713,16 @@ export function guardTrialRecords<T extends Pick<ShardOutcome, 'status' | 'trial
 export function verifySliceResults(
   manifest: PaidRunManifest,
   results: SliceResult[],
+  /**
+   * `flaky`: non-trial shards whose every failed case passed its one rule-16
+   * rerun (scripts/lib/paid-rerun.ts); their non-zero exit and failed status
+   * are not problems. `partial`: a later run attempt that re-ran only some
+   * slices, so a slice it did not re-run is no problem.
+   */
+  options: { flaky?: ReadonlySet<string>; partial?: boolean } = {},
 ): { ok: boolean; problems: string[] } {
   const problems: string[] = [];
+  const exitOk = (file: string, exitCode: number | null) => exitCode === 0 || !!options.flaky?.has(file);
   try { parseRunManifest(JSON.stringify(manifest)); }
   catch (error) { problems.push(`Invalid run manifest: ${error instanceof Error ? error.message : String(error)}`); }
   const byIndex = new Map<number, SliceResult>();
@@ -696,13 +733,14 @@ export function verifySliceResults(
       problems.push(`slice ${result.sliceIndex} did not bind the manifest PR case selection`);
     }
     if (byIndex.has(result.sliceIndex)) problems.push(`duplicate result for slice ${result.sliceIndex}`);
+    if (result.checkpoint) problems.push(`slice ${result.sliceIndex}/${result.sliceCount} ended before its final result (job ceiling or cancellation); its outcomes come from the last checkpoint: TIMEOUT`);
     byIndex.set(result.sliceIndex, result);
   }
   for (let index = 1; index <= manifest.sliceCount; index += 1) {
-    if (!byIndex.has(index)) problems.push(`slice ${index}/${manifest.sliceCount} reported NO result — cancelled/crashed executor, not a pass`);
+    if (!byIndex.has(index) && !options.partial) problems.push(`slice ${index}/${manifest.sliceCount} reported NO result — cancelled/crashed executor, not a pass`);
   }
 
-  const reported = new Map<string, { slice: number; status: ShardStatus; trial?: ShardTrialRecord }>();
+  const reported = new Map<string, { slice: number; status: ShardStatus; trial?: ShardTrialRecord; sliceDeadline?: ShardOutcome['sliceDeadline'] }>();
   const planned = new Map(manifest.entries.map(entry => [normalizeRelativePath(entry.file), entry]));
   for (const result of results) {
     for (const outcome of result.outcomes) {
@@ -717,7 +755,7 @@ export function verifySliceResults(
           ? -1 : outcome.executedTests - outcome.skippedTests;
         // A trial's exit status is its verdict (panelVerdict decides); its
         // completeness is the trial record checked below.
-        if ((!trialPlan && outcome.exitCode !== 0) || expected < 1 || (!trialPlan && executed !== expected)) {
+        if ((!trialPlan && !exitOk(file, outcome.exitCode)) || expected < 1 || (!trialPlan && executed !== expected)) {
           problems.push(`PR profile expected ${expected} executed cases in ${file}, received ${executed}`);
         }
       }
@@ -746,13 +784,14 @@ export function verifySliceResults(
       }
       if (outcome.inputKey !== undefined && !/^[a-f0-9]{64}$/.test(outcome.inputKey)) problems.push(`${file}: malformed input identity`);
       if (reported.has(file)) problems.push(`${file} reported by two slices`);
-      reported.set(file, { slice: result.sliceIndex, status: outcome.status, ...(outcome.trial ? { trial: outcome.trial } : {}) });
+      reported.set(file, { slice: result.sliceIndex, status: outcome.status, ...(outcome.trial ? { trial: outcome.trial } : {}),
+        ...(outcome.sliceDeadline ? { sliceDeadline: outcome.sliceDeadline } : {}) });
       const registered = FILE_RETRY_BUDGETS.find(budget => budget.file === shardFile(file));
       const finding = STRICT_RETRY_CASE_BUDGETS.find(budget => budget.file === file);
       if (finding) {
         // Full-census runs must account for every registered case. A manifest
         // explicitly marked selective may report its executed subset.
-        if (outcome.exitCode !== 0 || !Number.isInteger(outcome.executedTests) ||
+        if (!exitOk(file, outcome.exitCode) || !Number.isInteger(outcome.executedTests) ||
             outcome.executedTests! < 1 || outcome.executedTests! > finding.cases ||
             (manifest.evalsAll !== false && outcome.executedTests !== finding.cases) || outcome.skippedTests !== 0) {
           problems.push(`Finding workflow must execute real unskipped cases with exit zero: ${file}`);
@@ -779,7 +818,12 @@ export function verifySliceResults(
     // Isolated trial shards: harness health only; the panel verdict gates.
     if (entry.trial) {
       if (got.trial?.outcome === null) problems.push(`${entry.file}: no trial record (${got.trial.harness ?? 'unknown'})`);
-    } else if (got.status !== 'passed') problems.push(`${entry.file}: ${got.status}`);
+    } else if (got.status !== 'passed' && !(got.status === 'failed' && options.flaky?.has(normalizeRelativePath(entry.file)))) {
+      // The slice deadline distinguishes work that never started (INFRA) from work killed in flight (TIMEOUT).
+      const why = got.sliceDeadline === 'not_run' ? ' (not_run: the slice deadline passed before it started)'
+        : got.sliceDeadline === 'hung' ? ' (hung: killed at the slice deadline)' : '';
+      problems.push(`${entry.file}${why}: ${got.status}`);
+    }
   }
   return { ok: problems.length === 0, problems };
 }
@@ -790,11 +834,12 @@ export function formatSlicePlan(manifest: PaidRunManifest): string[] {
   if (!plan) return [];
   const minutes = (ms: number) => (ms / 60_000).toFixed(1);
   const lines = [`[test:paid] slice plan: ${manifest.sliceCount} slice(s) x ${plan.jobs} worker(s), budget ${minutes(plan.sliceBudgetMs)}m per slice, `
-    + `longest estimate ${minutes(Math.max(0, ...plan.estimatedSliceMs))}m, CI job timeout ${plan.ciTimeoutMinutes}m`];
+    + `longest estimate ${minutes(Math.max(0, ...plan.estimatedSliceMs))}m, CI job timeout ${plan.ciTimeoutMinutes}m (largest per-slice ceiling)`];
   for (let slice = 1; slice <= manifest.sliceCount; slice++) {
     const mine = sliceExecutionOrder(manifest.entries.filter(entry => entry.status === 'planned' && entry.slice === slice));
     const over = plan.estimatedSliceMs[slice - 1]! > plan.sliceBudgetMs ? '  [over budget: longer than one runner allows]' : '';
-    lines.push(`  slice ${slice}: ~${minutes(plan.estimatedSliceMs[slice - 1]!)}m${over}`);
+    const ceiling = plan.sliceCiTimeoutMinutes?.[slice - 1];
+    lines.push(`  slice ${slice}: ~${minutes(plan.estimatedSliceMs[slice - 1]!)}m${ceiling !== undefined ? `, job ceiling ${ceiling}m` : ''}${over}`);
     for (const entry of mine) lines.push(`    ${entry.file} ~${minutes(entry.estimatedMs ?? 0)}m retries=${retriesForFiles([entry.file])}`);
   }
   return lines;

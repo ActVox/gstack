@@ -24,6 +24,11 @@
  * Timeout → probe exceeded GSTACK_GBRAIN_PROBE_TIMEOUT_MS (default 15s) with no
  *           recognized error — engine is likely healthy but slow (e.g. a cold
  *           pooler connection, #1964). Consumers treat this as usable.
+ * Db-unreachable → the probe failed with a network error (DNS failure such as
+ *           ENOTFOUND/EAI_AGAIN in an offline sandbox, a refused or timed-out
+ *           connection). The config is fine as far as we know; it must never
+ *           route users to Step 1.5's "move your config aside" remediation.
+ *           Local stages skip; skill rendering treats it like timeout.
  * Thin-client → config carries gbrain's remote_mcp marker (#2051), OR the
  *           agent host's MCP registration is remote-HTTP-only (#2520 — bearer
  *           installs via `gbrain connect --token` never get the marker): NO
@@ -48,7 +53,8 @@ import {
 import { atomicWriteSync } from "./fs-atomic";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { buildGbrainEnv, gbrainConfigDir, isExecTimeout, NEEDS_SHELL_ON_WINDOWS } from "./gbrain-exec";
+import { buildGbrainEnv, gbrainChildCwd, gbrainConfigDir, isExecTimeout, NEEDS_SHELL_ON_WINDOWS } from "./gbrain-exec";
+import { classifyGbrainMcpEntry } from "./gbrain-mcp-locality";
 import { resolveStateRoot } from "./state-root";
 
 export type LocalEngineStatus =
@@ -59,6 +65,7 @@ export type LocalEngineStatus =
   | "broken-db"
   | "engine-locked"
   | "timeout"
+  | "db-unreachable"
   | "thin-client";
 
 export interface ClassifyOptions {
@@ -77,6 +84,8 @@ interface CacheEntry {
   // future shape change here requires an explicit migration.
   schema_version: 1;
   status: LocalEngineStatus;
+  /** One-line reason for a db-unreachable status (code + host). */
+  detail?: string;
   cached_at: number;
   /** Cache invariants — entry is invalidated if any of these change between writes. */
   key: {
@@ -125,9 +134,9 @@ export function cacheFilePath(): string {
  * (#2521): GBRAIN_HOME is a parent dir, `.gbrain` is appended. Same
  * resolution as buildGbrainEnv — both route through gbrainConfigDir.
  */
-function gbrainConfigPath(env?: NodeJS.ProcessEnv): string {
-  const e = env ?? process.env;
-  return join(gbrainConfigDir(e), "config.json");
+function gbrainConfigPath(env?: NodeJS.ProcessEnv): string | null {
+  const dir = gbrainConfigDir(env ?? process.env);
+  return dir && join(dir, "config.json");
 }
 
 /**
@@ -179,16 +188,11 @@ export function hasRemoteOnlyGbrainMcp(
   } catch {
     return false;
   }
-  // Same classification rules as gstack-gbrain-detect's detectMcpMode tier 3,
-  // including the #2051 name generalization (gbrain, gbrain-remote, gbrain_work).
-  const classify = (entry: McpEntry): "remote" | "local" | null => {
-    const mtype = entry.type || entry.transport || "";
-    if (mtype === "url" || mtype === "http" || mtype === "sse") return "remote";
-    if (mtype === "stdio") return "local";
-    if (entry.url) return "remote";
-    if (entry.command) return "local";
-    return null;
-  };
+  // The classifier gstack-gbrain-detect's detectMcpMode uses, so a loopback
+  // `gbrain serve --http` over this machine's own engine is local here too
+  // (#3539): detect never prints local-stdio next to thin-client. Name
+  // generalization (#2051: gbrain, gbrain-remote, gbrain_work) is below.
+  const classify = (entry: McpEntry): "remote" | "local" | null => classifyGbrainMcpEntry(entry, env ?? process.env);
   /** Extract the gbrain-relevant entries from an mcpServers object. */
   const gbrainEntries = (servers: unknown): Record<string, McpEntry> => {
     const out: Record<string, McpEntry> = {};
@@ -242,8 +246,10 @@ export function hasRemoteOnlyGbrainMcp(
 }
 
 function configuredEngine(env?: NodeJS.ProcessEnv): "pglite" | "postgres" | null {
+  const configPath = gbrainConfigPath(env);
+  if (!configPath) return null;
   try {
-    const parsed = JSON.parse(readFileSync(gbrainConfigPath(env), "utf-8")) as { engine?: string };
+    const parsed = JSON.parse(readFileSync(configPath, "utf-8")) as { engine?: string };
     return parsed.engine === "pglite" || parsed.engine === "postgres" ? parsed.engine : null;
   } catch {
     return null;
@@ -335,8 +341,10 @@ export function readGbrainVersion(env?: NodeJS.ProcessEnv): string {
 }
 
 function configFingerprint(env?: NodeJS.ProcessEnv): { mtime: number; size: number } {
+  const configPath = gbrainConfigPath(env);
+  if (!configPath) return { mtime: 0, size: 0 };
   try {
-    const st = statSync(gbrainConfigPath(env));
+    const st = statSync(configPath);
     return { mtime: Math.floor(st.mtimeMs), size: st.size };
   } catch {
     return { mtime: 0, size: 0 };
@@ -375,23 +383,24 @@ function keysEqual(a: CacheEntry["key"], b: CacheEntry["key"]): boolean {
   );
 }
 
-function readCache(key: CacheEntry["key"]): LocalEngineStatus | null {
+function readCache(key: CacheEntry["key"]): CacheEntry | null {
   if (!existsSync(cacheFilePath())) return null;
   try {
     const raw = JSON.parse(readFileSync(cacheFilePath(), "utf-8")) as CacheEntry;
     if (raw.schema_version !== 1) return null;
     if (Date.now() - raw.cached_at > CACHE_TTL_MS) return null;
     if (!keysEqual(raw.key, key)) return null;
-    return raw.status;
+    return raw;
   } catch {
     return null;
   }
 }
 
-function writeCache(status: LocalEngineStatus, key: CacheEntry["key"]): void {
+function writeCache(status: LocalEngineStatus, key: CacheEntry["key"], detail?: string): void {
   const entry: CacheEntry = {
     schema_version: 1,
     status,
+    ...(detail ? { detail } : {}),
     cached_at: Date.now(),
     key,
   };
@@ -401,6 +410,41 @@ function writeCache(status: LocalEngineStatus, key: CacheEntry["key"]): void {
   } catch {
     // Cache write failure is non-fatal — we re-probe next call.
   }
+}
+
+const NETWORK_ERROR_RE = /\b(ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ECONNRESET)\b/;
+
+/**
+ * The one-line db-unreachable reason (A2). The host comes from the configured
+ * database_url when it parses (never the password), else from the error text.
+ */
+export function dbUnreachableReason(code: string, host: string): string {
+  return `database host unreachable (${code}${host ? ` ${host}` : ""}); your gbrain config is unchanged. ` +
+    "Fix: check network or VPN, then re-run /sync-gbrain.";
+}
+
+function networkFailureDetail(stderr: string, env?: NodeJS.ProcessEnv): string | null {
+  const m = stderr.match(NETWORK_ERROR_RE);
+  if (!m) return null;
+  let host = "";
+  const configPath = gbrainConfigPath(env);
+  if (configPath) {
+    try {
+      const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
+      if (typeof cfg?.database_url === "string") {
+        host = new URL(cfg.database_url.replace(/^postgres(ql)?:\/\//, "http://")).hostname;
+      }
+    } catch {}
+  }
+  if (!host) host = stderr.match(new RegExp(`${m[1]}\\s+([A-Za-z0-9.-]+)`))?.[1] ?? "";
+  return dbUnreachableReason(m[1], host);
+}
+
+let lastDetail: string | null = null;
+
+/** The reason recorded with the last db-unreachable classification, if any. */
+export function localEngineStatusDetail(): string | null {
+  return lastDetail;
 }
 
 /**
@@ -421,7 +465,8 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
   // 2. Config file present? A bearer thin client (#2520) may never have run
   // a local init, so config.json can be absent while the remote-HTTP MCP
   // registration IS the user's brain.
-  if (!existsSync(gbrainConfigPath(env))) {
+  const configPath = gbrainConfigPath(env);
+  if (!configPath || !existsSync(configPath)) {
     return hasRemoteOnlyGbrainMcp(env) ? "thin-client" : "missing-config";
   }
 
@@ -434,7 +479,7 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
   // immune to gbrain error-string drift. Remote reachability is deliberately
   // NOT probed here — a classifier network probe is the #1964 pathology.
   try {
-    const cfg = JSON.parse(readFileSync(gbrainConfigPath(env), "utf-8")) as {
+    const cfg = JSON.parse(readFileSync(configPath, "utf-8")) as {
       remote_mcp?: unknown;
     };
     if (cfg && typeof cfg === "object" && cfg.remote_mcp) {
@@ -460,6 +505,7 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
       timeout: probeTimeoutMs(env),
       stdio: ["ignore", "pipe", "pipe"],
       env: buildGbrainEnv({ baseEnv: env ?? process.env }),
+      cwd: gbrainChildCwd(undefined, env ?? process.env),
       shell: NEEDS_SHELL_ON_WINDOWS, // #1731: gbrain is a .cmd shim on Windows
     });
     return "ok";
@@ -483,6 +529,11 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
     // DB-unreachable signal.
     const raw = ((): LocalEngineStatus => {
       if (/thin[- ]client/i.test(stderr)) return "thin-client";
+      const network = networkFailureDetail(stderr, env);
+      if (network) {
+        lastDetail = network;
+        return "db-unreachable";
+      }
       if (stderr.includes("Cannot connect to database")) return "broken-db";
       if (stderr.includes("config.json")) return "broken-config";
 
@@ -533,7 +584,7 @@ function freshClassify(env?: NodeJS.ProcessEnv): LocalEngineStatus {
     // to do locally" message. "timeout" is deliberately excluded: it already
     // counts as usable and may be a genuinely healthy slow LOCAL engine.
     if (
-      (raw === "broken-db" || raw === "broken-config" || raw === "engine-locked") &&
+      (raw === "broken-db" || raw === "broken-config" || raw === "engine-locked" || raw === "db-unreachable") &&
       hasRemoteOnlyGbrainMcp(env)
     ) {
       return "thin-client";
@@ -555,10 +606,15 @@ export function localEngineStatus(opts: ClassifyOptions = {}): LocalEngineStatus
 
   if (!opts.noCache) {
     const cached = readCache(key);
-    if (cached) return cached;
+    if (cached) {
+      lastDetail = cached.detail ?? null;
+      return cached.status;
+    }
   }
 
+  lastDetail = null;
   const fresh = freshClassify(env);
-  writeCache(fresh, key);
+  if (fresh !== "db-unreachable") lastDetail = null;
+  writeCache(fresh, key, lastDetail ?? undefined);
   return fresh;
 }

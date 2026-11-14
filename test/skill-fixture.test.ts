@@ -26,8 +26,14 @@ import {
   REVIEW_ARMY_E2E_SECTIONS,
   RETRO_E2E_SECTIONS,
   CODEX_REVIEW_E2E_SECTIONS,
+  extractCodexReviewExcerpt,
+  unresolvedBinRefs,
 } from './helpers/skill-fixture';
 import { E2E_TOUCHFILES, GLOBAL_TOUCHFILES, selectTests } from './helpers/touchfiles';
+import { readShippedSkillRouting } from './helpers/shipped-skill-routing';
+import { hasNarrationLeak } from './helpers/skill-body-narration';
+import { expectMentions } from './helpers/prompt-structure';
+import { SHARED_POINTER_HEADING, readSkillStartup } from './helpers/skill-startup';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 
@@ -296,7 +302,8 @@ describe('real-skill pins: section lists used by E2E fixtures', () => {
     expect(out).not.toContain('## Telemetry (run last)');
     expect(out).not.toContain('## Step 5: Fix-First Review');
     expect(out).not.toContain('review/sections/review-army.md');
-    expect(out).toContain('Enum & Value Completeness requires reading code OUTSIDE the diff.');
+    // Step 4's sideways-sweep paragraph (plan D2 replaced the enum-only one) survives the extraction.
+    expect(out).toContain('Sideways sweep (every finding; reads code OUTSIDE the diff).');
     // Meaningfully smaller than the source.
     const full = fs.readFileSync(path.join(ROOT, 'review', 'SKILL.md'), 'utf-8');
     expect(out.length).toBeLessThan(full.length * 0.5);
@@ -341,7 +348,7 @@ describe('real-skill pins: section lists used by E2E fixtures', () => {
     expect(out).toContain('### Step 14: Write the Narrative');
     expect(out).not.toContain('## Global Retrospective Mode');
     expect(out).toContain('Read `~/.claude/skills/gstack/retro/sections/report-format.md` and execute it');
-    expect(out).toContain('After delivering the repo-scoped report, run the following learning capture and result-save steps, then stop.');
+    expectMentions(out, [['stop', 'repo-scoped', 'result-save']], 'out');
     expect(out).not.toContain('## Telemetry (run last)');
 
     const reportFormat = fs.readFileSync(
@@ -356,6 +363,32 @@ describe('real-skill pins: section lists used by E2E fixtures', () => {
     const out = extractSkillSections(codexReview, CODEX_REVIEW_E2E_SECTIONS);
     expect(out).toContain('## Step 4: Critical pass (core review)');
     expect(out).not.toContain('## Telemetry (run last)');
+  });
+
+  // Run 42571575838: the excerpt kept ~/.claude/skills/gstack/bin/gstack-codex-probe,
+  // the fixture seeds no install, and the review failed closed on HELPER_UNAVAILABLE.
+  test('every bin/ helper the codex-review excerpt names resolves in this checkout', () => {
+    const excerpt = extractCodexReviewExcerpt(ROOT);
+    expect(excerpt).toContain('## Step 2A: Review Mode');
+    expect(excerpt).toContain(`_CODEX_PROBE=${path.join(ROOT, 'bin', 'gstack-codex-probe')}`);
+    expect(excerpt).toContain(`${path.join(ROOT, 'lib', 'outside-review-result.ts')} --label 'Codex review'`);
+    expect(excerpt).not.toContain('.claude/skills/gstack/');
+    expect(unresolvedBinRefs(excerpt, ROOT)).toEqual([]);
+  });
+
+  test('an install-path or missing helper stays unresolved', () => {
+    expect(unresolvedBinRefs('_CODEX_PROBE=~/.claude/skills/gstack/bin/gstack-codex-probe', ROOT))
+      .toEqual(['~/.claude/skills/gstack/bin/gstack-codex-probe']);
+    // /ship adversarial pass on #4223: the bin/-only rewrite left this lib/ call on the install path.
+    expect(unresolvedBinRefs("bun ~/.claude/skills/gstack/lib/outside-review-result.ts --label 'Codex review'", ROOT))
+      .toEqual(['~/.claude/skills/gstack/lib/outside-review-result.ts']);
+    expect(unresolvedBinRefs('a global `~/.claude/skills/gstack/` install', ROOT)).toEqual(['~/.claude/skills/gstack/']);
+    expect(unresolvedBinRefs(`bun ${path.join(ROOT, 'lib', 'outside-review-result.ts')}`, ROOT)).toEqual([]);
+    expect(unresolvedBinRefs(`bun ${path.join(ROOT, 'lib', 'no-such-script.ts')}`, ROOT))
+      .toEqual([path.join(ROOT, 'lib', 'no-such-script.ts')]);
+    const missing = path.join(ROOT, 'bin', 'gstack-no-such-helper');
+    expect(unresolvedBinRefs(`X=$(${missing} probe)`, ROOT)).toEqual([missing]);
+    expect(unresolvedBinRefs('see `bin/gstack-no-such-helper`.', ROOT)).toEqual(['bin/gstack-no-such-helper']);
   });
 });
 
@@ -385,7 +418,8 @@ describe('real-skill pins: body/head extraction used by E2E fixtures', () => {
       expect(out).not.toContain('## Preamble (run first)');
       expect(out).not.toContain('## Preamble (after scope gate)');
       expect(out).not.toContain('## Telemetry (run last)');
-      const full = fs.readFileSync(path.join(ROOT, skill, 'SKILL.md'), 'utf-8');
+      expect(out).not.toContain(SHARED_POINTER_HEADING);
+      const full = readSkillStartup(path.join(ROOT, skill, 'SKILL.md'));
       expect(out.length).toBeLessThan(full.length * 0.75);
       expect(out.length).toBeGreaterThan(500);
     });
@@ -402,7 +436,7 @@ describe('real-skill pins: body/head extraction used by E2E fixtures', () => {
     const file = path.join(ROOT, 'plan-eng-review', 'SKILL.md');
     const full = fs.readFileSync(file, 'utf-8');
     const scopeStart = full.indexOf('## Scope gate');
-    const preamble = full.indexOf('## Preamble (after scope gate)');
+    const preamble = full.indexOf(SHARED_POINTER_HEADING);
     expect(scopeStart).toBeGreaterThan(0); expect(preamble).toBeGreaterThan(scopeStart);
     expect(extractSkillBody(file)).toContain(full.slice(scopeStart, preamble).trimEnd());
   });
@@ -449,13 +483,13 @@ test('routing catalog contains installed project names without a request-to-skil
     writeFileSync: (file: string, content: string) => writes.set(file, content),
   };
   const compiled = new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end) + '\ninstallSkills(fixtureRoot);');
-  new Function('ROOT', 'fs', 'path', 'extractSkillHead', 'fixtureRoot', compiled)(
-    ROOT, mockFs, path, (file: string) => installed.get(file), fixtureRoot,
+  new Function('ROOT', 'fs', 'path', 'extractSkillHead', 'readShippedSkillRouting', 'fixtureRoot', compiled)(
+    ROOT, mockFs, path, (file: string) => installed.get(file), readShippedSkillRouting, fixtureRoot,
   );
   const instructions = writes.get(path.join(fixtureRoot, 'CLAUDE.md'))!;
+  expect(instructions).toContain(readShippedSkillRouting().instruction);
+  expect(instructions).not.toContain('→ invoke');
   expect(instructions).toContain('installed gstack skills: gstack, qa, review.');
-  expect(instructions).toContain("built-in skills are outside this project's workflow");
-  expect(instructions).toContain('matching the request to the skill descriptions');
   expect(instructions).not.toContain('photography');
   expect(instructions).not.toContain('code-review');
   expect(instructions).not.toContain('ship');
@@ -464,3 +498,42 @@ test('routing catalog contains installed project names without a request-to-skil
     .toBe(installed.get(path.join(ROOT, 'review/SKILL.md')));
   expect(writes.size).toBe(4);
 });
+
+test('routing fixtures read the ## Skill routing section gstack ships', () => {
+  const routing = readShippedSkillRouting();
+  expect(routing.instruction).toStartWith('## Skill routing\n\n');
+  expect(routing.instruction).toContain('Skill tool');
+  expect(routing.rules.some(rule => rule.includes('/context-save'))).toBe(true);
+  expect(routing.rules.some(rule => rule.includes('/context-restore'))).toBe(true);
+  expect(routing.section).not.toContain('If B:');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'shipped-routing-drift-'));
+  try {
+    fs.mkdirSync(path.join(root, 'bin'));
+    fs.writeFileSync(path.join(root, 'bin', 'gstack-skill-start'), '#!/bin/bash\necho no routing here\n');
+    expect(() => readShippedSkillRouting(root)).toThrow('routing-injection heredoc not found');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// Stored synthesized SKILL.md bodies for the skillify narration grader.
+{
+  const DIR = path.join(import.meta.dir, 'fixtures', 'skillify-narration');
+  const read = (name: string) => fs.readFileSync(path.join(DIR, name), 'utf8');
+  const KNOWN_BAD = fs.readdirSync(DIR).filter(name => name.startsWith('known-bad-')).sort();
+
+  describe('skillify narration grader', () => {
+    test('accepts a clean body that says "let me know" in a trigger', () => {
+      expect(hasNarrationLeak(read('known-good.md'))).toBe(false);
+    });
+    test('stored known-bad fixtures exist', () => {
+      expect(KNOWN_BAD.length).toBeGreaterThanOrEqual(4);
+    });
+    test.each(KNOWN_BAD)('still rejects %s', (name) => {
+      expect(hasNarrationLeak(read(name))).toBe(true);
+    });
+    test('the previous grader rejected every known-bad fixture and also the known-good one', () => {
+      const previous = (body: string) => /^I /m.test(body) || /Let me /i.test(body) || /^I'll /m.test(body);
+      for (const name of KNOWN_BAD) expect(previous(read(name))).toBe(true);
+      expect(previous(read('known-good.md'))).toBe(true);
+    });
+  });
+}

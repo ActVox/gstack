@@ -8,6 +8,8 @@ import { isPreTurnInfraFailure, recordE2E } from './helpers/e2e-helpers';
 import { EvalCollector, isFinalizedEvalResultFile, listEvalJsonFiles, type EvalTestEntry } from './helpers/eval-store';
 import { OFFICE_HOURS_BUN_GRACE_MS, runRecordedOfficeHoursAttempt } from './helpers/office-hours-attempt';
 import { isPaidTestFile } from './helpers/paid-test-set';
+import { seedHermeticGstackHome } from './helpers/hermetic-env';
+import { resolveEvalModel } from '../lib/eval-model';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const source = fs.readFileSync(path.join(ROOT, 'test/skill-e2e-plan.test.ts'), 'utf8');
@@ -19,6 +21,17 @@ const openCompletion = '\n**VERDICT:** ENG ISSUES OPEN\n\n**UNRESOLVED DECISIONS
 const CASE = '/plan-eng-review writes GSTACK REVIEW REPORT to plan file';
 
 type Scenario = { kind: string; table?: string; exitReason?: string; open?: boolean };
+
+// Run the copied section's real Outside Voice preflight against a state root.
+function outsideMode(section: string, home: string, gstackHome?: string): string {
+  const block = section.slice(section.indexOf('**Preflight — decide whether and how the outside voice runs:**')).match(/```bash\n([\s\S]*?)```/)![1];
+  // Git Bash on Windows needs its own spelling of the checkout path.
+  const bin = Bun.spawnSync(['bash', '-c', 'cd "$1" && pwd', '_', path.join(ROOT, 'bin')], { timeout: 10_000 }).stdout.toString().trim();
+  const child = Bun.spawnSync(['bash', '-c', block.replaceAll('"$HOME/.claude/skills/gstack/bin/gstack-config"', '"$GSTACK_CONFIG_BIN"')], {
+    env: { PATH: process.env.PATH ?? '', HOME: home, GSTACK_CONFIG_BIN: `${bin}/gstack-config`,
+      ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}), ...(gstackHome ? { GSTACK_HOME: gstackHome } : {}) }, timeout: 10_000 });
+  return child.stdout.toString().trim();
+}
 
 async function exercise(scenarios: Scenario[], opts: { deadline?: boolean; sibling?: boolean } = {}) {
   const owned = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-report-recording-free-'));
@@ -45,7 +58,7 @@ async function exercise(scenarios: Scenario[], opts: { deadline?: boolean; sibli
   for (const declaration of source.matchAll(/^import[\s\S]*?;\n/gm)) executable = executable.replace(declaration[0], '');
   const js = new Bun.Transpiler({ loader: 'ts', target: 'bun' }).transformSync(executable);
   const args: Record<string, any> = {
-    expect, ROOT, runId: 'public-report-free', evalsEnabled: true, CAPTURE_LONG_MS,
+    expect, ROOT, runId: 'public-report-free', evalsEnabled: true, CAPTURE_LONG_MS, resolveEvalModel, seedHermeticGstackHome,
     OFFICE_HOURS_BUN_GRACE_MS, EvalCollector: BoundCollector, recordE2E,
     createEvalCollector: (tier: string) => new BoundCollector(tier),
     finalizeEvalCollector: async (collector: EvalCollector | null) => {
@@ -81,7 +94,10 @@ async function exercise(scenarios: Scenario[], opts: { deadline?: boolean; sibli
     runSkillTest: async (options: any) => {
       const file = path.join(options.workingDirectory, 'plan.md');
       const seed = fs.readFileSync(file, 'utf8');
+      const section = fs.readFileSync(path.join(options.workingDirectory, 'plan-eng-review/sections/review-sections.md'), 'utf8');
       calls.push({ ...options, seed,
+        outside: outsideMode(section, options.workingDirectory, options.env?.GSTACK_HOME),
+        unseeded: outsideMode(section, options.workingDirectory, fs.mkdtempSync(path.join(owned, 'unseeded-state-'))),
         main: fs.readFileSync(path.join(options.workingDirectory, 'plan-eng-review/SKILL.md'), 'utf8'),
         section: fs.readFileSync(path.join(options.workingDirectory, 'plan-eng-review/sections/review-sections.md'), 'utf8'),
       });
@@ -208,20 +224,26 @@ test('canonical reports preserve both successful exits, terminal forms, metadata
   expect(actual.helperOptions).toHaveLength(2);
   for (const options of actual.helperOptions) expect(options.budgetMs).toBe(CAPTURE_LONG_MS);
   for (const call of actual.calls) {
-    expect(call).toMatchObject({ testName: 'plan-review-report', model: 'claude-opus-4-7', maxTurns: 20,
+    expect(call).toMatchObject({ testName: 'plan-review-report', model: 'claude-opus-5-5', maxTurns: 20,
       timeout: CAPTURE_LONG_MS, runId: 'public-report-free' });
     expect(call.signal).toBeInstanceOf(AbortSignal);
     expect(call.prompt).toContain('Read plan-eng-review/SKILL.md and plan-eng-review/sections/review-sections.md');
-    expect(call.prompt).toContain('"Plan File Review Report" section of plan-eng-review/sections/review-sections.md');
+    expect(call.prompt).toContain('plan.md is the plan file for this review session');
+    expect(call.prompt).not.toMatch(/CRITICAL REQUIREMENT|GSTACK REVIEW REPORT|\bMUST\b/);
     expect(call.prompt).not.toContain('placeholder table with all five review rows (CEO, Codex, Eng, Design, DX)');
     expect(call.main).toBe(fs.readFileSync(path.join(ROOT, 'plan-eng-review/SKILL.md'), 'utf8'));
     expect(call.section).toBe(fs.readFileSync(path.join(ROOT, 'plan-eng-review/sections/review-sections.md'), 'utf8'));
     expect(call.section).toContain('| Review | Trigger | Why | Runs | Status | Findings |');
+    // Gate 40660626349: both reds spent 4 of 21 turns on the default-on outside voice.
+    expect(call.outside).toBe('CODEX_MODE: disabled');
+    expect(call.unseeded).not.toContain('disabled');
+    expect(call.unseeded).toMatch(/^CODEX_MODE: \w+$/);
   }
+  expect(actual.fixtures.filter(dir => path.basename(dir).startsWith('skill-e2e-review-report-state-'))).toHaveLength(2);
   for (const outcome of actual.outcomes) {
     expect(outcome.entries).toHaveLength(1);
     expect(outcome.entries[0]).toMatchObject({ name: '/plan-review-report', suite: 'Plan Review Report E2E', tier: 'e2e', passed: true,
-      duration_ms: 25, cost_usd: 0.12, model: 'claude-opus-4-7', first_response_ms: 3, max_inter_turn_ms: 7 });
+      duration_ms: 25, cost_usd: 0.12, model: 'claude-opus-5-5', first_response_ms: 3, max_inter_turn_ms: 7 });
     expect(outcome.entries[0].output).toHaveLength(2000);
     expect(outcome.entries[0].transcript).toEqual(outcome.result.transcript);
   }
@@ -265,9 +287,12 @@ function runnerResult(exitReason: string, turnsUsed = 0, transcript: any[] = [{ 
     costEstimate: { inputChars: 1, outputChars: 0, estimatedTokens: 0, estimatedCost: 0, turnsUsed } };
 }
 function recordedClass(result: any, extra?: Partial<EvalTestEntry>) {
-  const collector = new EvalCollector('e2e');
-  recordE2E(collector, 'infra-probe', 'Infra probe', result, extra);
-  return (collector as any).tests.at(-1)?.failure_class;
+  const evalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'report-recording-class-'));
+  try {
+    const collector = new EvalCollector('e2e', evalDir);
+    recordE2E(collector, 'infra-probe', 'Infra probe', result, extra);
+    return (collector as any).tests.at(-1)?.failure_class;
+  } finally { fs.rmSync(evalDir, { recursive: true, force: true }); }
 }
 
 test.each(['error_api', 'timeout_startup', 'error_output_stream', 'exit_code_1'])(

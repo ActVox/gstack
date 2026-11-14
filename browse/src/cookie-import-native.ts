@@ -4,7 +4,9 @@ import { createRequire } from 'node:module';
 import { release } from 'node:os';
 import path from 'node:path';
 import { CookieImportError, normalizeCookieDomain, type PlaywrightCookie } from './cookie-import-browser';
+import { emptyBunConfig, findWindowsBunExe } from './bun-child-config';
 import { hashNativeFile, nativeCodeHashes, nativeCodeMatches, readNativeQualifications, type NativeQualifiedBuild } from './cookie-import-native-integrity';
+import { NATIVE_CLEANUP_MS } from './cookie-import-native-job';
 
 type BrowserName = 'Chrome' | 'Chromium' | 'Brave' | 'Edge';
 
@@ -106,20 +108,13 @@ export async function importNativeCookies(options: {
   } catch (error) {
     throw new CookieImportError('The native browser build could not be checked safely. Sign in manually in the gstack browser.', error instanceof Error && error.message === 'native_timeout' ? 'native_timeout' : 'native_unqualified');
   }
-  const bunCandidates = [
-    ...(process.env.BUN_INSTALL ? [path.join(process.env.BUN_INSTALL, 'bin', 'bun.exe')] : []),
-    ...(process.env.PATH || process.env.Path || '').split(path.delimiter).filter(directory => path.isAbsolute(directory)).map(directory => path.join(directory, 'bun.exe')),
-    ...(process.env.USERPROFILE ? [path.join(process.env.USERPROFILE, '.bun', 'bin', 'bun.exe')] : []),
-  ];
-  const bunExecutable = bunCandidates.find(candidate => {
-    try { return statSync(candidate).isFile(); } catch { return false; }
-  });
+  const bunExecutable = findWindowsBunExe();
   if (!bunExecutable || !qualified.some(build => build.executableSha256 === executableSha256 && build.playwrightVersion === playwrightVersion)) {
     throw new CookieImportError('This browser build or supervisor runtime has not passed native qualification. Sign in manually in the gstack browser.', 'native_unqualified');
   }
   if (Date.now() >= deadline) throw new CookieImportError('Native cookie import exceeded its operation deadline.', 'native_timeout');
   const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => /^(systemroot|windir|temp|tmp|userprofile|localappdata|appdata|programfiles|programfiles\(x86\)|programdata|path|pathext)$/i.test(key) && typeof value === 'string'));
-  const worker = spawn(bunExecutable, ['--no-env-file', '--no-install', '--no-macros', '--config=NUL', path.join(import.meta.dir, 'cookie-import-native-worker.ts')], {
+  const worker = spawn(bunExecutable, ['--no-env-file', '--no-install', '--no-macros', `--config=${emptyBunConfig()}`, path.join(import.meta.dir, 'cookie-import-native-worker.ts')], {
     env,
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
@@ -129,7 +124,7 @@ export async function importNativeCookies(options: {
     const timer = setTimeout(() => {
       worker.kill();
       reject(new CookieImportError('Native cookie cleanup could not be confirmed within its deadline.', 'native_cleanup_failed'));
-    }, Math.max(0, deadline + 5_000 - Date.now()));
+    }, Math.max(0, deadline + NATIVE_CLEANUP_MS + 2_000 - Date.now()));
     worker.stdout.setEncoding('utf8');
     worker.stdout.on('data', chunk => {
       output += chunk;

@@ -1,12 +1,13 @@
 /**
  * Design-to-Code Prompt Generator.
- * Extracts implementation instructions from an approved mockup via GPT-4o vision.
+ * Extracts implementation instructions from an approved mockup via the active provider's vision model.
  * Produces a structured prompt the agent can use to implement the design.
  */
 
 import fs from "fs";
-import { requireApiKey } from "./auth";
+import { requireProvider } from "./auth";
 import { receiptedFetch } from "./receipted-fetch";
+import { visionErrorHint, visionRequest } from "./provider";
 import { readDesignConstraints } from "./memory";
 
 export interface DesignToCodeResult {
@@ -24,7 +25,7 @@ export async function generateDesignToCodePrompt(
   imagePath: string,
   repoRoot?: string,
 ): Promise<DesignToCodeResult> {
-  const apiKey = requireApiKey();
+  const provider = requireProvider();
   const imageData = fs.readFileSync(imagePath).toString("base64");
 
   // Read DESIGN.md if available for additional context
@@ -38,24 +39,16 @@ export async function generateDesignToCodePrompt(
       ? `\n\nExisting DESIGN.md (use these as constraints):\n${designConstraints}`
       : "";
 
-    const response = await receiptedFetch("design-to-code-request", "https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{
-          role: "user",
-          content: [
-            {
-              type: "image_url",
-              image_url: { url: `data:image/png;base64,${imageData}` },
-            },
-            {
-              type: "text",
-              text: `Analyze this approved UI mockup and generate a structured implementation prompt. Return valid JSON only:
+    const request = visionRequest(provider, [{
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${imageData}` },
+          },
+          {
+            type: "text",
+            text: `Analyze this approved UI mockup and generate a structured implementation prompt. Return valid JSON only:
 
 {
   "implementationPrompt": "A detailed paragraph telling a developer exactly how to build this UI. Include specific CSS values, layout approach (flex/grid), component structure, and interaction behaviors. Reference the specific elements visible in the mockup.",
@@ -66,18 +59,14 @@ export async function generateDesignToCodePrompt(
 }
 
 Be specific about every visual detail: exact hex colors, font sizes in px, spacing values, border-radius, shadows. The developer should be able to implement this without looking at the mockup again.${contextBlock}`,
-            },
-          ],
-        }],
-        max_tokens: 1000,
-        response_format: { type: "json_object" },
-      }),
-      signal: controller.signal,
-    });
+          },
+        ],
+      }], 1000, { response_format: { type: "json_object" } });
+    const response = await receiptedFetch("design-to-code-request", request.url, { ...request.init, signal: controller.signal }, globalThis.fetch, request.receipt);
 
     if (!response.ok) {
       const error = await response.text();
-      throw new Error(`API error (${response.status}): ${error.slice(0, 200)}`);
+      throw new Error(`API error (${response.status}): ${error.slice(0, 200)}${visionErrorHint(provider, response.status, error)}`);
     }
 
     const data = await response.json() as any;

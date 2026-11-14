@@ -13,7 +13,8 @@ description: |
   a new product idea, asks whether something is worth building, wants to think
   through design decisions for something that doesn't exist yet, or is exploring
   a concept before any code is written.
-  Use before /plan-ceo-review or /plan-eng-review. (gstack)
+  Use before /plan-ceo-review or /autoplan. (gstack)
+codex_default_prompt: "Use $gstack-office-hours to think this idea through before any code: challenge the premise, find the narrowest wedge, and save a design doc the later skills read."
 allowed-tools:
   - Bash
   - Read
@@ -41,18 +42,17 @@ gbrain:
       render_as: "## Prior office-hours sessions in this repo"
     - id: builder-profile
       kind: filesystem
-      glob: "~/.gstack/builder-profile.jsonl"
-      tail: 1
+      glob: "{gstack_state_root}/developer-profile.json"
       render_as: "## Your builder profile snapshot"
     - id: design-doc-history
       kind: filesystem
-      glob: "~/.gstack/projects/{repo_slug}/*-design-*.md"
+      glob: "{gstack_state_root}/projects/{repo_slug}/*-design-*.md"
       sort: mtime_desc
       limit: 3
       render_as: "## Recent design docs for this project"
     - id: prior-eureka
       kind: filesystem
-      glob: "~/.gstack/analytics/eureka.jsonl"
+      glob: "{gstack_state_root}/analytics/eureka.jsonl"
       tail: 5
       render_as: "## Recent eureka moments"
 ---
@@ -82,11 +82,11 @@ Understand the project and the area the user wants to change.
 ```
 
 1. Read `CLAUDE.md`, `TODOS.md` (if they exist).
-2. Run `git log --oneline -30` and `git diff origin/main --stat 2>/dev/null` to understand recent context.
+2. Run `git log --oneline -30` and `git diff origin/HEAD --stat` (default branch) to grasp recent context.
 3. Use Grep/Glob to map the codebase areas most relevant to the user's request.
 4. **List existing design docs for this project:**
    ```bash
-   eval "$(~/.claude/skills/gstack/bin/gstack-paths)"; : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+   GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
    setopt +o nomatch 2>/dev/null || true  # zsh compat
    ls -t "$GSTACK_STATE_ROOT"/projects/$SLUG/*-design-*.md 2>/dev/null
    ```
@@ -150,7 +150,7 @@ After the user states the problem (first question in Phase 2A or 2B), search exi
 
 Extract 3-5 significant keywords from the user's problem statement and grep across design docs:
 ```bash
-eval "$(~/.claude/skills/gstack/bin/gstack-paths)"; : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
 setopt +o nomatch 2>/dev/null || true  # zsh compat
 grep -li "<keyword1>\|<keyword2>\|<keyword3>" "$GSTACK_STATE_ROOT"/projects/$SLUG/*-design-*.md 2>/dev/null
 ```
@@ -158,8 +158,6 @@ grep -li "<keyword1>\|<keyword2>\|<keyword3>" "$GSTACK_STATE_ROOT"/projects/$SLU
 If matches found, read the matching design docs and surface them:
 - "FYI: Related design found — '{title}' by {user} on {date} (branch: {branch}). Key overlap: {1-line summary of relevant section}."
 - Ask via AskUserQuestion: "Should we build on this prior design or start fresh?"
-
-This enables cross-team discovery — multiple users exploring the same project will see each other's design docs in `~/.gstack/projects/`.
 
 If no matches found, proceed silently.
 
@@ -171,13 +169,13 @@ If no matches found, proceed silently.
 
 Read ETHOS.md for the full Search Before Building framework (three layers, eureka moments). The preamble's Search Before Building section has the ETHOS.md path.
 
-After understanding the problem through questioning, search for what the world thinks. This is NOT competitive research (that's /design-consultation's job). This is understanding conventional wisdom so you can evaluate where it's wrong.
+After the questioning, learn the conventional wisdom (not competitive research) so you can judge where it's wrong.
 
 **Privacy gate:** Before searching, use AskUserQuestion: "I'd like to search for what the world thinks about this space to inform our discussion. This sends generalized category terms (not your specific idea) to a search engine through your Aside browser (or the WebSearch tool if Aside is not running). OK to proceed?"
 Options: A) Yes, search away  B) Skip — keep this session private
 If B: skip this phase entirely and proceed to Phase 3. Use only in-distribution knowledge.
 
-When searching, use **generalized category terms** — never the user's specific product name, proprietary concept, or stealth idea. For example, search "task management app landscape" not "SuperTodo AI-powered task killer."
+Search **generalized category terms** only, never the user's product name, proprietary concept or stealth idea ("task management app landscape", not "SuperTodo AI-powered task killer").
 
 If the Aside check did not print `READY`, run the same searches with the WebSearch tool when the host provides it; with neither, skip this phase and note: "Search unavailable — proceeding with in-distribution knowledge only."
 
@@ -193,10 +191,7 @@ Research through Aside (Web research runs in Aside, above), one read-only reques
 - "[thing being built] open source alternatives"
 - "best [thing category] {current year}"
 
-```bash
-{{ASIDE_EXEC_PRELUDE}}
-_aside_exec "Search the web for [problem space] startup approach {current year}, [problem space] common mistakes, and why [incumbent solution] works or fails. Read-only: do not sign in, submit, or change anything. Reply with up to 8 bullets, each with its source URL, then stop."
-```
+Prompt file text (create, write and send it with the Web research runs in Aside blocks above): `[problem space] startup approach {current year}, [problem space] common mistakes, and why [incumbent solution] works or fails. Reply with up to 8 bullets, each with its source URL.`
 
 Read the top 2-3 sources it cites. Run the three-layer synthesis:
 - **[Layer 1]** What does everyone already know about this space?
@@ -207,7 +202,7 @@ Read the top 2-3 sources it cites. Run the three-layer synthesis:
 
 If no eureka moment exists, say: "The conventional wisdom seems sound here. Let's build on it." Proceed to Phase 3.
 
-**Important:** This search feeds Phase 3 (Premise Challenge). If you found reasons the conventional approach fails, those become premises to challenge. If conventional wisdom is solid, that raises the bar for any premise that contradicts it.
+Findings feed Phase 3: reasons the conventional approach fails become premises to challenge; solid conventional wisdom raises the bar for any premise that contradicts it.
 
 ---
 
@@ -233,13 +228,19 @@ Use AskUserQuestion to confirm. If the user disagrees with a premise, revise und
 
 ---
 
-{{CODEX_SECOND_OPINION}}
+{{IF_SECTION:second-opinion}}## Phase 3.5: Cross-Model Second Opinion (optional)
+
+Use AskUserQuestion: "Want a second opinion from an independent AI perspective? It reviews your problem statement, key answers, premises and landscape findings from a structured summary, without this conversation. Usually 2-5 minutes." A) Yes, get a second opinion. B) No, proceed to alternatives.
+
+If B: skip Phase 3.5 and remember the second opinion did NOT run (the design doc, founder signals and Phase 4 depend on it).
+If A:
+{{/IF_SECTION}}{{SECTION:second-opinion}}
 
 ---
 
-## Phase 4: Alternatives Generation (MANDATORY)
+## Phase 4: Alternatives Generation
 
-Produce 2-3 distinct implementation approaches. This is NOT optional.
+Produce 2-3 distinct implementation approaches.
 
 For each approach:
 ```
@@ -269,13 +270,14 @@ Rules:
 
 Emit ONE AskUserQuestion that lists every alternative (A/B and optionally C) as numbered options, using the preamble's AskUserQuestion Format section. The AskUserQuestion call is a tool_use, not prose — write the question text and call the tool.
 
-**STOP.** Do NOT proceed to Phase 4.5 (Founder Signal Synthesis), Phase 5 (Design Doc), Phase 6 (Closing), or any design-doc generation until the user responds. A "clearly winning approach" is still an approach decision and still needs explicit user approval before it lands in the design doc. Writing the recommendation in chat prose and continuing forward is the failure mode this gate exists to prevent.
+**STOP.** Do NOT proceed to Phase 4.25, 4.5, 5 or 6, or write any design doc, until the user responds. A "clearly winning approach" still needs explicit approval; writing the recommendation in prose and continuing is the failure this gate prevents.
 
 ---
 
-{{DESIGN_MOCKUP}}
+{{IF_SECTION:visual-design}}## Phase 4.25: Visual design (UI ideas only)
 
-{{DESIGN_SKETCH}}
+If the approach approved in Phase 4 has no user-facing UI (screens, pages, forms, dashboards, interactive elements), skip to Phase 4.5.
+{{/IF_SECTION}}{{SECTION:visual-design}}
 
 ---
 
@@ -293,14 +295,28 @@ Track which of these signals appeared during the session:
 - Showed **agency** — actually building, not just planning
 - **Defended premise with reasoning** against cross-model challenge (kept original premise when Codex disagreed AND articulated specific reasoning for why — dismissal without reasoning does not count)
 
-Count the signals. You'll use this count in Phase 6 to determine which tier of closing message to use.
+Count the signals; Phase 6 uses the count to pick the closing tier.
+
+### Builder Profile Read (before this session is logged)
+
+Read the profile before the append below: a read after it counts this session as history, so a
+first-timer gets the welcome-back closing about an assignment they haven't been given yet.
+
+```bash
+~/.claude/skills/gstack/bin/gstack-builder-profile 2>/dev/null || echo "PROFILE_READ: failed"
+```
+
+Write this line in your reply (it must survive context compaction until Phase 6):
+`Builder profile before this session: PROFILE_READ=ok SESSION_TIER=<TIER> PRIOR_SESSION_COUNT=<SESSION_COUNT> LAST_PROJECT=<LAST_PROJECT> LAST_ASSIGNMENT=<LAST_ASSIGNMENT> CROSS_PROJECT=<true|false>`
+CROSS_PROJECT is true only when LAST_PROJECT is non-empty and differs from this session's SLUG
+(the output's own CROSS_PROJECT compares the two previous sessions). If the output says
+`PROFILE_READ: failed` or has no `TIER:` line, write `PROFILE_READ=failed SESSION_TIER=introduction
+PRIOR_SESSION_COUNT=0` with the rest empty or false.
 
 ### Builder Profile Append
 
-After counting signals, append a session entry to the builder profile. This is the single
-source of truth for all closing state (tier, resource dedup, journey tracking). The
-`gstack-developer-profile --log-session` binary handles its own directory creation
-and writes via atomic mktemp+mv to `~/.gstack/developer-profile.json`.
+After the read above, append a session entry to the builder profile. This is the single
+source of truth for all closing state (tier, resource dedup, journey tracking).
 
 Append one JSON line with these fields (substitute actual values from this session):
 - `date`: current ISO 8601 timestamp
@@ -317,9 +333,7 @@ Append one JSON line with these fields (substitute actual values from this sessi
 ~/.claude/skills/gstack/bin/gstack-developer-profile --log-session '{"date":"TIMESTAMP","mode":"MODE","project_slug":"SLUG","signal_count":N,"signals":SIGNALS_ARRAY,"design_doc":"DOC_PATH","assignment":"ASSIGNMENT_TEXT","resources_shown":[],"topics":TOPICS_ARRAY}' 2>/dev/null || true
 ```
 
-The session entry is appended to `developer-profile.json`'s `sessions[]` array. A second
-session entry with `mode: "resources"` is appended via `--log-session` after resource
-selection in Phase 6 Beat 3.5.
+Phase 6 (Founder Resources) appends a second `mode: "resources"` entry.
 
 ---
 
@@ -329,6 +343,26 @@ selection in Phase 6 Beat 3.5.
 
 Confirm you Read every section the Section index named as applying to this run, and executed it. The conversation phase is section-backed too — if you ran the diagnostic or brainstorm from memory without Reading `sections/phase-2a-startup-diagnostic.md` (startup mode) or `sections/phase-2b-builder-brainstorm.md` (builder mode), the questions lost their teeth. If you produced the design doc or handoff from memory without Reading `sections/design-and-handoff.md`, stop and Read it now.
 
+## Before telemetry: confirm this run's design doc
+
+Check the `~/.gstack` copy this run wrote in Phase 5, by its exact path (never the newest file in
+the folder; another session may have written it):
+
+```bash
+GSTACK_STATE_ROOT=$(~/.claude/skills/gstack/bin/gstack-paths --get GSTACK_STATE_ROOT); : "${GSTACK_STATE_ROOT:?gstack-paths failed; reinstall with ./setup or /gstack-upgrade}"
+DOC="DESIGN_DOC_PATH"
+case "$DOC" in "$GSTACK_STATE_ROOT"/projects/*-design-*.md) [ -s "$DOC" ] && echo "DESIGN_DOC: ok" || echo "DESIGN_DOC: missing" ;; *) echo "DESIGN_DOC: missing" ;; esac
+P="HOST_PLAN_PATH"
+if [ -s "$DOC" ] && [ -f "$P" ]; then
+  [ "$P" -nt "$DOC" ] && ! cmp -s "$P" "$DOC" && cp "$P" "$DOC" && echo "PLAN_COPY: written through"
+  echo "$P" > "$DOC.plan-copy"
+fi
+```
+
+Replace DESIGN_DOC_PATH with that path, or with nothing if no doc was written. In host plan mode, set HOST_PLAN_PATH to the absolute path of the plan file holding this doc, else nothing; its edits are written through to the doc, the source of truth. After `PLAN_COPY: written through`, rewrite any repo copy from the doc (Phase 5 scan rule). OUTCOME is `success`
+only after `DESIGN_DOC: ok`; otherwise use `abort` if the user ended the session, else `error`
+with FAILED_STEP `design_doc`.
+
 ---
 
 {{LEARNINGS_LOG}}
@@ -336,7 +370,7 @@ Confirm you Read every section the Section index named as applying to this run, 
 ## Important Rules
 
 - **Never start implementation.** This skill produces design docs, not code. Not even scaffolding.
-- **Questions ONE AT A TIME.** Never batch multiple questions into one AskUserQuestion.
+- **Questions ONE AT A TIME.** Never batch multiple questions into one AskUserQuestion. Without AskUserQuestion, use `Q<N>` for open-ended questions and `D<N>` for discrete decisions.
 - **The assignment is mandatory.** Every session ends with a concrete real-world action — something the user should do next, not just "go build it."
 - **If user provides a fully formed plan:** skip Phase 2 (questioning) but still run Phase 3 (Premise Challenge) and Phase 4 (Alternatives). Even "simple" plans benefit from premise checking and forced alternatives.
 - **Completion status:**

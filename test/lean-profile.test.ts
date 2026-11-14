@@ -52,6 +52,17 @@ describe('optional lean instruction profile', () => {
         expect(pdfRun.stdout).toContain(`MAKE_PDF_READY: ${pdfBinary}`);
         expect(pdfRun.stdout).toContain('LEAN_PDF_CALLED:generate:fixture.md');
         expect(ship).not.toMatch(/\{\{[A-Z_]+/);
+        // The lean preamble stays inline and short: no hoisted shared preamble, no
+        // onboarding start command, and every folder a curated policy links keeps its SKILL.md.
+        expect(ship).toContain('## Scope and completion');
+        expect(ship).not.toContain('Shared preamble (load first)');
+        expect(ship).not.toContain('gstack-skill-start');
+        // ActVox fork: one local-only completion line keeps the local usage log
+        // alive in lean renders (no lease, sync or remote telemetry).
+        expect(ship).toContain('## Completion (run last)');
+        expect(ship).toMatch(/\/bin\/gstack-skill-end --local-only --skill '(gstack-)?ship' --outcome success/);
+        expect(fs.existsSync(path.join(path.dirname(skill('ship')), 'sections', 'preamble.md'))).toBe(false);
+        expect(fs.existsSync(skill('plan-eng-review'))).toBe(true);
         const links = [...ship.matchAll(/\]\(([^)]+\/sections\/[^)]+\.md)\)/g)].map(m => m[1]);
         expect(links.length).toBeGreaterThan(0);
         for (const link of links) {

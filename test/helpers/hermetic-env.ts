@@ -24,6 +24,9 @@
  *      + DISABLE_AUTOUPDATER=1 (pinned in both branches; the scrub drops the
  *        workflow's copy and every PTY screen otherwise shows the updater's
  *        "no write permission to npm prefix" failure)
+ *      + GH_TELEMETRY=0 (gh 2.103 records a telemetry device-id under
+ *        $HOME/.local/state/gh, a stray write in every fixture HOME; run
+ *        42371706491's autoplan-ceo-only)
  *      + per-test overrides spread LAST
  *
  * Escape hatch: EVALS_HERMETIC=0 restores the legacy contaminated env
@@ -71,14 +74,26 @@ const ALLOW_EXACT = new Set([
  * VOYAGE_API_KEY) — CI doesn't have them and eval children have no business
  * using them. A test that legitimately needs one opts in via its own env
  * override; a provider runner (codex/gemini) re-admits its auth vars via
- * opts.extraAllow. Prefix matches reject credential-shaped suffixes; exact
+ * opts.extraAllow. Prefix matches reject credential-shaped segments; exact
  * and explicit runner admissions still win. */
 const ALLOW_PREFIXES = ['EVALS_', 'GITHUB_'];
-const CREDENTIAL_SUFFIXES = new Set([
+const CREDENTIAL_SEGMENTS = new Set([
   'KEY', 'KEYS', 'TOKEN', 'TOKENS', 'SECRET', 'SECRETS', 'PASSWORD', 'PASSWD',
   'PASS', 'CREDENTIAL', 'CREDENTIALS', 'AUTH', 'PAT', 'DSN', 'COOKIE',
   'SESSION', 'PRIVATE',
 ]);
+
+/**
+ * True when any underscore-separated segment of `name` is a credential word.
+ * Every segment, not just the last: a trailing qualifier moves the credential
+ * word off the end (`GITHUB_APP_PRIVATE_KEY_BASE64` is the PEM itself,
+ * `GITHUB_TOKEN_1` is a token). Segments, not substrings: `GITHUB_PATH`
+ * contains "PAT" and `GITHUB_TOKENIZER` contains "TOKEN", and both are
+ * metadata.
+ */
+function isCredentialShapedName(name: string): boolean {
+  return name.toUpperCase().split('_').some((segment) => CREDENTIAL_SEGMENTS.has(segment));
+}
 
 export interface HermeticEnvOpts {
   /** Per-runner additional allowed names (exact match) or prefixes (entries
@@ -126,13 +141,13 @@ export function buildHermeticEnv(
     const allowed =
       ALLOW_EXACT.has(k) ||
       extraExact.has(k) ||
-      (ALLOW_PREFIXES.some((p) => k.startsWith(p)) &&
-        !CREDENTIAL_SUFFIXES.has(k.slice(k.lastIndexOf('_') + 1).toUpperCase())) ||
+      (ALLOW_PREFIXES.some((p) => k.startsWith(p)) && !isCredentialShapedName(k)) ||
       extraPrefixes.some((p) => k.startsWith(p));
     if (allowed) out[k] = v;
   }
   if (!out.TERM) out.TERM = 'xterm-256color';
   out.DISABLE_AUTOUPDATER = '1';
+  out.GH_TELEMETRY = '0';
   Object.assign(out, hermeticVars);
   for (const [k, v] of Object.entries(overrides ?? {})) if (v !== undefined) out[k] = v;
   return out;
@@ -350,7 +365,7 @@ export function seedHermeticRuntimeView(root: string, destination: string): void
   const sourceRoot = fs.realpathSync(root);
   const excluded = new Set(['node_modules', 'test', 'tests']);
   const roots = new Set([
-    'SKILL.md', 'ETHOS.md', 'VERSION', 'package.json', 'bin', 'lib', 'scripts',
+    'SKILL.md', 'ETHOS.md', 'VERSION', 'package.json', 'bin', 'lib', 'scripts', 'crew',
     'browse', 'browser-skills', 'design', 'extension', 'model-overlays', 'agents',
     // On-demand protocol/reference files explicitly read by shipped skills.
     'docs/askuserquestion-split.md', 'docs/askuserquestion-cjk.md',
@@ -536,7 +551,7 @@ export function hermeticChildEnv(
   const dirs = getHermeticDirs();
   return buildHermeticEnv(
     process.env,
-    { CLAUDE_CONFIG_DIR: dirs.configDir, GSTACK_HOME: dirs.gstackHome },
+    { CLAUDE_CONFIG_DIR: dirs.configDir, GSTACK_HOME: dirs.gstackHome, GSTACK_LEASE_DIR: path.join(dirs.runRoot, 'gstack-leases') },
     overrides,
     opts,
   );

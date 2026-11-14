@@ -25,8 +25,34 @@ const ROOT = path.resolve(import.meta.dir, '..', '..');
 
 export const QA_ASSET_BLOCKER = 'If missing or unreadable, report a QA setup blocker and its affected probes as blocked; continue other safe probes (independent functional/static checks). Missing/unreadable assets block required QA.';
 
+/** Skills carved on every host: QA (portable assets), those whose external
+ * render would exceed SKILL_BYTE_CEILING inlined (C4, #2777), and design-review,
+ * whose on-demand craft audit stays out of every skeleton (GSTA-92). */
+const CARVED_ON_EVERY_HOST = ['qa', 'qa-only', 'ship', 'plan-ceo-review', 'office-hours', 'design-review'];
+
+/** Hosts read at most this many UTF-8 bytes of one SKILL.md (~40K tokens). */
+export const SKILL_BYTE_CEILING = 160_000;
+
 export function usesLazySections(host: Host, skill: string): boolean {
-  return host === 'claude' || skill === 'qa' || skill === 'qa-only';
+  return host === 'claude' || CARVED_ON_EVERY_HOST.includes(skill);
+}
+
+/**
+ * External hosts: a template's literal `~/.claude/skills/gstack/<skill>/sections/<file>`
+ * reference arrives here as `$GSTACK_ROOT/...` or `~/<globalRoot>/...`, and external
+ * runtime roots have no section trees. For a carved skill, point it at the installed copy;
+ * for this skill's own section inlined by {{SECTION}}, point at the inlined text.
+ */
+export function rewriteCarvedSectionRefs(content: string, ctx: TemplateContext): string {
+  if (ctx.host === 'claude') return content;
+  // The root arrives as $GSTACK_ROOT or as the host's literal ~/<globalRoot> (path rewrites).
+  return content.replace(/`(?:\$GSTACK_ROOT|~\/[\w./-]*?skills\/gstack)\/([a-z0-9-]+)\/sections\/([A-Za-z0-9._-]+)`/g, (match, skill: string, file: string) => {
+    if (!fs.existsSync(path.join(ROOT, skill, 'sections', `${file}.tmpl`))) return match;
+    if (usesLazySections(ctx.host, skill)) return `\`sections/${file}\` relative to the installed \`gstack-${skill}\` SKILL.md directory`;
+    const entry = loadManifest(skill).sections.find(e => e.file === file);
+    const inlined = skill === ctx.skillName && entry && fs.readFileSync(path.join(ROOT, skill, 'SKILL.md.tmpl'), 'utf-8').includes(`{{SECTION:${entry.id}}}`);
+    return inlined ? `the \`${file.replace(/\.md$/, '')}\` section inlined in this SKILL.md` : match;
+  });
 }
 
 interface SectionEntry {
@@ -34,6 +60,10 @@ interface SectionEntry {
   file: string;
   title: string;
   trigger: string;
+  /** Plan B4: read by bin/gstack-autoplan alone; interactive renders ignore it. Default `always`. */
+  scope?: 'always' | 'ui' | 'dx' | 'db' | 'perf' | 'security' | 'incident';
+  /** Plan B4: a runner-profile section (the checklist) stays out of the Section index. */
+  runner_only?: boolean;
 }
 interface SectionManifest {
   skill: string;
@@ -54,11 +84,17 @@ function findSection(skill: string, id: string): SectionEntry {
   return entry;
 }
 
+/**
+ * Pointer to a carved section file. Claude keeps its global-root path; QA and
+ * every external host point relative to the installed skill directory, because
+ * external runtime roots (`$GSTACK_ROOT`) carry no `<skill>/sections/` tree
+ * while setup links or copies whole skill directories.
+ */
 export function sectionPath(ctx: TemplateContext, skill: string, id: string): string {
   const entry = findSection(skill, id);
-  if (skill === 'qa' || skill === 'qa-only') {
+  if (ctx.host !== 'claude' || skill === 'qa' || skill === 'qa-only') {
     fs.accessSync(path.join(ROOT, skill, 'sections', `${entry.file}.tmpl`), fs.constants.R_OK);
-    const installedName = ctx.host === 'claude' ? `\`${skill}\`/\`gstack-${skill}\`` : `\`gstack-${skill}\``;
+    const installedName = ctx.host === 'claude' ? `\`${skill}\`/\`gstack-${skill}\`` : `\`${skill.startsWith('gstack-') ? skill : `gstack-${skill}`}\``;
     return `\`sections/${entry.file}\` relative to the installed ${installedName} SKILL.md directory`;
   }
   return `\`${ctx.paths.skillRoot}/${skill}/sections/${entry.file}\``;
@@ -72,6 +108,9 @@ export const SECTION: ResolverFn = (ctx: TemplateContext, args?: string[]): stri
   const id = args?.[0];
   if (!id) throw new Error('{{SECTION:id}} requires a section id');
   const entry = findSection(ctx.skillName, id);
+  if (ctx.modules?.excluded.has(`section:${ctx.skillName}/${id}`)) {
+    return `> Not loaded in the ${ctx.modules!.name} loadout: skip ${entry.trigger}. Do not offer it, and treat it as not run.`;
+  }
 
   if (ctx.instructionProfile === 'lean') {
     if (!ctx.sectionRoot) throw new Error('Lean sections require an output root');
@@ -98,6 +137,21 @@ export const SECTION: ResolverFn = (ctx: TemplateContext, args?: string[]): stri
   return fs.readFileSync(tmplPath, 'utf-8').trimEnd();
 };
 
+const SECTION_GUARD_RE = /\{\{IF_SECTION:([a-z0-9-]+)\}\}([\s\S]*?)\{\{\/IF_SECTION\}\}/g;
+
+/**
+ * {{IF_SECTION:id}}…{{/IF_SECTION}}: skeleton text that belongs to one of this
+ * skill's sections (an offer, a self-check naming it). The markers vanish and
+ * the text stays when the section loads, so `full` bytes are unchanged; a
+ * loadout that excludes the section drops the text with it.
+ */
+export function applySectionGuards(content: string, ctx: TemplateContext): string {
+  return content.replace(SECTION_GUARD_RE, (_match, id: string, inner: string) => {
+    findSection(ctx.skillName, id);
+    return ctx.modules?.excluded.has(`section:${ctx.skillName}/${id}`) ? '' : inner;
+  });
+}
+
 /**
  * {{SECTION_INDEX:skill}} — situation→section table from the passive manifest.
  * Lazy skills only; an index would be noise for inlined skills.
@@ -118,6 +172,7 @@ export const SECTION_INDEX: ResolverFn = (ctx: TemplateContext, args?: string[])
     '|------|-------------------|',
   ];
   for (const s of manifest.sections) {
+    if (s.runner_only || ctx.modules?.excluded.has(`section:${skill}/${s.id}`)) continue;
     const reference = skill === 'qa' || skill === 'qa-only' ? sectionPath(ctx, skill, s.id) : `\`sections/${s.file}\``;
     if (skill === 'review' && s.id === 'review-army') {
       lines.push(`| Select surfaces and read QA methods | Inline in [Step 4](#step-4-critical-pass-core-review); setup and probes run in Step 4.7 |`);

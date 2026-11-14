@@ -12,21 +12,27 @@ const WORKFLOWS = path.resolve(import.meta.dir, '..', '.github', 'workflows');
 const DOCKERFILE = path.resolve(import.meta.dir, '..', '.github', 'docker', 'Dockerfile.ci');
 
 describe('ActVox CI runner policy', () => {
-  test('no workflow references unprovisioned Ubicloud runners', () => {
+  test('no workflow job runs on an unprovisioned Ubicloud runner by default', () => {
+    // Upstream keeps Ubicloud names in comments and as an explicit free_runner
+    // dispatch override. The fork invariant is the effective default: no job's
+    // `runs-on` and no default runner constant may name one.
+    const assigned = /^\s*(?:runs-on|FREE_SUITE_RUNNER):\s*["']?ubicloud-/m;
     const offenders = fs.readdirSync(WORKFLOWS)
       .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
-      .filter((name) => fs.readFileSync(path.join(WORKFLOWS, name), 'utf8').includes('ubicloud-standard-'));
+      .filter((name) => assigned.test(fs.readFileSync(path.join(WORKFLOWS, name), 'utf8')));
 
-    expect(offenders, `unprovisioned Ubicloud references: ${offenders.join(', ')}`).toEqual([]);
+    expect(offenders, `unprovisioned Ubicloud runner assignments: ${offenders.join(', ')}`).toEqual([]);
   });
 
   test('the required free-tests lane uses a GitHub-hosted Linux runner', () => {
     const source = fs.readFileSync(path.join(WORKFLOWS, 'free-tests.yml'), 'utf8');
-    const freeSuite = source.split('\n  free-suite:\n')[1]!.split('\n  free-tests:\n')[0]!;
-    expect(source).toContain('runs-on: ubuntu-latest');
-    expect(source).toContain('GSTACK_FREE_JOBS: "1"');
-    expect(source).toContain('GSTACK_FREE_RETRY_FLAKY: "1"');
-    expect(freeSuite).toContain('timeout-minutes: 35');
+    const freeSuite = source.split('\n  free-suite:\n')[1]!.split(/^  [a-zA-Z0-9_-]+:\n/m)[0]!;
+    expect(source).toMatch(/^  FREE_SUITE_RUNNER: ubuntu-latest$/m);
+    // The shard runner and its timeout now come from the free-plan job (upstream #3850).
+    expect(freeSuite).toContain('runs-on: ${{ needs.free-plan.outputs.runner }}');
+    expect(freeSuite).toMatch(/^    timeout-minutes: \S/m);
+    expect(freeSuite).toContain('GSTACK_FREE_JOBS: "1"');
+    expect(freeSuite).toContain('GSTACK_FREE_RETRY_FLAKY: "1"');
   });
 
   test('the CI image keeps Ubuntu sources reachable from GitHub-hosted runners', () => {
@@ -48,9 +54,9 @@ describe('ActVox CI runner policy', () => {
   });
 
   test('paid eval jobs stay disabled until ActVox explicitly provisions credentials', () => {
-    for (const name of ['evals.yml', 'evals-periodic.yml', 'evals-marathon.yml']) {
+    for (const name of ['evals.yml', 'evals-periodic.yml', 'evals-marathon.yml', 'eval-sweep.yml']) {
       const source = fs.readFileSync(path.join(WORKFLOWS, name), 'utf8');
-      const jobStarts = [...source.matchAll(/^  (build-image|evals|plan-slices|eval-slices|gate-census|report|slices-report):\n/gm)];
+      const jobStarts = [...source.matchAll(/^  (build-image|evals|plan-slices|eval-slices|eval-codex-slices|eval-rerun|train-bisect|schema-canary|gate-census|report|slices-report|image|sweep):\n/gm)];
       expect(jobStarts.length, `${name}: paid job census unexpectedly empty`).toBeGreaterThan(0);
       for (const match of jobStarts) {
         const rest = source.slice(match.index + match[0].length);

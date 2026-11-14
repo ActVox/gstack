@@ -262,7 +262,7 @@ test.each([
   [reviewStartLead, reviewStartLabels, 2],
   ['D1 — No design doc found: run /office-hours before the review?', ['Run /office-hours now', 'Skip — proceed with review (Recommended)'], 2],
   [reviewStartLead, ['Skip — standard review', 'Run /office-hours first'], 1],
-  ...['Example: ', 'If approved: ', 'Do not ', '> ', '    ', '"', '`'].map(prefix => [prefix + reviewStartLead, reviewStartLabels, 1]),
+  ...['Example: ', 'If approved: ', 'Do not ', '> ', '    ', '"', '`'].map(prefix => [prefix + reviewStartLead, reviewStartLabels, 1] as const),
   ['D1 — Discuss /office-hours in our documentation?', reviewStartLabels, 1],
   ['D1 — Run /office-hours instead of this review?', reviewStartLabels, 1],
   [reviewStartLead, ['Run /office-hours first', 'Skip'], 1],
@@ -291,6 +291,43 @@ test.each([
   expect(pickSuppliedCeoPlanStart({ options })).toBe(expected);
 });
 
+describe('F2: design-doc discovery prefers docs/designs over a root DESIGN.md (#2839)', () => {
+  function discover(files: Record<string, string>): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'design-doc-f2-'));
+    try {
+      const cwd = path.join(root, 'project');
+      const home = path.join(root, 'home');
+      fs.mkdirSync(cwd); fs.mkdirSync(home);
+      // The block runs the installed bin/gstack-design-doc-find.
+      const installed = path.join(home, '.claude/skills/gstack/bin');
+      fs.mkdirSync(installed, { recursive: true });
+      for (const bin of ['gstack-design-doc-find', 'gstack-paths', 'gstack-state-root.sh']) {
+        fs.copyFileSync(path.join(import.meta.dir, '..', 'bin', bin), path.join(installed, bin));
+        fs.chmodSync(path.join(installed, bin), 0o755);
+      }
+      execFileSync('git', ['init', '-q', '-b', 'main'], { cwd, timeout: 30_000 });
+      for (const [rel, body] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(cwd, rel)), { recursive: true });
+        fs.writeFileSync(path.join(cwd, rel), body);
+      }
+      // The design system is the newest file, so mtime alone would pick it.
+      if (files['DESIGN.md']) fs.utimesSync(path.join(cwd, 'DESIGN.md'), new Date(), new Date(Date.now() + 60_000));
+      return execFileSync('bash', ['-c', `SLUG=fixture; BRANCH=main; ${DESIGN_DOC_DISCOVERY_BLOCK}`], {
+        cwd, env: { PATH: process.env.PATH!, HOME: home }, encoding: 'utf8', timeout: 10_000,
+      }).replace(fs.realpathSync(cwd), '<repo>').replace(cwd, '<repo>');
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+
+  test('a feature doc in docs/designs/ wins over a newer root DESIGN.md', () => {
+    expect(discover({ 'DESIGN.md': '# Design system\ncolors: {}\n', 'docs/designs/pricing.md': '# Pricing design\n' }))
+      .toBe('Design doc found: <repo>/docs/designs/pricing.md\n');
+  });
+
+  test('a root DESIGN.md alone is a design system, not a design doc', () => {
+    expect(discover({ 'DESIGN.md': '# Design system\n' })).toBe('No design doc found\n');
+  });
+});
+
 describe('CEO finding fixture establishes scope before launch', () => {
   test('a supplied design satisfies actual prerequisite discovery without becoming a branch change', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ceo-design-seed-'));
@@ -301,11 +338,12 @@ describe('CEO finding fixture establishes scope before launch', () => {
       const plan = '# Export saved settings\nReview the CSV formatter before implementation.\n';
       const design = '# Settings export design\n\n## Problem\nOperators need saved settings in a spreadsheet for offline comparison.\n\n## Approach\nReuse the settings API and escape commas, quotes, and newlines in a CSV formatter.\n';
       seedCeoFindingProject(cwd, plan, design);
-      const output = execFileSync('bash', ['-c', `SLUG=fixture; BRANCH=main; ${DESIGN_DOC_DISCOVERY_BLOCK}`], {
+      const block = DESIGN_DOC_DISCOVERY_BLOCK.replaceAll('~/.claude/skills/gstack/bin/', `${path.resolve(import.meta.dir, '..')}/bin/`);
+      const output = execFileSync('bash', ['-c', `SLUG=fixture; BRANCH=main; ${block}`], {
         cwd, env: { PATH: process.env.PATH!, HOME: home }, encoding: 'utf8', timeout: 10_000,
       });
-      expect(output).toBe(`Design doc found: ${path.join(cwd, 'DESIGN.md')}\n`);
-      expect(execFileSync('git', ['show', 'HEAD:DESIGN.md'], { cwd, encoding: 'utf8', timeout: 30_000 })).toBe(design);
+      expect(output).toBe(`Design doc found: ${path.join(cwd, 'docs', 'designs', 'feature-design.md')}\n`);
+      expect(execFileSync('git', ['show', 'HEAD:docs/designs/feature-design.md'], { cwd, encoding: 'utf8', timeout: 30_000 })).toBe(design);
       expect(execFileSync('git', ['show', 'HEAD:review-input.md'], { cwd, encoding: 'utf8', timeout: 30_000 })).toBe(plan);
       expect(execFileSync('git', ['status', '--porcelain'], { cwd, encoding: 'utf8', timeout: 30_000 })).toBe('');
       expect(execFileSync('git', ['diff', 'origin/main...HEAD'], { cwd, encoding: 'utf8', timeout: 30_000 })).toBe('');
@@ -346,7 +384,7 @@ describe('CEO finding fixture establishes scope before launch', () => {
       expect(fs.readFileSync(path.join(cwd, 'CLAUDE.md'), 'utf8')).toContain('Read it before\nchoosing review scope');
       fs.writeFileSync(path.join(state, 'config.yaml'), 'update_check: false\nrouting_declined: false\n');
       const output = execFileSync(path.join(ROOT, 'bin', 'gstack-skill-start'), ['--skill', 'plan-ceo-review'], {
-        cwd, env: { PATH: process.env.PATH!, HOME: home, GSTACK_HOME: state }, encoding: 'utf8', timeout: 10_000,
+        cwd, env: { PATH: process.env.PATH!, HOME: home, GSTACK_HOME: state, GSTACK_LEASE_DIR: path.join(state, 'gstack-leases') }, encoding: 'utf8', timeout: 10_000,
       });
       expect(output).toContain('HAS_ROUTING: yes');
       expect(output).not.toContain('GSTACK_INSTRUCTION_BEGIN: routing-injection');

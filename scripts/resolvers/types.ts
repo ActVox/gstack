@@ -115,6 +115,39 @@ export interface TemplateContext {
    * Terse builds make the compression structural — bytes never ship in the first place.
    */
   explainLevel?: 'default' | 'terse';
+  /**
+   * Install-context render contract (docs/ADDING_A_HOST.md): absolute install
+   * root a per-install render serves (`gen-skill-docs --install-root`).
+   * null/undefined = the host's default root (committed render, unchanged bytes).
+   */
+  installRoot?: string | null;
+  /**
+   * Plan-mode preamble block. Defaults to true (block ships).
+   * false (opt-in via `--plan-mode=off`): the "## Plan Mode Safe Operations" +
+   * "## Skill Invocation During Plan Mode" section is dropped from the
+   * preamble. "PLAN MODE EXCEPTION — ALWAYS RUN" markers inside skill bodies
+   * still apply.
+   */
+  planMode?: boolean;
+  /**
+   * Module loadout filter (modules/loadouts.json, gen-skill-docs --loadout/--modules).
+   * Undefined = the `full` loadout: every module renders and committed bytes are unchanged.
+   */
+  modules?: ModuleFilter;
+}
+
+/** A resolved loadout: which module ids it leaves out, and which ids can never be left out. */
+export interface ModuleFilter {
+  /** Loadout name, or `adhoc` for a --modules spec. */
+  name: string;
+  excluded: ReadonlySet<string>;
+  pinned: ReadonlySet<string>;
+  /** Unpinned preamble pieces render as if the skill's preamble-tier were at most this. */
+  preambleTierMax?: number;
+  /** The model an automatic selection was made for; the start line tells any other model to read fullRoot instead. */
+  boundModel?: string;
+  /** Absolute root of the full install that holds <skill>/SKILL.md. */
+  fullRoot?: string;
 }
 
 /** Resolver function signature. args is populated for parameterized placeholders like {{INVOKE_SKILL:name}}. */

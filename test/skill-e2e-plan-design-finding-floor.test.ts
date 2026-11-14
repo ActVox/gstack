@@ -1,7 +1,9 @@
 /**
  * /plan-design-review AskUserQuestion floor regression (periodic, paid, real-PTY).
  *
- * See test/skill-e2e-plan-eng-finding-floor.test.ts for the contract.
+ * Contract: a seeded forcing finding must fire at least one AskUserQuestion
+ * before the review writes its plan or exits plan mode (the /plan-eng-review
+ * floor that first pinned it retired with that skill, GST-1698).
  */
 
 import { test } from 'bun:test';
@@ -9,6 +11,7 @@ import { CAPTURE_LONG_MS, PTY_MS } from './helpers/eval-budgets';
 import { describeE2ETier } from './helpers/e2e-gate';
 import { runPlanSkillFloorCheck } from './helpers/claude-pty-runner';
 import { FORCING_FLOOR_DESIGN } from './fixtures/forcing-finding-seeds';
+import { pickDesignFocusAll } from './fixtures/design-floor-focus-picker';
 import { seedPlanReviewProject } from './helpers/ceo-finding-fixture';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -33,6 +36,7 @@ describeE2E('/plan-design-review AskUserQuestion floor (periodic)', () => {
           cwd: project,
           timeoutMs: CAPTURE_LONG_MS,
           env: { QUESTION_TUNING: 'false', EXPLAIN_LEVEL: 'default' },
+          pickSetupChoice: pickDesignFocusAll,
         });
 
         if (obs.outcome !== 'auq_observed') {

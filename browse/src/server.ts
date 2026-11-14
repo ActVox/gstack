@@ -14,6 +14,7 @@
  */
 
 import { BrowserManager, markDaemonProcess } from './browser-manager';
+import { runInRequestTab } from './session-tabs';
 import { handleReadCommand, hasOutArg } from './read-commands';
 import { handleWriteCommand } from './write-commands';
 import { handleMetaCommand } from './meta-commands';
@@ -46,9 +47,10 @@ import {
 } from './port-allocator';
 import { acquireAgentStateLock, readAgentRecord, clearAgentRecord, isOurAgent, isAgentRecordLive, isAgentRecordGone, stopAgentByRecord, spawnTerminalAgent } from './terminal-agent-control';
 import { isProcessAlive } from './error-handling';
+import { allowedExtensionOrigin } from './extension-id';
 import { sanitizeBody, stripLoneSurrogates } from './sanitize';
 import { startSocksBridge, testUpstream, type BridgeHandle } from './socks-bridge';
-import { parseProxyConfig, toUpstreamConfig, ProxyConfigError } from './proxy-config';
+import { parseProxyConfig, toUpstreamConfig, ProxyConfigError, serverProxyEnv, directProxyLogLine } from './proxy-config';
 import { writeReceipt } from '../../lib/egress-receipt';
 import { redactProxyUrl } from './proxy-redact';
 import { type XvfbHandle } from './xvfb';
@@ -154,6 +156,7 @@ let tunnelActive = false;
 let tunnelUrl: string | null = null;
 let tunnelListener: any = null;           // ngrok listener handle
 let tunnelServer: ReturnType<typeof Bun.serve> | null = null; // tunnel HTTP listener
+let tunnelStarting: Promise<StartTunnelResult> | null = null;
 
 export type { Surface };
 
@@ -296,15 +299,11 @@ const TUNNEL_PATHS = new Set<string>([
 ]);
 
 /**
- * The gstack sidebar extension's pinned Chrome extension ID. Derived from
- * the "key" field in extension/manifest.json (first 16 bytes of SHA-256 of
- * the DER public key, hex nibbles mapped 0-9a-f → a-p). Reproduce with:
- *   bun browse/scripts/extension-id.ts
- * POST /extension-token releases AUTH_TOKEN only to an Origin of exactly
- * `chrome-extension://<this id>`. If the manifest keypair is ever rotated,
- * this constant must be updated in the same commit.
+ * POST /extension-token releases AUTH_TOKEN only to an Origin of exactly the
+ * pinned extension, or the one set with `gstack-config set browse_extension_id`
+ * (browse/src/extension-id.ts, shared with the terminal agent's /ws gate).
  */
-export const GSTACK_EXTENSION_ID = 'dgbkdbjebeiblbajiilljmhjdpmiglep';
+export { GSTACK_EXTENSION_ID } from './extension-id';
 
 /**
  * The extension-origin auth check (POST /extension-token): Origin is exactly
@@ -320,7 +319,7 @@ function isPinnedExtensionRequest(req: Request): boolean {
   } catch (err) {
     if (!(err instanceof TypeError)) throw err;  // TypeError = malformed Host
   }
-  const originOk = req.headers.get('origin') === `chrome-extension://${GSTACK_EXTENSION_ID}`;
+  const originOk = req.headers.get('origin') === allowedExtensionOrigin();
   const hostOk = hostname === '127.0.0.1' || hostname === 'localhost';
   return originOk && hostOk;
 }
@@ -402,8 +401,14 @@ type StartTunnelResult =
  *
  * On success, sets the module tunnel state (tunnelListener / tunnelUrl /
  * tunnelServer / tunnelActive) and records the tunnel in the state file.
+ * Concurrent calls from either caller share the one in-flight start.
  */
-async function startTunnel(opts: {
+async function startTunnel(opts: Parameters<typeof openTunnel>[0]): Promise<StartTunnelResult> {
+  tunnelStarting ??= openTunnel(opts).finally(() => { tunnelStarting = null; });
+  return tunnelStarting;
+}
+
+async function openTunnel(opts: {
   fetchHandler: (req: Request, server: any) => Promise<Response>;
   authtoken: string;
   consent: string;
@@ -469,6 +474,9 @@ async function startTunnel(opts: {
     try { if (tunnelListener) await tunnelListener.close(); } catch {}
     try { boundTunnel.stop(true); } catch {}
     tunnelListener = null;
+    tunnelServer = null;
+    tunnelUrl = null;
+    tunnelActive = false;
     return { ok: false, stage: 'ngrok', error: err };
   }
 }
@@ -610,7 +618,7 @@ function generateHelpText(): string {
 }
 
 // ─── Buffer (from buffers.ts) ────────────────────────────────────
-import { consoleBuffer, networkBuffer, dialogBuffer, addConsoleEntry, addNetworkEntry, addDialogEntry, type LogEntry, type NetworkEntry, type DialogEntry } from './buffers';
+import { consoleBuffer, networkBuffer, dialogBuffer, addConsoleEntry, addNetworkEntry, addDialogEntry, formatDialogLogLine, formatNetworkLogLine, type LogEntry, type NetworkEntry, type DialogEntry } from './buffers';
 
 export { consoleBuffer, networkBuffer, dialogBuffer, addConsoleEntry, addNetworkEntry, addDialogEntry, type LogEntry, type NetworkEntry, type DialogEntry };
 
@@ -666,10 +674,7 @@ async function flushBuffers() {
     const newNetworkCount = networkBuffer.totalAdded - lastNetworkFlushed;
     if (newNetworkCount > 0) {
       const entries = networkBuffer.last(Math.min(newNetworkCount, networkBuffer.length));
-      const lines = entries.map(e =>
-        `[${new Date(e.timestamp).toISOString()}] ${e.method} ${e.url} → ${e.status || 'pending'} (${e.duration || '?'}ms, ${e.size || '?'}B)`
-      ).join('\n') + '\n';
-      appendSecureFile(NETWORK_LOG_PATH, lines);
+      appendSecureFile(NETWORK_LOG_PATH, entries.map(formatNetworkLogLine).join('\n') + '\n');
       lastNetworkFlushed = networkBuffer.totalAdded;
     }
 
@@ -677,10 +682,7 @@ async function flushBuffers() {
     const newDialogCount = dialogBuffer.totalAdded - lastDialogFlushed;
     if (newDialogCount > 0) {
       const entries = dialogBuffer.last(Math.min(newDialogCount, dialogBuffer.length));
-      const lines = entries.map(e =>
-        `[${new Date(e.timestamp).toISOString()}] [${e.type}] "${e.message}" → ${e.action}${e.response ? ` "${e.response}"` : ''}`
-      ).join('\n') + '\n';
-      appendSecureFile(DIALOG_LOG_PATH, lines);
+      appendSecureFile(DIALOG_LOG_PATH, entries.map(formatDialogLogLine).join('\n') + '\n');
       lastDialogFlushed = dialogBuffer.totalAdded;
     }
   } catch (err: any) {
@@ -742,6 +744,7 @@ export const __testInternals__ = {
   // need shutdown to fire. Without this, the second test's shutdown
   // returns early at the `if (isShuttingDown) return;` guard.
   resetShutdownState: () => { isShuttingDown = false; },
+  get browserManager() { return browserManager; }, handleCommandInternal, // tab-external-close.test.ts drives real dispatch
 };
 
 // ─── Parent-Process Watchdog ────────────────────────────────────────
@@ -970,11 +973,11 @@ interface CommandResult {
  *   chainDepth: recursion guard — reject nested chains (depth > 0 means inside a chain)
  */
 async function handleCommandInternalImpl(
-  body: { command: string; args?: string[]; tabId?: number },
+  body: { command: string; args?: string[] },
   tokenInfo?: TokenInfo | null,
   opts?: { skipRateCheck?: boolean; skipActivity?: boolean; chainDepth?: number },
 ): Promise<CommandResult> {
-  const { args = [], tabId } = body;
+  const { args = [] } = body;
   const rawCommand = body.command;
 
   if (!rawCommand) {
@@ -1051,17 +1054,7 @@ async function handleCommandInternalImpl(
     if (!opts?.skipRateCheck && tokenInfo.token) recordCommand(tokenInfo.token);
   }
 
-  // Pin to a specific tab if requested (set by BROWSE_TAB env var, e.g. per-tab agent contexts).
-  // This prevents parallel agents from interfering with each other's tab context.
-  // Safe because Bun's event loop is single-threaded — no concurrent handleCommand.
-  let savedTabId: number | null = null;
-  if (tabId !== undefined && tabId !== null) {
-    savedTabId = browserManager.getActiveTabId();
-    // bringToFront: false — internal tab pinning must NOT steal window focus
-    try { browserManager.switchTab(tabId, { bringToFront: false }); } catch (err: any) {
-      console.warn('[browse] Failed to pin tab', tabId, ':', err.message);
-    }
-  }
+  // Pin to a specific tab: runInRequestTab (session-tabs.ts) already bound this request's tab (#1961).
 
   // ─── Tab ownership check (own-only tokens / pair-agent isolation) ──
   //
@@ -1072,7 +1065,7 @@ async function handleCommandInternalImpl(
   //
   // Skip for `newtab` — it creates a tab rather than accessing one.
   if (command !== 'newtab' && tokenInfo && tokenInfo.clientId !== 'root' && tokenInfo.tabPolicy === 'own-only') {
-    const targetTab = tabId ?? browserManager.getActiveTabId();
+    const targetTab = browserManager.getActiveTabId();
     if (!browserManager.checkTabAccess(targetTab, tokenInfo.clientId, { isWrite: isWriteInvocation(command, args), ownOnly: true })) {
       return {
         status: 403, json: true,
@@ -1123,7 +1116,7 @@ async function handleCommandInternalImpl(
   try {
     let result: string;
 
-    const session = browserManager.getActiveSession();
+    const tabWarning = await browserManager.ensureCommandTab(command);
 
     // Per-request warnings collected during hidden-element detection,
     // surfaced into the envelope the LLM sees. Carries across the read
@@ -1131,6 +1124,7 @@ async function handleCommandInternalImpl(
     let hiddenContentWarnings: string[] = [];
 
     if (READ_COMMANDS.has(command)) {
+      const session = browserManager.getActiveSession();
       const isScoped = tokenInfo && tokenInfo.clientId !== 'root';
       // Hidden-element / ARIA-injection detection for every scoped
       // DOM-reading channel (text, html, links, forms, accessibility,
@@ -1165,7 +1159,8 @@ async function handleCommandInternalImpl(
         result = await handleReadCommand(command, args, session, browserManager);
       }
     } else if (WRITE_COMMANDS.has(command)) {
-      result = await handleWriteCommand(command, args, session, browserManager);
+      const session = browserManager.getActiveSession();
+      result = await browserManager.failIfNavigationBlocked(session.getPage(), handleWriteCommand(command, args, session, browserManager));
     } else if (META_COMMANDS.has(command)) {
       // Pass chain depth + executeCommand callback so chain routes subcommands
       // through the full security pipeline (scope, domain, tab, wrapping).
@@ -1268,7 +1263,7 @@ async function handleCommandInternalImpl(
       ts: new Date().toISOString(),
       cmd: command,
       aliasOf: isAliased ? rawCommand : undefined,
-      args: args.join(' '),
+      args,
       origin: browserManager.getCurrentUrl(),
       durationMs: successDuration,
       status: 'ok',
@@ -1277,21 +1272,8 @@ async function handleCommandInternalImpl(
     });
 
     browserManager.resetFailures();
-    // Restore original active tab if we pinned to a specific one
-    if (savedTabId !== null) {
-      try { browserManager.switchTab(savedTabId, { bringToFront: false }); } catch (restoreErr: any) {
-        console.warn('[browse] Failed to restore tab after command:', restoreErr.message);
-      }
-    }
-    return { status: 200, result };
+    return { status: 200, result: tabWarning ? `${tabWarning}\n${result}` : result };
   } catch (err: any) {
-    // Restore original active tab even on error
-    if (savedTabId !== null) {
-      try { browserManager.switchTab(savedTabId, { bringToFront: false }); } catch (restoreErr: any) {
-        console.warn('[browse] Failed to restore tab after error:', restoreErr.message);
-      }
-    }
-
     // Activity: emit command_end (error) — skipped for chain subcommands
     const errorDuration = Date.now() - startTime;
     if (!opts?.skipActivity) {
@@ -1313,7 +1295,7 @@ async function handleCommandInternalImpl(
       ts: new Date().toISOString(),
       cmd: command,
       aliasOf: isAliased ? rawCommand : undefined,
-      args: args.join(' '),
+      args,
       origin: browserManager.getCurrentUrl(),
       durationMs: errorDuration,
       status: 'error',
@@ -1337,11 +1319,11 @@ async function handleCommandInternalImpl(
  * Do not bypass this by calling handleCommandInternalImpl directly.
  */
 async function handleCommandInternal(
-  body: { command: string; args?: string[]; tabId?: number },
+  body: { command: string; args?: string[]; tabId?: number; session?: string },
   tokenInfo?: TokenInfo | null,
   opts?: { skipRateCheck?: boolean; skipActivity?: boolean; chainDepth?: number },
 ): Promise<CommandResult> {
-  const cr = await handleCommandInternalImpl(body, tokenInfo, opts);
+  const cr = await runInRequestTab(browserManager, body, tokenInfo, () => handleCommandInternalImpl(body, tokenInfo, opts));
   return { ...cr, result: stripLoneSurrogates(cr.result) };
 }
 
@@ -1880,24 +1862,19 @@ export async function start() {
   safeUnlink(NETWORK_LOG_PATH);
   safeUnlink(DIALOG_LOG_PATH);
 
-  const port = await findPort();
-  LOCAL_LISTEN_PORT = port;
-
   // ─── Proxy config (D8 + codex F5) ──────────────────────────────
-  // BROWSE_PROXY_URL is set by the CLI when --proxy was passed. For SOCKS5
-  // with auth, we run a local 127.0.0.1 bridge that relays to the
-  // authenticated upstream (Chromium can't do SOCKS5 auth itself). For
-  // HTTP/HTTPS or unauthenticated SOCKS5, we pass the URL directly to
-  // Chromium's proxy.server option.
+  // The CLI resolves the proxy (--proxy or env, #915). SOCKS5 with auth runs a
+  // local 127.0.0.1 bridge to the authenticated upstream (Chromium can't do
+  // SOCKS5 auth itself); HTTP/HTTPS or unauthenticated SOCKS5 pass through.
   let proxyBridge: BridgeHandle | null = null;
-  const proxyUrl = process.env.BROWSE_PROXY_URL;
+  const { url: proxyUrl, source: proxySource, bypass: proxyBypass, direct: proxyDirect } = serverProxyEnv(process.env);
   if (proxyUrl) {
     let parsed;
     try {
       parsed = parseProxyConfig({
         proxyUrl,
         envUser: process.env.BROWSE_PROXY_USER,
-        envPass: process.env.BROWSE_PROXY_PASS,
+        envPass: process.env.BROWSE_PROXY_PASS, source: proxySource,
       });
     } catch (err) {
       if (err instanceof ProxyConfigError) {
@@ -1928,15 +1905,15 @@ export async function start() {
 
       proxyBridge = await startSocksBridge({ upstream: toUpstreamConfig(parsed) });
       console.log(`[browse] [proxy] bridge listening on 127.0.0.1:${proxyBridge.port}`);
-      browserManager.setProxyConfig({ server: `socks5://127.0.0.1:${proxyBridge.port}` });
+      browserManager.setProxyConfig({ server: `socks5://127.0.0.1:${proxyBridge.port}`, bypass: proxyBypass });
     } else {
       // HTTP/HTTPS or unauth SOCKS5 — pass through to Chromium directly.
       browserManager.setProxyConfig({
-        server: `${parsed.scheme}://${parsed.host}:${parsed.port}`,
+        server: `${parsed.scheme}://${parsed.host}:${parsed.port}`, bypass: proxyBypass,
         ...(parsed.userId ? { username: parsed.userId } : {}),
         ...(parsed.password ? { password: parsed.password } : {}),
       });
-      console.log(`[browse] [proxy] using ${redactProxyUrl(proxyUrl)} (pass-through to Chromium)`);
+      console.log(`[browse] [proxy] using ${redactProxyUrl(proxyUrl)} from ${proxySource} (pass-through to Chromium)`);
     }
 
     // Tear down bridge on shutdown.
@@ -1945,7 +1922,7 @@ export async function start() {
         proxyBridge.close().catch(() => { /* shutting down anyway */ });
       }
     });
-  }
+  } else console.log(directProxyLogLine(process.env));
 
   process.on('exit', () => { browserManager.closeOwnedDisplay(); });
 
@@ -1969,6 +1946,11 @@ export async function start() {
   }
 
   const startTime = Date.now();
+
+  // The port is probed free and then bound; pick it after the browser launch so the seconds Chromium takes to start are not
+  // a window in which another process can take it (Free Tests 41951644962: "Failed to start server. Is port 43780 in use?").
+  const port = await findPort();
+  LOCAL_LISTEN_PORT = port;
 
   // ─── Build the request handlers via buildFetchHandler factory ───
   // CLI path passes env-derived values; no beforeRoute hook. Phoenix uses
@@ -2021,6 +2003,7 @@ export async function start() {
     // D2 daemon-mismatch detection: CLI computes the same hash from its
     // resolved flags and refuses if it differs from this stored value.
     ...(process.env.BROWSE_CONFIG_HASH ? { configHash: process.env.BROWSE_CONFIG_HASH } : {}),
+    ...(proxyUrl ? { proxy: redactProxyUrl(proxyUrl), proxySource, proxyBypass } : proxyDirect ? { proxyDirect } : {}), // #915/#3440 refusal detail
     // Xvfb child PID + start-time + display so disconnect (or a future
     // daemon launch on this state file) can validate-then-cleanup orphans
     // without clobbering a recycled PID.

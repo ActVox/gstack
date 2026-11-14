@@ -74,6 +74,8 @@ If you accept the local PGLite, you end up in **split-engine mode**:
 - **Brain/context queries** (`mcp__gbrain__search`, `mcp__gbrain__query`, `mcp__gbrain__get_page`) route to the remote MCP. Plans, retros, learnings, cross-machine memory — all on the shared server.
 - **Code queries** (`gbrain code-def`, `code-refs`, `code-callers`, `code-callees`, `gbrain search` for code) route to the local PGLite via the `.gbrain-source` pin in each worktree. Indexed locally, fast, never leaves the machine.
 
+A `gbrain serve --http` on this machine's loopback address (`localhost`, `127.0.0.1`, `::1`) over this machine's own Postgres brain is not Path 4. That is gbrain's recommended setup for local agents on a Postgres brain (`gbrain bootstrap harness`), and gstack treats it as a local brain: transcripts go through `gbrain import` here. gstack decides this from the URL and the local gbrain config alone, and only a config with a Postgres `database_url` counts. A loopback URL next to a local PGLite stays Path 4, so the split-engine setup above keeps working when you reach the remote brain through an SSH tunnel or port forward on a loopback port.
+
 The two engines are independent. Wiping the local PGLite doesn't touch the remote brain; rotating the remote MCP bearer doesn't affect local code search. This is also the right configuration if your remote brain admin can't (or shouldn't) index every developer's checkout — local code stays local.
 
 ## MCP registration for Claude Code
@@ -210,13 +212,14 @@ The skill re-collects a PAT (one-time, discarded after), lists every project in 
 
 | Bin | Purpose |
 |---|---|
-| `gstack-gbrain-detect` | Emit current state as JSON: gbrain on PATH, version, config engine, doctor status, sync mode |
+| `gstack-gbrain-detect` | Emit current state as JSON: gbrain on PATH, version, config engine, doctor status, sync mode. `--doctor` runs the full brain-health gate that `/setup-gbrain` Step 5 uses (`gbrain doctor --json --scope=brain`); it prints `brain_ok`, `brain_failures` and `skill_failures`, and exits 0 only when `brain_ok` is true. Failed skill checks (gbrain grading another agent's skills folder) never decide `brain_ok`. |
 | `gstack-gbrain-install` | Detect-first installer (probes `~/git/gbrain`, `~/gbrain`, then fresh clone). Has `--dry-run` and `--validate-only` flags. PATH-shadow check exits 3 with remediation menu. |
 | `gstack-gbrain-lib.sh` | Sourced, not executed. Provides `read_secret_to_env VARNAME "prompt" [--echo-redacted "<sed-expr>"]` |
 | `gstack-gbrain-supabase-verify` | Structural URL check. Rejects direct-connection URLs (`db.*.supabase.co:5432`) with exit 3 |
 | `gstack-gbrain-supabase-provision` | Management API wrapper. Subcommands: `list-orgs`, `create`, `wait`, `pooler-url`, `list-orphans`, `delete-project`. All require `SUPABASE_ACCESS_TOKEN` in env. `create` and `pooler-url` also require `DB_PASS`. `--json` mode available on every subcommand. |
 | `gstack-gbrain-repo-policy` | Per-remote trust triad. Subcommands: `get`, `set`, `list`, `normalize` |
-| `gstack-gbrain-source-wireup` | Registers your `~/.gstack/` brain repo with gbrain as a federated source via `gbrain sources add` + `git worktree`, then runs an initial `gbrain sync`. Idempotent. Replaces the dead `consumers.json + /ingest-repo` HTTP wireup from v1.12.x. Flags: `--strict`, `--source-id <id>`, `--no-pull`, `--uninstall`, `--probe`. |
+| `gstack-gbrain-source-wireup` | Registers your `~/.gstack/` brain repo with gbrain as a federated source via `gbrain sources add` + `git worktree`, then runs an initial `gbrain sync`. Idempotent. Replaces the dead `consumers.json + /ingest-repo` HTTP wireup from v1.12.x. Flags: `--strict`, `--source-id <id>`, `--no-pull`, `--uninstall`, `--probe`, `--advance-only`, and `--check-target` (read-only: reports `TARGET: MATCH` or `TARGET: MISMATCH` for whether an earlier run with `GBRAIN_HOME` set could have used the wrong brain; never prints a database URL). |
+| `gstack-gbrain-home.sh` | Sourced, not executed. Provides `gstack_gbrain_config_path`, which prints the config.json gbrain itself reads (`$GBRAIN_HOME/.gbrain/config.json`, else `~/.gbrain/config.json`) and prints nothing for a `GBRAIN_HOME` gbrain refuses (relative, or with a `..` segment). Used by the source wireup and skill start. |
 
 ### gbrain CLI (upstream tool)
 
@@ -226,7 +229,7 @@ Gbrain itself ships with these that gstack wraps:
 |---|---|
 | `gbrain init --pglite` | Initialize a local PGLite brain |
 | `gbrain init --non-interactive` | Initialize via env (`GBRAIN_DATABASE_URL` or `DATABASE_URL`). Never pass a URL as argv — it'll leak to shell history. |
-| `gbrain doctor --json` | Health check. Returns `{status: "ok"|"warnings"|"error", health_score: 0-100, checks: [...]}` |
+| `gbrain doctor --json` | Health check. Returns `{status: "healthy"|"warnings"|"unhealthy" (older gbrain: "ok"), health_score: 0-100, checks: [...]}`. `--scope=brain` (gbrain v0.41.20+) skips the skill checks. |
 | `gbrain migrate --to supabase --url ...` | Move a PGLite brain to Supabase (lossless, preserves source as backup) |
 | `gbrain migrate --to pglite` | Reverse migration |
 | `gbrain search "query"` | Search the brain |
@@ -238,7 +241,7 @@ Gbrain itself ships with these that gstack wraps:
 
 | Path | What lives there |
 |---|---|
-| `~/.gbrain/config.json` | Engine (pglite/postgres), database URL or path, API keys. Mode 0600. Written by `gbrain init`. |
+| `~/.gbrain/config.json` | Engine (pglite/postgres), database URL or path, API keys. Mode 0600. Written by `gbrain init`. When `GBRAIN_HOME` is set, gbrain and gstack's helpers read `$GBRAIN_HOME/.gbrain/config.json` instead. |
 | `~/.gstack/gbrain-repo-policy.json` | Per-remote trust triad. Schema v2. Mode 0600. |
 | `~/.gstack/.setup-gbrain.lock.d` | Concurrent-run lock (atomic mkdir). Released on normal exit + SIGINT. |
 | `~/.gstack/.brain-queue.d/` | Pending sync records for gstack memory sync — maildir-style spool, one file per record. A legacy `.brain-queue.jsonl` from older releases migrates automatically on the next drain. |
@@ -259,7 +262,7 @@ Gbrain itself ships with these that gstack wraps:
 | `GSTACK_HOME` | every bin helper | Override `~/.gstack` state dir. Heavy test use. |
 | `VOYAGE_API_KEY` | `gbrain embed` subprocess; gstack PGLite init | When set, gstack inits PGLite with `voyage-code-3` (1024-dim), Voyage's code-specialized embedding model. Beats `voyage-4-large` and OpenAI `text-embedding-3-large` head-to-head on this codebase's symbol queries. See CHANGELOG v1.43.1.0 for the A/B numbers. |
 | `OPENAI_API_KEY` | `gbrain embed` subprocess | Used for embeddings during `gbrain sync` / `/sync-gbrain` when `VOYAGE_API_KEY` is not set (gbrain's auto-selected fallback, `text-embedding-3-large` 1536-dim). Without either key, pages are imported structurally (symbol tables, chunks) but semantic search degrades — you'll see `[gbrain] embedding failed for code file ...` in the sync log. |
-| `ANTHROPIC_API_KEY` | `claude-agent-sdk`, paid evals | Required for `bun run test:evals` and any direct `query()` call against Claude. |
+| `ANTHROPIC_API_KEY` | `claude-agent-sdk`, paid evals | Required for paid evals (`bun run eval:bg:pr`) and any direct `query()` call against Claude. |
 | `GSTACK_OPENAI_API_KEY` | `lib/conductor-env-shim.ts` | Conductor-injected fallback. Promoted to `OPENAI_API_KEY` when the canonical name is empty. |
 | `GSTACK_ANTHROPIC_API_KEY` | `lib/conductor-env-shim.ts` | Same pattern as above for Anthropic. |
 
@@ -272,7 +275,7 @@ If you run gstack inside a [Conductor](https://conductor.build) workspace, **Con
 - `bin/gstack-gbrain-sync.ts` — so `/sync-gbrain` picks up OpenAI for embeddings
 - `bin/gstack-model-benchmark` — so `--judge` runs work without manual env mapping
 - `scripts/preflight-agent-sdk.ts` — so paid-eval auth probes work
-- `test/helpers/e2e-helpers.ts` — so `bun run test:evals` finds Anthropic
+- `test/helpers/e2e-helpers.ts` — so paid evals find Anthropic
 
 If you add a new TS entry point that hits a paid API or needs gbrain embeddings, add the same one-line import at the top. See [CONTRIBUTING.md "Conductor workspaces"](CONTRIBUTING.md#conductor-workspaces) for the contributor checklist.
 

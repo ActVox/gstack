@@ -1,9 +1,10 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S bun --no-env-file --config=/dev/null
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { discoverTemplates, includesSkill } from './discover-skills';
+import { discoverTemplates, includesSkill, RETIRED_SKILLS } from './discover-skills';
 import { externalSkillName, extractNameAndDescription } from './external-skill-names';
 import { getHostConfig } from '../hosts';
+import { CLAUDE_CODE_RUNTIME_FILES } from '../lib/claude-code-migration';
 
 const args = process.argv.slice(2);
 const value = (flag: string): string => {
@@ -113,6 +114,7 @@ const sourceNames = new Set<string>();
 for (const template of discoverTemplates(source)) {
   const dir = path.dirname(template.tmpl);
   const name = externalSkillName(dir, extractNameAndDescription(fs.readFileSync(path.join(source, template.tmpl), 'utf8')).name);
+  if (RETIRED_SKILLS.includes(dir)) continue;
   sourceNames.add(name);
   if (!includesSkill(config, dir)) continue;
   names.add(name);
@@ -155,12 +157,11 @@ for (const name of hostEntries.filter(name => name.startsWith('gstack-') && !sou
 
 const old = path.join(namespace, 'gstack-claude');
 const nextSkill = path.join(namespace, 'gstack-claude-code');
-const renameFiles = ['bin/gstack-claude-code', 'lib/claude-code.ts', 'lib/claude-code-windows-job.ts', 'lib/claude-bin.ts', 'lib/outside-review-result.ts'];
 const runtimeSkill = path.join(runtime, 'SKILL.md');
 const runtimeBanner = !fs.existsSync(runtimeSkill) || fs.readFileSync(runtimeSkill, 'utf8').includes('<!-- AUTO-GENERATED from');
 const rename = owned(old) && (!exists(nextSkill) || owned(nextSkill))
   && (!exists(runtime)?.isSymbolicLink() || linkIsOurs(runtime))
-  && runtimeBanner && renameFiles.every(rel => {
+  && runtimeBanner && CLAUDE_CODE_RUNTIME_FILES.every(rel => {
     const parent = path.join(runtime, path.dirname(rel));
     return exists(path.join(source, rel)) && (!exists(parent)?.isSymbolicLink() || linkIsOurs(parent));
   });
@@ -172,7 +173,7 @@ if (rename) {
     for (const rel of ['SKILL.md', 'agents/openai.yaml']) checkAtomicCopy(path.join(next, rel), physicalNamespace, 'rename skill write', true);
   }
   if (exists(runtime) && physical(runtime) !== source) {
-    for (const rel of renameFiles) {
+    for (const rel of CLAUDE_CODE_RUNTIME_FILES) {
       const dest = path.join(runtime, rel);
       if (exists(dest) && physical(dest) === physical(path.join(source, rel))) continue;
       checkAtomicCopy(dest, physicalNamespace, 'rename runtime write');

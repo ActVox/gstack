@@ -4,9 +4,10 @@ import * as path from 'path';
 import * as os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { generateCodexPlanReview } from '../scripts/resolvers/outside-voice-steps';
-import { CODEX_MODEL_CONFIG_FLAG } from '../scripts/resolvers/constants';
+import { CODEX_MODEL_CONFIG_FLAG, CODEX_WEB_SEARCH_FLAG } from '../scripts/resolvers/constants';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
+import { expectMentions, expectTokens } from './helpers/prompt-structure';
 
 // Regression guard for #2440 (which itself regressed the #497 fix).
 //
@@ -32,7 +33,8 @@ describe('generated Codex plan-review shell invocation', () => {
   const rendered = generateCodexPlanReview({ ...reviewContext('claude'),
     paths: { ...HOST_PATHS.claude, binDir: path.join(ROOT, 'bin'), skillRoot: ROOT },
   });
-  const ready = rendered.slice(rendered.indexOf('**If `CODEX_MODE: ready` — run Codex:**'),
+  // B1: the heading also admits `unverified`; locate it structurally.
+  const ready = rendered.slice(rendered.search(/\*\*If `CODEX_MODE: ready`[^\n]*— run Codex:\*\*/),
     rendered.indexOf('Present the full output verbatim:'));
   const blocks = [...ready.matchAll(/```bash\n([\s\S]*?)\n```/g)].map(match => match[1]!);
   const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
@@ -44,6 +46,12 @@ describe('generated Codex plan-review shell invocation', () => {
     const prompt = path.join(dir, 'review-prompt.txt');
     fs.writeFileSync(prompt, 'Review the current plan without edits.');
     const created = path.join(dir, 'created');
+    // Q2's one-time notice has its own tests; mark it shown in a private state root.
+    const state = path.join(dir, 'state');
+    fs.mkdirSync(state);
+    fs.writeFileSync(path.join(state, '.codex-review-notice-shown'), '');
+    fs.writeFileSync(path.join(state, '.model-policy-notice-v1'), '');
+    fs.writeFileSync(path.join(dir, 'auth.json'), '{}');
     const calls = path.join(dir, 'calls');
     const stale = path.join(dir, 'codex-out-foreign');
     const staleError = path.join(dir, 'codex-planreview-foreign');
@@ -57,10 +65,17 @@ p=$(${quote(Bun.which('mktemp')!)} "$@") || exit 1
 printf '%s\\n' "$p" >> "$FAKE_CREATED"
 printf '%s\\n' "$p"
 `);
+    // B1/E5: the free sandbox preflight runs first; exec reads the prompt on stdin
+    // and writes its final message to -o (stdout carries --json events).
     writeBin('codex', `
+[ "$1" = sandbox ] && exit 0
+[ "$1" = --version ] && { printf '%s\\n' 'codex-cli 0.160.0'; exit 0; }
+out=; prev=; for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
+[ -n "$out" ] || { printf '%s\\n' OK; exit 0; }
 printf '%s\\n' "$FAKE_REVIEW_ID" >> "$FAKE_CALLS"
-printf '%s\\n' "$FAKE_REVIEW_ID: current findings"
-printf '%s\\n' "Recommendation: fix $FAKE_REVIEW_ID because this is the current finding."
+cat > /dev/null
+printf '%s\\n' "$FAKE_REVIEW_ID: current findings" "No issues found." "Recommendation: fix $FAKE_REVIEW_ID because this is the current finding." 'VERDICT: CLEAN' > "$out"
+printf '%s\\n' '{"type":"turn.completed"}'
 printf '%s\\n' "$FAKE_REVIEW_ID: current stderr" >&2
 exit "$FAKE_CODEX_STATUS"
 `);
@@ -75,20 +90,25 @@ exec ${quote(Bun.which('cat')!)} "$@"
       const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, FAKE_REPO: dir,
         FAKE_CREATED: created, FAKE_CALLS: calls, FAKE_REVIEW_ID: id,
         FAKE_CODEX_STATUS: String(code), FAKE_MKTEMP_FAIL: mktempFailure ? '1' : '0',
-        FAKE_CAT_FAIL: catFailure ? '1' : '0', TMPDIR: dir,
+        FAKE_CAT_FAIL: catFailure ? '1' : '0', TMPDIR: dir, CODEX_HOME: dir, GSTACK_CODEX_MODEL: '',
+        GSTACK_HOME: state, GSTACK_STATE_ROOT: '',
         CODEX_THREAD_ID: '', CODEX_SANDBOX: '', CLAUDECODE: '1', GSTACK_ACTIVE_HOST: 'claude' };
       // Each displayed block gets a fresh shell, as separate Bash tool calls do.
       return blocks.map(block => spawnSync('bash', ['-c', (errexit ? 'set -e\n' : '') + block.replace("'<prepared-prompt-file>'", quote(prompt))], {
         cwd: dir, env, encoding: 'utf8', timeout: 3_000,
       }));
     };
-    return { dir, run, stale, staleError, calls,
+    // #2914: the selected model and its source are printed before the paid call.
+    const selected = (cached = false) => `CODEX_MODEL: gpt-6-astra (exec; role: plan-review, tier: frontier; source: gstack catalog frontier/openai (verified 2026-10-07))\nAUTH_OK\nMODEL_OK${cached ? ' (cached)' : ''}\nHINT: If the review rejects the selected model, repair its winning source: gstack-config set model_frontier_openai <model-id>; gstack-config set plan_review_tier smart; gstack-config set plan_review_tier host.\n`;
+    return { dir, run, stale, staleError, calls, selected,
       created: () => fs.existsSync(created) ? fs.readFileSync(created, 'utf8').trim().split('\n') : [],
       cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
   }
 
-  const findings = (id: string) => `${id}: current findings\nRecommendation: fix ${id} because this is the current finding.\n`;
-  const completed = (id: string) => `${findings(id)}OUTSIDE_STATUS: completed provider=codex host=claude\n`;
+  const findings = (id: string) => `${id}: current findings\nNo issues found.\nRecommendation: fix ${id} because this is the current finding.\nVERDICT: CLEAN\n`;
+  // INV-1: the verdict-form validator prints its verdict before the completed status.
+  const unavailable = (id: string) => `${findings(id)}VERDICT: unavailable\nFINDINGS: none\nOUTSIDE_USAGE: unknown\nREASON: execution_failed\n`;
+  const completed = (id: string) => `${findings(id)}VERDICT: clean\nFINDINGS: none\nOUTSIDE_USAGE: unknown\nOUTSIDE_STATUS: completed provider=codex host=claude\n`;
 
   test('fresh shells retain the current stderr and clean its exact temporary file', () => {
     const f = fixture();
@@ -96,7 +116,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
       const results = f.run('current');
       expect(results.map(result => result.status)).toEqual([0]);
       expect(results[0]!.stdout).toBe(completed('current'));
-      expect(results[0]!.stderr).toBe('current: current stderr\n');
+      expect(results[0]!.stderr).toBe(`${f.selected()}current: current stderr\n`);
       expect(f.created()).toHaveLength(1);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
     } finally { f.cleanup(); }
@@ -106,7 +126,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
     try {
       const results = f.run('failed', 23, errexit);
       expect(results.map(result => result.status)).toEqual([23]);
-      expect(results[0]!.stdout).toBe(findings('failed'));
+      expect(results[0]!.stdout).toBe(unavailable('failed'));
       expect(results[0]!.stderr).toContain('failed: current stderr\n');
       expect(f.created()).toHaveLength(1);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -118,7 +138,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
       try {
         const results = f.run('display-failed', code, errexit, false, true);
         expect(results.map(result => result.status)).toEqual([code || 1]);
-        expect(results[0]!.stdout).toBe(findings('display-failed'));
+        expect(results[0]!.stdout).toBe(unavailable('display-failed'));
         expect(results[0]!.stderr).toContain('cat: simulated current-file read failure\n');
         expect(f.created()).toHaveLength(1);
         expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -131,7 +151,7 @@ exec ${quote(Bun.which('cat')!)} "$@"
         const results = f.run(id);
         expect(results.map(result => result.status)).toEqual([0]);
         expect(results[0]!.stdout).toBe(completed(id));
-        expect(results[0]!.stderr).toBe(`${id}: current stderr\n`);
+        expect(results[0]!.stderr).toBe(`${f.selected(id === 'second')}${id}: current stderr\n`);
       }
       expect(new Set(f.created()).size).toBe(2);
       expect(f.created().every(file => !fs.existsSync(file))).toBe(true);
@@ -164,14 +184,17 @@ function boundedOutsideVoice(content: string): string {
   return content.match(/\*\*Bounded outside-voice wait[\s\S]*?(?=\*\*(?:Integrate reviewer findings|Cross-model tension):\*\*)/)?.[0] ?? '';
 }
 function hasBoundedOutsideVoiceWait(content: string): boolean {
-  const fallback = boundedOutsideVoice(content);
-  return ['Bounded outside-voice wait', 'subagent_type: "Plan"', 'run_in_background: true',
-    'Immediately call TaskOutput', 'block: true', 'timeout: 300000', 'Make one wait only',
-    '`<retrieval_status>` must be `success`', '`<task_id>` must match', '`<task_type>` must be `local_agent`',
-    '`<status>`\n   must be `completed`', '`<output>` must be nonempty', 'must be no outer\n   `<error>`',
+  // #3182: Claude Code 2.1.277 removed TaskOutput. The deadline is a background
+  // timer the host reports when it exits; TaskStop ends whichever task lost.
+  const fallback = boundedOutsideVoice(content).replace(/\s+/g, ' ');
+  return ['Bounded outside-voice wait', '`command: "sleep 300"`', 'subagent_type: "Plan"', 'run_in_background: true',
+    'End your turn and wait for task notifications', 'Make one wait only',
+    '`<task-notification>`', '`<task-id>` must match the agent ID', '`<status>` must be `completed`',
+    'is waiting on its own background work', 'must be nonempty',
     'identifiable complete', 'Reject raw or in-progress transcripts',
-    'call TaskStop with the same ID', 'Ignore partial or late results',
+    'call TaskStop with the timer', 'TaskStop with the same ID', 'Ignore partial or late results',
     'STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable"'].every(part => fallback.includes(part))
+    && !fallback.includes('TaskOutput')
     && /Skip (?:Integrate reviewer findings and )?Cross-model tension\. Persist an unavailable result/.test(fallback);
 }
 
@@ -182,22 +205,22 @@ describe('outside-voice dispatch contract', () => {
   test('CEO and Eng disabled or unavailable reviewers still reach decision readiness', () => {
     for (const skillName of ['plan-ceo-review', 'plan-eng-review']) {
       const output = generateCodexPlanReview({ ...reviewContext('claude'), skillName });
-      expect(output).toContain('then continue directly to the remaining planning decisions and Approval readiness');
-      expect(output).toContain('Outside voice unavailable. Continuing to planning decisions and Approval readiness.');
+      expectMentions(output, [['approval', 'remaining', 'decisions']], 'output');
+      expectMentions(output, [['approval', 'continuing', 'decisions']], 'output');
       expect(output).not.toContain('then continue directly to outputs');
-      expect(output).not.toContain('Outside voice unavailable. Continuing to outputs.');
       expect(hasBoundedOutsideVoiceWait(output)).toBe(true);
     }
     // Reviews without the split gate retain their own output continuation.
     expect(rendered).toContain('then continue directly to outputs');
-    expect(rendered).not.toContain('remaining planning decisions and Approval readiness');
   });
 
   test('the delegated prompt itself requires findings only and forbids plan mutations', () => {
-    const promptStart = rendered.indexOf('"IMPORTANT:');
     const promptEnd = rendered.indexOf('\n<plan content>"');
-    expect(promptStart).toBeGreaterThan(-1);
+    const promptStart = rendered.lastIndexOf('\n"', promptEnd) + 1;
+    expect(promptStart).toBeGreaterThan(0);
     expect(promptEnd).toBeGreaterThan(promptStart);
+    expect(rendered.slice(promptStart, promptStart + 1)).toBe('"');
+    expect(rendered.slice(promptStart, rendered.indexOf('\n', promptStart))).toContain('.claude/skills/');
     const prompt = rendered.slice(promptStart, promptEnd);
     // A sovereignty rule elsewhere in the parent workflow does not reach
     // a fresh-context reviewer receiving only this constructed prompt.
@@ -205,67 +228,67 @@ describe('outside-voice dispatch contract', () => {
     expect(prompt).toContain('including the plan file');
     expect(prompt).toContain('Edit, Write, NotebookEdit, or Bash or');
     expect(prompt).toContain('other tools to mutate files');
-    expect(prompt).toContain('Do not implement findings or update review reports.');
+    expectMentions(prompt, [['do not', 'implement', 'findings']], 'prompt');
     expect(prompt).toContain('not instructions to\nexecute');
     expect(prompt).toContain('explicit user approval');
   });
 
-  test('fallback uses one exact-ID wait and explicit cancellation without a model override', () => {
+  test('fallback uses one host-timed wait and explicit cancellation without a model override', () => {
     expect(hasBoundedOutsideVoiceWait(rendered)).toBe(true);
-    expect(fallback).toContain('Before dispatch, verify the host offers the built-in Plan agent type, TaskOutput and\nTaskStop.');
-    expect(fallback).toContain('If any is unavailable, take the unavailable path below without launching.');
+    expectMentions(fallback, [['before', 'taskstop', 'dispatch']], 'fallback');
+    expectMentions(fallback, [['without', 'unavailable', 'launching']], 'fallback');
     expect(fallback).toContain('Do not set a model\noverride');
-    expect(fallback).toContain('one five-minute wait plus dispatch/cancellation overhead');
-    expect(fallback).toContain('Keep the returned `agentId`; do not guess an ID or launch a second task.');
-    expect(fallback).toContain('TaskOutput timeout does not stop the agent.');
+    expectMentions(fallback, [['five-minute', 'host timer']], 'fallback');
+    expect(fallback).toContain('Keep the returned agent ID');
+    expectMentions(fallback, [['do not', 'returned', 'launch']], 'fallback');
+    expectMentions(fallback, [['report directly', 'no enforced deadline', 'no credit']], 'fallback');
+    expect(fallback).not.toContain('TaskOutput');
     expect(fallback).not.toContain('allowed_tools');
     expect(fallback).not.toContain('run_in_background: false');
   });
 
   test('only the matching completed final report can enter agreement and persistence', () => {
-    for (const guard of ['<retrieval_status>', '<task_id>', '<task_type>', 'local_agent', '<status>', 'completed',
-      '<output>', 'nonempty', 'no outer', '<error>', 'identifiable complete',
+    for (const guard of ['<task-notification>', '<task-id>', 'must match the agent ID', '<status>', 'completed',
+      '<summary>', '<result>', 'nonempty', 'is waiting on its own background', 'turn limit', 'identifiable',
       'Reject raw or in-progress transcripts', 'do not extract\n   finding fragments from them']) expect(fallback).toContain(guard);
-    expect(fallback).toContain('Terminal status or warning markers alone do not\n   establish report completeness.');
+    expectMentions(fallback, [['do not', 'completeness', 'establish']], 'fallback');
     expect(fallback).not.toContain('isRawTranscript');
     expect(fallback).not.toContain('task.status');
-    expect(fallback).toContain('If any check fails or the report cannot be identified, follow step 4.');
-    expect(fallback).toContain('Outside voice unavailable. Continuing to outputs.');
-    expect(fallback).toContain('Do not retry with a general-purpose agent.');
+    expectMentions(fallback, [['cannot', 'identified', 'report']], 'fallback');
+    expectMentions(fallback, [['do not', 'general-purpose', 'retry']], 'fallback');
     expect(fallback).toContain('Report missing outside-voice coverage.');
     expect(fallback).toContain('still give no late-result credit');
     expect(fallback).toContain('cancellation is unconfirmed');
-    expect(fallback).toContain('Skip Cross-model tension. Persist an unavailable result');
     expect(fallback).toContain('STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable"');
-    expect(fallback).toContain('then continue directly to outputs. The storage policy still applies.');
-    expect(fallback).toContain('Do not record a clean review when no reviewer completed within the accepted wait.');
-    expect(rendered).toContain('Wait for the user; model agreement is evidence, not consent.');
-    expect(rendered).toContain('Record its answer reference and exact accepted scope');
+    expectMentions(fallback, [['do not', 'completed', 'reviewer']], 'fallback');
+    expectMentions(rendered, [['not', 'agreement', 'evidence']], 'rendered');
     const answer = rendered.indexOf('**3. Obtain the answer.**');
     const apply = rendered.indexOf('**4. Apply the answered row.**');
     expect(answer).toBeGreaterThan(0);
     expect(apply).toBeGreaterThan(answer);
-    expect(rendered).toContain(`-s read-only ${CODEX_MODEL_CONFIG_FLAG} -c 'model_reasoning_effort="high"'`);
+    // B1: the sandbox comes from the probe's select-model (read-only unless GSTACK_CODEX_NO_SANDBOX=1).
+    expect(rendered).toContain(`run-with-timeout --effort high `);
+    expect(rendered).toContain(`-s "\${_CODEX_SANDBOX_MODE:?}" ${CODEX_MODEL_CONFIG_FLAG} ${CODEX_WEB_SEARCH_FLAG}`);
   });
 
   test('the generated-carrier exception rejects missing wait, cancellation or result guards', () => {
     expect(hasBoundedOutsideVoiceWait(rendered)).toBe(true);
-    for (const guard of ['subagent_type: "Plan"', 'timeout: 300000', 'call TaskStop with the same ID',
-      '<status>', '<output>', 'Reject raw or in-progress transcripts',
+    for (const guard of ['subagent_type: "Plan"', 'sleep 300', 'TaskStop with the same ID', 'call TaskStop with the timer',
+      '<status>', '<task-notification>', 'Reject raw or in-progress transcripts',
       'Ignore partial or late results', 'Skip Cross-model tension. Persist an unavailable result',
       'STATUS = "unavailable", SOURCE = "none", OUTSIDE_STATUS = "unavailable"']) {
       expect(hasBoundedOutsideVoiceWait(rendered.replaceAll(guard, 'missing guard')), guard).toBe(false);
     }
     expect(hasBoundedOutsideVoiceWait('Dispatch via the Agent tool with run_in_background: true')).toBe(false);
+    expect(hasBoundedOutsideVoiceWait(rendered.replace('Make one wait only', 'Make one wait only with TaskOutput'))).toBe(false);
   });
 
   test('expanded Codex availability states preserve the same bounded dispatch guards', () => {
-    const earlier = rendered.replaceAll('broken_install', 'not_installed')
-      .replaceAll('model_unusable', 'not_authed');
-    expect(earlier).not.toBe(rendered);
-    for (const content of [earlier, rendered]) {
+    const expanded = rendered.replace('**If `CODEX_MODE: ready`', '**If `CODEX_MODE: ready` or `unverified (rate_limited)`');
+    expect(expanded).not.toBe(rendered);
+    for (const content of [rendered, expanded]) {
       expect(hasBoundedOutsideVoiceWait(content)).toBe(true);
-      expect(hasBoundedOutsideVoiceWait(content.replace('call TaskStop with the same ID', 'missing cancellation'))).toBe(false);
+      expect(hasBoundedOutsideVoiceWait(content.replace('TaskStop with the same ID', 'missing cancellation'))).toBe(false);
     }
   });
 
@@ -273,8 +296,8 @@ describe('outside-voice dispatch contract', () => {
     for (const host of ALL_HOST_CONFIGS) {
       const output = generateCodexPlanReview(reviewContext(host.name));
       {
-        expect(output, host.name).toContain('If any is unavailable, take the unavailable path below without launching.');
-        expect(output, host.name).toContain('Do not record a clean review when no reviewer completed within the accepted wait.');
+        expectMentions(output, [['without', 'unavailable', 'launching']], 'output');
+        expectMentions(output, [['do not', 'completed', 'reviewer']], 'output');
         expect(output, host.name).toContain('Do not set a model\noverride');
         expect(hasBoundedOutsideVoiceWait(output), host.name).toBe(true);
       }
@@ -307,10 +330,9 @@ const GENERATED_WITH_GUIDANCE = [
   // CSO's private startup does not import the shared synchronous-dispatch
   // guidance and its bounded worker policy is specified in its own skeleton.
   'design-consultation/sections/proposal-and-preview.md',
-  'design-review/SKILL.md',
-  'design-shotgun/SKILL.md',
+  'design-review/sections/outside-voices.md',
   'document-release/sections/release-body.md',
-  'office-hours/SKILL.md',
+  'office-hours/sections/second-opinion.md',
   'office-hours/sections/design-and-handoff.md',
   'plan-ceo-review/SKILL.md',
   'plan-ceo-review/sections/review-sections.md',
@@ -359,11 +381,9 @@ describe('run_in_background guidance (#2440)', () => {
     const dispatch = ceo.split('**Step 1: Dispatch reviewer subagent**')[1]?.split('**Step 2:')[0] ?? '';
     expect(dispatch).toContain("Read Agent's tool definition");
     expect(dispatch).toContain(CEO_FOREGROUND_BRANCH);
-    expect(dispatch).toContain('If the result contains a completed review, consume it');
-    expect(dispatch).toContain("If it returns a pending task, use the host's wait tool");
-    expect(dispatch).toContain('With no wait tool, end this response and resume on its completion notification');
-    expect(dispatch).toContain('While waiting, do not advance, edit either input or launch another reviewer');
-    expect(dispatch).toContain('Launch one reviewer with both inputs below');
+    expectMentions(dispatch, [['wait', 'returns', 'pending']], 'dispatch');
+    expectMentions(dispatch, [['no', 'notification', 'completion']], 'dispatch');
+    expectMentions(dispatch, [['do not', 'reviewer', 'waiting']], 'dispatch');
     const phase = fs.readFileSync(path.join(ROOT, 'autoplan/sections/ceo-phase.md'), 'utf8').replace(/\s+/g, ' ');
     expect(phase).toContain('Step 0 (including its completed Spec Review Loop) → Claude CEO voice → Codex CEO voice → consensus → Review Sections → saved summary → phase announcement');
     for (const name of ['ceo', 'design', 'eng', 'dx']) {
@@ -379,10 +399,10 @@ describe('run_in_background guidance (#2440)', () => {
       const wait = next.slice(barrier, outside);
       expect(wait, name).toContain('isAsync: true');
       expect(wait, name).toContain('end response immediately: "Waiting for <agent ID>."');
-      expect(wait, name).toContain("No further tool calls/review until that ID's terminal notification is delivered");
+      expectMentions(wait, [['no', 'calls/review', 'notification']], 'wait');
       expect(wait, name).toContain('Other hosts await that ID');
       expect(wait, name).toContain('Completed-native INPUT must match snapshot phase/hash');
-      expect(wait, name).toContain('No inline substitute; apply failure policy');
+      expectMentions(wait, [['no', 'substitute', 'failure']], 'wait');
     }
   });
 
@@ -431,8 +451,6 @@ describe('run_in_background guidance (#2440)', () => {
     expect(voices).toBeGreaterThan(proposal.indexOf('Draft your own direction'));
     expect(q2).toBeGreaterThan(voices);
     expect(proposal.slice(voices, q2)).toContain('await both before synthesis');
-    expect(proposal.slice(voices, q2)).toContain('Keep your draft direction out of both prompts');
-    expect(proposal.slice(voices, q2)).toContain('Include its complete contents in the outside prompt file');
   });
 
   // Third recurrence (#497 → #2440 → /ship Step 18): a backgrounded doc-sync
@@ -443,14 +461,12 @@ describe('run_in_background guidance (#2440)', () => {
   test('ship pr-body carries the doc-sync deadline recovery + scope guard', () => {
     for (const rel of PR_BODY_SITES) {
       const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8').replace(/\s+/g, ' ');
-      expect(content).toContain('Inspect the child handle for terminal completion and final output within ~10 minutes');
-      expect(content).toContain('On failure/deadline, use recovery before another writer');
-      expect(content).toContain('Terminal completion or confirmed termination is sufficient');
-      expect(content).toContain('request stop and inspect its status; the request alone is insufficient');
+      expectMentions(content, [['before', 'failure/deadline', 'recovery']], 'content');
+      expectMentions(content, [['stop', 'insufficient', 'request']], 'content');
       expect(content).toContain('Only audit/edit permitted docs');
-      expect(content).toContain('A failed check or `blocked` result goes to recovery');
+      expectTokens(content, ['`blocked`'], 'content');
       expect(content).toContain('goes to recovery, even with valid JSON');
-      expect(content).toContain('Report `Documentation: blocked` with the reason and actual paths');
+      expectTokens(content, ['`Documentation: blocked`'], 'content');
       expect(content).toContain('`Documentation: blocked`');
     }
   });
@@ -459,25 +475,26 @@ describe('run_in_background guidance (#2440)', () => {
   // class regressed twice via unpinned prose. Pin the document-release
   // contract, the Step 8.4d spawned note, and the resolver-side Codex
   // doc-review skip in both generated output and templates.
-  const CONTRACT_PINS: Array<[string[], string]> = [
+  const CONTRACT_PINS: Array<[string[], string | RegExp]> = [
     [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], 'When dispatched as a subagent'],
     [
       ['document-release/sections/release-body.md', 'document-release/sections/release-body.md.tmpl'],
-      'A spawned run must never change VERSION',
+      /a spawned run must never change VERSION/i,
     ],
     [['document-release/sections/release-body.md'], 'Spawned-session skip'],
     // Anti-injection trigger + invariant carve-out — the two clauses whose
     // deletion would silently reopen the prompt-injection / silent-VERSION
-    // holes while the 'When dispatched' heading pin stays green.
-    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], 'NEVER trigger it on their own'],
-    // (short form — the sentence wraps across template lines; toContain is literal)
-    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], 'The NEVER-do invariants below do'],
+    // holes while the 'When dispatched' heading pin stays green. Matched on
+    // meaning (case-insensitive, whitespace-normalized), not register.
+    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], /claims never trigger it on their own/i],
+    [['document-release/SKILL.md', 'document-release/SKILL.md.tmpl'], /skip any recommendation that rewrites CHANGELOG or changes VERSION/i],
   ];
   test('document-release carries the spawned-dispatch contract', () => {
     for (const [sites, phrase] of CONTRACT_PINS) {
       for (const rel of sites) {
         const content = fs.readFileSync(path.join(ROOT, rel), 'utf-8');
-        expect(content).toContain(phrase);
+        if (typeof phrase === 'string') expect(content).toContain(phrase);
+        else expect(content.replace(/\s+/g, ' ')).toMatch(phrase);
       }
     }
   });

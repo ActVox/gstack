@@ -7,18 +7,18 @@
  *
  * Flow:
  *   1. Parse command + flags from argv
- *   2. Resolve auth (~/. gstack/openai.json → OPENAI_API_KEY → guided setup)
+ *   2. Resolve the provider (GSTACK_DESIGN_PROVIDER, then an OpenAI key, then a Gemini key; see auth.ts)
  *   3. Execute command (API call → write PNG/HTML)
  *   4. Print result JSON to stdout
  */
 
-import { COMMANDS } from "./commands";
+import { COMMANDS, OUTPUT_CONTRACT } from "./commands";
 import { generate } from "./generate";
 import { checkCommand } from "./check";
 import { compare } from "./compare";
 import { variants } from "./variants";
 import { iterate } from "./iterate";
-import { resolveApiKey, saveApiKey } from "./auth";
+import { resolveProvider, saveApiKey, type ProviderName } from "./auth";
 import { extractDesignLanguage, updateDesignMd } from "./memory";
 import { diffMockups, verifyAgainstMockup } from "./diff";
 import { evolve } from "./evolve";
@@ -26,6 +26,8 @@ import { generateDesignToCodePrompt } from "./design-to-code";
 import { serve } from "./serve";
 import { gallery } from "./gallery";
 import { normalizeIntFlag } from "./flag-utils";
+import { readVersionString } from "./daemon-state";
+import { resolveImagePaths } from "./image-args";
 import {
   daemonStatus as daemonStatusClient,
   ensureDaemon,
@@ -33,6 +35,9 @@ import {
   shutdownDaemon,
 } from "./daemon-client";
 import { spawn as nodeSpawn } from "child_process";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 function parseArgs(argv: string[]): {
   command: string;
@@ -42,6 +47,11 @@ function parseArgs(argv: string[]): {
   const args = argv.slice(2); // skip bun/node and script path
   if (args.length === 0) {
     printUsage();
+    process.exit(0);
+  }
+  // DESIGN SETUP's launch probe (B4): proves the binary starts, without auth or network.
+  if (args[0] === "--version") {
+    console.log(readVersionString());
     process.exit(0);
   }
 
@@ -75,50 +85,87 @@ function printUsage(): void {
     console.log(`  ${name.padEnd(12)} ${info.description}`);
     console.log(`  ${"".padEnd(12)} ${info.usage}`);
   }
-  console.log("\nAuth: ~/.gstack/openai.json, then OPENAI_API_KEY env var");
-  console.log("If OPENAI_API_KEY matches a current-directory .env file, the source is reported before billing.");
-  console.log("Setup: $D setup");
+  console.log(`\n${OUTPUT_CONTRACT}`);
+  console.log("\nAuth: OpenAI (~/.gstack/openai.json, then OPENAI_API_KEY) when set, else Gemini (~/.gstack/gemini.json, then GEMINI_API_KEY).");
+  console.log("GSTACK_DESIGN_PROVIDER=openai|gemini picks one explicitly. Free Gemini key: https://aistudio.google.com/apikey");
+  console.log("If a key matches a current-directory .env file, the source is reported before billing.");
+  console.log("Setup: $D setup [--provider openai|gemini] [--key-stdin]");
 }
 
-async function runSetup(): Promise<void> {
-  const existing = resolveApiKey();
+const KEY_PREFIX: Record<ProviderName, string> = { openai: "sk-", gemini: "AIza" };
+const KEY_PAGE: Record<ProviderName, string> = { openai: "https://platform.openai.com/api-keys", gemini: "https://aistudio.google.com/apikey" };
+
+async function readStdinKey(): Promise<string> {
+  const reader = Bun.stdin.stream().getReader();
+  const { value } = await reader.read();
+  reader.releaseLock();
+  return new TextDecoder().decode(value).trim();
+}
+
+/**
+ * Store a key (prompted, or piped with --key-stdin) and smoke-test the
+ * provider it belongs to. --provider or --key-stdin stores the new key even
+ * when another provider's key already resolves; with neither, an existing key
+ * is smoke-tested as before.
+ */
+async function runSetup(flags: Record<string, string | boolean>): Promise<void> {
+  const requested = flags.provider;
+  if (requested !== undefined && requested !== "openai" && requested !== "gemini") {
+    console.error("--provider must be openai or gemini.");
+    process.exit(1);
+  }
+  let provider = requested as ProviderName | undefined;
+  const existing = provider || flags["key-stdin"] ? null : resolveProvider();
   if (existing) {
-    console.log("Existing API key found. Running smoke test...");
+    provider = existing.provider;
+    console.log(`Existing ${provider === "gemini" ? "Gemini" : "OpenAI"} key found. Running smoke test...`);
   } else {
-    console.log("No API key found. Please enter your OpenAI API key.");
-    console.log("Get one at: https://platform.openai.com/api-keys");
-    console.log("(Needs image generation permissions)\n");
-
-    // Read from stdin
-    process.stdout.write("API key: ");
-    const reader = Bun.stdin.stream().getReader();
-    const { value } = await reader.read();
-    reader.releaseLock();
-    const key = new TextDecoder().decode(value).trim();
-
-    if (!key || !key.startsWith("sk-")) {
-      console.error("Invalid key. Must start with 'sk-'.");
+    if (!flags["key-stdin"] && !process.stdin.isTTY) {
+      console.error("No terminal to type a key into.");
+      console.error("Fix: printf %s \"$KEY\" | $D setup --provider gemini --key-stdin (or --provider openai), or set GEMINI_API_KEY / OPENAI_API_KEY.");
       process.exit(1);
     }
-
-    saveApiKey(key);
-    console.log("Key saved to ~/.gstack/openai.json (0600 permissions).");
+    if (!flags["key-stdin"]) {
+      console.log(provider
+        ? `Enter your ${provider === "gemini" ? "Gemini" : "OpenAI"} API key (get one at ${KEY_PAGE[provider]}).`
+        : `No API key found. Enter an OpenAI key (sk-…, ${KEY_PAGE.openai}) or a free Gemini key (AIza…, ${KEY_PAGE.gemini}).`);
+      process.stdout.write("API key: ");
+    }
+    const key = await readStdinKey();
+    provider ??= key.startsWith(KEY_PREFIX.gemini) ? "gemini" : "openai";
+    if (!key || !key.startsWith(KEY_PREFIX[provider])) {
+      console.error(`Invalid key. A${provider === "openai" ? "n OpenAI" : " Gemini"} key starts with '${KEY_PREFIX[provider]}'.`);
+      process.exit(1);
+    }
+    saveApiKey(key, provider);
+    console.log(`Key saved to ~/.gstack/${provider}.json (0600 permissions).`);
   }
 
-  // Smoke test
   console.log("\nRunning smoke test (generating a simple image)...");
-  try {
-    await generate({
-      brief: "A simple blue square centered on a white background. Minimal, geometric, clean.",
-      output: "/tmp/gstack-design-smoke-test.png",
-      size: "1024x1024",
-      quality: "low",
-    });
-    console.log("\nSmoke test PASSED. Design generation is working.");
-  } catch (err: any) {
-    console.error(`\nSmoke test FAILED: ${err.message}`);
-    console.error("Check your API key and organization verification status.");
+  const shellProvider = process.env.GSTACK_DESIGN_PROVIDER;
+  process.env.GSTACK_DESIGN_PROVIDER = provider;
+  const smoke = await generate({
+    brief: "A simple blue square centered on a white background. Minimal, geometric, clean.",
+    output: path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gstack-design-smoke-")), "smoke-test.png"),
+    size: "1024x1024",
+    quality: "low",
+  });
+  if (smoke.exitCode !== 0) {
+    console.error(`\nSmoke test FAILED: ${smoke.failures.map(f => f.reason).join("; ")}`);
+    console.error(provider === "gemini"
+      ? "Check your Gemini key and its quota in Google AI Studio."
+      : "Check your API key and organization verification status.");
     process.exit(1);
+  }
+  console.log("\nSmoke test PASSED. Design generation is working.");
+  if (shellProvider === undefined) delete process.env.GSTACK_DESIGN_PROVIDER;
+  else process.env.GSTACK_DESIGN_PROVIDER = shellProvider;
+  let next: ProviderName | null = null;
+  try { next = resolveProvider()?.provider ?? null; } catch { /* an invalid shell setting fails the next run with its own Fix line */ }
+  if (next !== provider) {
+    const label = provider === "gemini" ? "Gemini" : "OpenAI";
+    console.log(`Note: later $D runs will not use this ${label} key yet${next ? `; ${next === "gemini" ? "Gemini" : "OpenAI"} is picked first` : ""}.`);
+    console.log(`Fix: export GSTACK_DESIGN_PROVIDER=${provider} (add it to your shell profile to keep it).`);
   }
 }
 
@@ -133,7 +180,7 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "generate":
-      await generate({
+      process.exitCode = (await generate({
         brief: flags.brief as string,
         briefFile: flags["brief-file"] as string,
         output: (flags.output as string) || "/tmp/gstack-mockup.png",
@@ -141,7 +188,7 @@ async function main(): Promise<void> {
         retry: normalizeIntFlag(flags.retry, { name: "retry", def: 0, min: 0 }),
         size: flags.size as string,
         quality: flags.quality as string,
-      });
+      })).exitCode;
       break;
 
     case "check":
@@ -149,9 +196,7 @@ async function main(): Promise<void> {
       break;
 
     case "compare": {
-      // Parse --images as glob or multiple files
-      const imagesArg = flags.images as string;
-      const images = await resolveImagePaths(imagesArg);
+      const images = await resolveImagePaths(flags.images as string, flags["images-file"] as string | undefined);
       const outputPath = (flags.output as string) || "/tmp/gstack-design-board.html";
       compare({ images, output: outputPath });
       // If --serve flag is set, publish the board.
@@ -191,13 +236,14 @@ async function main(): Promise<void> {
     }
 
     case "setup":
-      await runSetup();
+      await runSetup(flags);
       break;
 
     case "variants":
-      await variants({
+      process.exitCode = await variants({
         brief: flags.brief as string,
         briefFile: flags["brief-file"] as string,
+        briefsFile: flags["briefs-file"] as string,
         // #2032: pass the RAW flag through — variants() normalizes at its
         // consumption site (a pre-parseInt here would silently truncate "3.7").
         count: flags.count,
@@ -209,7 +255,7 @@ async function main(): Promise<void> {
       break;
 
     case "iterate":
-      await iterate({
+      process.exitCode = await iterate({
         session: flags.session as string,
         feedback: flags.feedback as string,
         output: (flags.output as string) || "/tmp/gstack-iterate.png",
@@ -261,7 +307,7 @@ async function main(): Promise<void> {
     }
 
     case "evolve":
-      await evolve({
+      process.exitCode = await evolve({
         screenshot: flags.screenshot as string,
         brief: flags.brief as string,
         output: (flags.output as string) || "/tmp/gstack-evolved.png",
@@ -329,7 +375,7 @@ async function main(): Promise<void> {
  * Stderr lines (in order):
  *   - "DAEMON_STARTED port=N version=V"  (or "DAEMON_ATTACHED port=N ..."
  *     if a daemon was already running)
- *   - "BOARD_PUBLISHED: http://127.0.0.1:N/boards/<id>/"
+ *   - "BOARD_PUBLISHED: http://127.0.0.1:N/<secret>/boards/<id>/"
  *   - "BOARD_URL: <same url>"  (alias for grep-friendliness)
  *   - "SERVE_STARTED: port=N html=<path>"  (legacy back-compat alias for
  *     any external script that scraped the pre-daemon output — note the
@@ -349,6 +395,7 @@ async function publishToDaemon(opts: { html: string; title?: string }): Promise<
   );
   const result = await publishBoard({
     port: ensured.port,
+    token: ensured.token,
     html: opts.html,
     title: opts.title,
   });
@@ -379,31 +426,6 @@ function openBrowser(url: string): void {
   } catch {
     console.error(`Open this URL in your browser: ${url}`);
   }
-}
-
-/**
- * Resolve image paths from a glob pattern or comma-separated list.
- */
-async function resolveImagePaths(input: string): Promise<string[]> {
-  if (!input) {
-    console.error("--images is required. Provide glob pattern or comma-separated paths.");
-    process.exit(1);
-  }
-
-  // Check if it's a glob pattern
-  if (input.includes("*")) {
-    const glob = new Bun.Glob(input);
-    const paths: string[] = [];
-    for await (const match of glob.scan({ absolute: true })) {
-      if (match.endsWith(".png") || match.endsWith(".jpg") || match.endsWith(".jpeg")) {
-        paths.push(match);
-      }
-    }
-    return paths.sort();
-  }
-
-  // Comma-separated or single path
-  return input.split(",").map(p => p.trim());
 }
 
 // Self-execution shortcut: when invoked with --daemon-mode, this same

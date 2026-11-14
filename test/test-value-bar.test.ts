@@ -3,7 +3,7 @@
  * sweeps tests. These checks prove the prompts carry the contract; the paid
  * cases in test/skill-e2e-test-value.test.ts carry the behavior claim.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -13,8 +13,11 @@ import { generateTestCoverageAuditInner } from '../scripts/resolvers/testing';
 import {
   CALLER_SEARCH_COMMAND, CALLER_SYMBOL_PATTERN, CARD_FIELD_MAX_BYTES, CATALOG, MESSAGES, PRAGMA, QUESTIONS, REASON_CODES,
   RETENTION_ONE_LINER, RETIREMENT_FIELDS, REVIEW_EVIDENCE_FIELDS, SWEEP_POINTER, TEST_VALUE_BAR_MAX_BYTES, TEST_VALUE_BAR_MODES,
+  NO_CLAIM_EXAMPLES, VALUE_CARD_FIELDS, VALUE_CARD_OPTIONAL_FIELD,
   WEAK_REASONS, clampCardField, generateTestValueBar, renderValueCard, type TestValueBarMode,
 } from '../scripts/resolvers/test-value';
+import { createShipCoverageValueFixture, recordsNonTestCallerSearch, weakGapCovers } from './helpers/test-value-fixture';
+import { expectMentions } from './helpers/prompt-structure';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const FIX = 'Fix: bun run gen:skill-docs && bun test test/test-value-bar.test.ts';
@@ -22,7 +25,8 @@ const read = (relative: string) => fs.readFileSync(path.join(ROOT, relative), 'u
 const ctx = { skillName: 'ship', tmplPath: '', host: 'claude', paths: HOST_PATHS.claude } as TemplateContext;
 const bar = (mode: TestValueBarMode) => generateTestValueBar(ctx, [mode]);
 
-const CARD_FORMAT = 'Value: protects=<...>; fails_when=<...>; why_new=<...>; seam=none';
+const CARD_FORMAT = 'Value: protects=<...>; fails_when=<...>; why_new=<...>; seam=none; no_claim=<...>';
+const NO_CLAIM_EXAMPLE_TOKENS = NO_CLAIM_EXAMPLES.map(example => `no_claim=${example}`);
 const shipSection = read('ship/sections/test-coverage.md');
 const shipGate = generateTestCoverageAuditInner(ctx, 'ship', 'gate');
 
@@ -35,6 +39,7 @@ const CONTRACT: Record<TestValueBarMode, { render: string; required: string[]; a
       'X = paths with a ★★/★★★ test / total paths', 'Y = paths with any test / total paths', RETENTION_ONE_LINER,
       'unless exact output is the declared contract (goldens, prompt bytes, wire formats)',
       'Its value card', 'Tests made obsolete by this plan', '## Tests to Retire',
+      'Value: protects={...}; fails_when={...}; why_new={...}; seam=none; no_claim={...}', ...NO_CLAIM_EXAMPLE_TOKENS,
     ],
     absent: ['100% coverage is the goal', 'Step 4.75'],
   },
@@ -46,7 +51,8 @@ const CONTRACT: Record<TestValueBarMode, { render: string; required: string[]; a
       '5 tests per generation pass', 'an extension uses one slot and a rejection uses none', '30-path/5-tests-per-pass/2-minute per-test caps',
       'precedence extended > added > rejected', REASON_CODES.join(', '),
       '"coverage_pct":N,"gaps":N,"diagram":"<full markdown coverage diagram for PR body>","tests_added":["path",...],"coverage_pct_value":N,"weak_gaps":[',
-      'a value-card header with four non-empty fields (else\n   `incomplete_card`)', 'a later duplicate is `duplicate_protects`', 'is `needs_seam`',
+      'the four required fields non-empty plus\n   an optional `no_claim`', 'an older four-field card stays valid', '`incomplete_card`', 'a later duplicate is `duplicate_protects`', 'is `needs_seam`',
+      ...NO_CLAIM_EXAMPLE_TOKENS,
       'No `tests_rejected` path may remain on disk as a new file', 'dispatch one read-only Agent', 'it uses no generation\n   pass',
       'Regression proof — fails at HEAD: yes · passes at base: yes | unavailable (<reason>) | manual · passes after fix: yes | pending',
       'base control unavailable: collection error', 'N of M regression tests got base control', 'worktree add --quiet --detach',
@@ -61,7 +67,7 @@ const CONTRACT: Record<TestValueBarMode, { render: string; required: string[]; a
   },
   qa: {
     render: bar('qa'),
-    required: [QUESTIONS[2], QUESTIONS[3], CARD_FORMAT, 'Put it in the 8e.5 record (/qa) or under each proposed test (/qa-only).', 'A missing upstream card never blocks'],
+    required: [QUESTIONS[2], QUESTIONS[3], CARD_FORMAT, 'A missing upstream card never blocks'],
     absent: [QUESTIONS[0], QUESTIONS[1]],
   },
   audit: {
@@ -80,6 +86,20 @@ describe('test value bar render contract', () => {
     const rendered = bar(mode);
     expect(rendered.includes('Example: Value: protects=') && rendered.includes('Rejected (covered_elsewhere)'), `${mode} needs one good card and one rejected proposal`).toBe(true);
     expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(TEST_VALUE_BAR_MAX_BYTES[mode]);
+  });
+
+  test('the card clamp applies to card lines only; written JSON keeps full values (C2)', () => {
+    for (const mode of TEST_VALUE_BAR_MODES) {
+      expect(bar(mode)).toContain(`each field at most ${CARD_FIELD_MAX_BYTES} UTF-8 bytes here (clamp to 157 plus \`...\`; written JSON keeps full values)`);
+    }
+  });
+
+  test('qa mode names only the invoking skill\'s card location (/qa-only has no 8e.5 record)', () => {
+    const forSkill = (skillName: string) => generateTestValueBar({ ...ctx, skillName }, ['qa']);
+    expect(forSkill('qa')).toContain('Put it in the 8e.5 record.');
+    expect(forSkill('qa')).not.toContain('proposed test');
+    expect(forSkill('qa-only')).toContain('Put it under each proposed test.');
+    expect(forSkill('qa-only')).not.toContain('8e.5');
   });
 
   test('plan and ship coverage audits render the bar at their call site', () => {
@@ -106,6 +126,22 @@ describe('test value bar render contract', () => {
     expect(clamped).not.toContain('\uFFFD');
     expect(clampCardField('short')).toBe('short');
     expect(renderValueCard({ protects: long, fails_when: 'x', why_new: 'y', seam: 'none' })).toStartWith(`Value: protects=${clamped}; fails_when=x;`);
+  });
+
+  test('no_claim is an optional fifth field: rendered last when present, absent from a four-field card (W5)', () => {
+    expect(VALUE_CARD_FIELDS).toEqual(['protects', 'fails_when', 'why_new', 'seam']);
+    expect(VALUE_CARD_OPTIONAL_FIELD).toBe('no_claim');
+    const four = renderValueCard({ protects: 'a', fails_when: 'b', why_new: 'c', seam: 'none' });
+    expect(four).toBe('Value: protects=a; fails_when=b; why_new=c; seam=none');
+    const five = renderValueCard({ protects: 'a', fails_when: 'b', why_new: 'c', seam: 'none', no_claim: NO_CLAIM_EXAMPLES[1] });
+    expect(five).toBe(`${four}; no_claim=${NO_CLAIM_EXAMPLES[1]}`);
+    expect(renderValueCard({ protects: 'a', fails_when: 'b', why_new: 'c', seam: 'none', no_claim: '€'.repeat(100) })).toEndWith('...');
+    for (const mode of TEST_VALUE_BAR_MODES) {
+      const rendered = bar(mode);
+      expect(rendered, `${mode} lacks both no_claim examples`).toContain(`no_claim=${NO_CLAIM_EXAMPLES[0]}`);
+      expect(rendered).toContain(`no_claim=${NO_CLAIM_EXAMPLES[1]}`);
+      expectMentions(rendered, [['no_claim', 'never waives']], `${mode} bar`);
+    }
   });
 });
 
@@ -134,9 +170,11 @@ describe('ship parent decision rules', () => {
   });
 
   test('the rejection step removes new rejected files and reports tracked ones for a hunk revert', () => {
-    const block = shipSection.slice(shipSection.indexOf('   while IFS= read -r f; do'), shipSection.indexOf('   REJECTED\n') + '   REJECTED\n'.length)
-      .split('\n').map(line => line.replace(/^ {3}/, '')).join('\n');
-    expect(block).toContain('<one rejected test path per line>');
+    const start = shipSection.indexOf('   REJECTED_FILE="$(git rev-parse');
+    const end = shipSection.indexOf('   rm -f "$REJECTED_FILE"\n', start) + '   rm -f "$REJECTED_FILE"\n'.length;
+    const block = shipSection.slice(start, end).split('\n').map(line => line.replace(/^ {3}/, '')).join('\n');
+    expect(block).toContain('<rejected-file-name>');
+    expect(block).toContain('done < "$REJECTED_FILE"');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-value-rejected-'));
     try {
       const git = (...args: string[]) => spawnSync('git', args, { cwd: dir, encoding: 'utf8', timeout: 10_000 });
@@ -147,13 +185,18 @@ describe('ship parent decision rules', () => {
       git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'seed');
       fs.appendFileSync(path.join(dir, 'test/kept.test.ts'), 'test("dup", () => {});\n');
       fs.writeFileSync(path.join(dir, 'test/new dup.test.ts'), 'test("dup", () => {});\n');
-      const script = block.replace('<one rejected test path per line>', 'test/new dup.test.ts\ntest/kept.test.ts');
+      fs.mkdirSync(path.join(dir, '.gstack/tmp'), { recursive: true });
+      const list = path.join(dir, '.gstack/tmp/rejected-tests.abc123');
+      fs.writeFileSync(list, 'test/new dup.test.ts\ntest/kept.test.ts\n../outside.test.ts\n');
+      const script = block.replace('<rejected-file-name>', 'rejected-tests.abc123');
       const run = spawnSync('bash', ['-c', script], { cwd: dir, encoding: 'utf8', timeout: 10_000 });
       expect(run.status).toBe(0);
       expect(run.stdout).toContain('REMOVED: test/new dup.test.ts');
       expect(run.stdout).toContain('REVERT_HUNK: test/kept.test.ts');
+      expect(run.stdout).toContain('SKIPPED (outside repo): ../outside.test.ts');
       expect(fs.existsSync(path.join(dir, 'test/new dup.test.ts'))).toBe(false);
       expect(fs.existsSync(path.join(dir, 'test/kept.test.ts'))).toBe(true);
+      expect(fs.existsSync(list)).toBe(false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -175,6 +218,7 @@ describe('static review specialist stays in sync', () => {
     const expected = [...QUESTIONS, ...CATALOG, ...REVIEW_EVIDENCE_FIELDS.map(field => `\`${field}\``), RETIREMENT_FIELDS.join(', '),
       ...REASON_CODES.map(code => `\`${code}\``), `${PRAGMA} reason="<why>"`, CALLER_SEARCH_COMMAND, CALLER_SYMBOL_PATTERN, SWEEP_POINTER,
       'never an auto-delete', 'stays a coverage gap at its existing severity', 'one INFORMATIONAL line', 'Regression test without red proof',
+      '`no_claim=...`',
       `test-value-bar.md#${MESSAGES.callerCheckUnavailable.anchor}`];
     const flat = specialist.replace(/\n/g, ' ').replace(/ +/g, ' ');
     expect(expected.filter(text => !flat.includes(text.replace(/\n/g, ' '))), `review/specialists/testing.md is out of sync with scripts/resolvers/test-value.ts`).toEqual([]);
@@ -186,7 +230,7 @@ describe('template contracts', () => {
     expect(read('qa/SKILL.md.tmpl')).toContain('{{TEST_VALUE_BAR:qa}}');
     expect(read('qa-only/SKILL.md.tmpl')).toContain('{{TEST_VALUE_BAR:qa}}');
     expect(read('test-audit/SKILL.md.tmpl')).toContain('{{TEST_VALUE_BAR:audit}}');
-    for (const skill of ['qa', 'qa-only']) expect(read(`${skill}/SKILL.md`), `${skill} lacks the rendered bar. ${FIX}`).toContain(bar('qa'));
+    for (const skill of ['qa', 'qa-only']) expect(read(`${skill}/SKILL.md`), `${skill} lacks the rendered bar. ${FIX}`).toContain(generateTestValueBar({ ...ctx, skillName: skill }, ['qa']));
     expect(read('test-audit/SKILL.md')).toContain(bar('audit'));
     const templates = spawnSync('git', ['ls-files', '*.tmpl'], { cwd: ROOT, encoding: 'utf8', timeout: 10_000 }).stdout.split('\n').filter(Boolean);
     expect(templates.filter(file => read(file).includes('prefer too many to too few'))).toEqual([]);
@@ -226,7 +270,6 @@ describe('docs and registration', () => {
     const lists: [string, string][] = [
       ['AGENTS.md', '| `/test-audit` |'],
       ['README.md', '| `/test-audit` | **Test Auditor** |'],
-      ['README.md', '/deslop-shared-libs, /test-audit, /ship'],
       ['docs/skills.md', '| [`/test-audit`](#test-audit) |'],
       ['docs/skills.md', '## `/test-audit`'],
       ['gstack/llms.txt', '[/test-audit](test-audit/SKILL.md)'],
@@ -236,6 +279,46 @@ describe('docs and registration', () => {
       ['test/helpers/touchfiles-data.ts', "'test-audit-report-only': ['test-audit/**'"],
     ];
     expect(lists.filter(([file, text]) => !read(file).includes(text)).map(([file, text]) => `${file}: ${text}`)).toEqual([]);
-    expect(read('README.md').split('/deslop-shared-libs, /test-audit, /ship').length - 1).toBe(2);
+    expect(read('README.md').split('/deslop-shared-libs, /test-audit, /ship').length - 1).toBe(0);
   });
+});
+
+// Stored test-only-export evidence for the review test-value caller-search grader.
+{
+  const stored = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/test-value-seam-evidence.json'), 'utf8')) as
+    { known_good: Record<string, unknown>; known_bad: Record<string, unknown> };
+
+  describe('test-only export caller-search evidence', () => {
+    test.each(Object.entries(stored.known_good))('accepts %s', (_name, evidence) => {
+      expect(recordsNonTestCallerSearch({ evidence })).toBe(true);
+    });
+    test.each(Object.entries(stored.known_bad))('rejects %s', (_name, evidence) => {
+      expect(recordsNonTestCallerSearch({ evidence })).toBe(false);
+    });
+  });
+}
+
+describe('ship-coverage-value weak_gaps grader', () => {
+  // Run 42571575838, codex-sol gate arm, t1: the ★-only refund path as a bare file:line row.
+  const captured = { path: 'src/billing.ts:11', existing_test: 'test/billing.test.ts:16', reason: 'star_one' };
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'ship-coverage-value-'));
+  createShipCoverageValueFixture(cwd);
+  const covers = (gap: unknown) => weakGapCovers(gap, cwd, /refund/i);
+
+  test('a star_one row inside refundPayment with its smoke test counts, as does a row naming refund', () => {
+    expect(/refund/i.test(JSON.stringify(captured))).toBe(false);
+    expect(covers(captured)).toBe(true);
+    expect(covers({ path: 'src/billing.ts:refundPayment', existing_test: 'test/billing.test.ts', reason: 'star_one' })).toBe(true);
+  });
+
+  test('processPayment rows, other reasons, empty rows and the processPayment test do not count', () => {
+    expect(covers({ ...captured, path: 'src/billing.ts:4' })).toBe(false);
+    expect(covers({ ...captured, reason: 'gate_failed' })).toBe(false);
+    expect([].some(covers)).toBe(false);
+    expect(covers({})).toBe(false);
+    expect(covers({ ...captured, existing_test: 'test/billing.test.ts:6' })).toBe(false);
+    expect(covers({ ...captured, path: 'src/billing.ts:40' })).toBe(false);
+  });
+
+  afterAll(() => fs.rmSync(cwd, { recursive: true, force: true }));
 });

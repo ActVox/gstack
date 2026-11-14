@@ -1,9 +1,9 @@
 {
   "name": "gstack-diagram-render",
-  "sha256": "46ed274ca8b6bc763308c87fea05fa9ad940d7f6bcfbd1bc0abbf56c6c0c705d",
-  "srcSha256": "07238fae312bc0444f62b0a0a3404a8a38c45cef505aa1528c60a0ded17cbe06",
-  "bytes": 7901685,
-  "bunVersion": "1.3.10",
+  "sha256": "c2d37f9f924baae2a146bc109bf9b4c308d89f49e08b1c35793edc310b579444",
+  "srcSha256": "17d8921086e091252425c63f06cab01b4626d8e0fa9fe8738267e1ac4ade52e8",
+  "bytes": 7884979,
+  "bunVersion": "1.4.2",
   "deps": {
     "@excalidraw/excalidraw": "0.18.1",
     "@excalidraw/mermaid-to-excalidraw": "2.2.2",

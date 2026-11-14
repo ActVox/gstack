@@ -19,10 +19,13 @@ import * as path from 'path';
 import { TUNNEL_COMMANDS } from '../src/server';
 import { __resetConnectRateLimit } from '../src/token-registry';
 import { makeServer, stubRouteContext, callRoute, fakeTunnel, type TestServer } from './route-test-harness';
+import { usePrivateStateRoot } from '../../test/helpers/private-state-root';
+import { __resetTunnelDenialLog, logTunnelDenial } from '../src/tunnel-denial-log';
 
 const SERVER_SRC = fs.readFileSync(path.join(import.meta.dir, '../src/server.ts'), 'utf-8');
 const TABLE_SRC = fs.readFileSync(path.join(import.meta.dir, '../src/routes/table.ts'), 'utf-8');
 
+const stateRoot = usePrivateStateRoot();
 let server: TestServer;
 let scoped = '';
 const overlayCalls: string[] = [];
@@ -110,7 +113,7 @@ describe('Tunnel command allowlist', () => {
     'goto', 'click', 'text', 'screenshot',
     'html', 'links', 'forms', 'accessibility',
     'attrs', 'media', 'data',
-    'scroll', 'press', 'type', 'select', 'wait', 'eval',
+    'scroll', 'press', 'type', 'select', 'wait',
     // Tab + navigation primitives operator docs and CLI hints already promised
     'newtab', 'tabs', 'back', 'forward', 'reload',
     // Read/inspect/write operators paired agents need to be useful
@@ -244,6 +247,74 @@ describe('/command tunnel command allowlist', () => {
       expect(resp.body.hint).toContain('Tunnel commands: ');
     }
   });
+
+  const guarded = [
+    { command: 'goto', args: ['file://./.env'] },
+    { command: 'newtab', args: ['file:///tmp/page.html'] },
+    { command: 'eval', args: ['script.js'] },
+    { command: 'screenshot', args: ['assets/logo.png'] },
+    { command: 'snapshot', args: ['-a', '-o', 'annotated.png'] },
+    { command: 'screenshot', args: [] },
+    { command: 'screenshot', args: ['--selector', '.hero'] },
+    { command: 'snapshot', args: ['-a'] },
+    { command: 'snapshot', args: ['-H', '{"@e1":"green"}'] },
+  ];
+  function recordingCtx(handled: unknown[]) {
+    return stubRouteContext({
+      resetIdleTimer: () => {},
+      commands: {
+        handle: async (body) => { handled.push(body); return new Response('{"ok":true}'); },
+        handleInternal: async () => { throw new Error('unexpected handleInternal'); },
+      },
+    });
+  }
+
+  test('tunnel surface refuses non-web navigation, eval, and screenshot output paths before dispatch', async () => {
+    const handled: unknown[] = [];
+    for (const body of guarded) {
+      const resp = await statusAndJson(await callRoute('POST', '/command', recordingCtx(handled), { surface: 'tunnel', body }));
+      expect(resp.status).toBe(403);
+      expect(resp.body.error).toBe(`Command '${body.command}' is not allowed over the tunnel surface`);
+    }
+    expect(handled).toEqual([]);
+  });
+
+  test('local surface dispatches the same commands unchanged', async () => {
+    const handled: unknown[] = [];
+    for (const body of guarded) {
+      const resp = await callRoute('POST', '/command', recordingCtx(handled), { surface: 'local', body });
+      expect(resp.status).toBe(200);
+    }
+    expect(handled).toEqual(guarded);
+  });
+
+  test('a screenshot with no args field is gated like args: [] (tunnel refuses, local dispatches)', async () => {
+    const handled: unknown[] = [];
+    const body = { command: 'screenshot' };
+    const tunnel = await statusAndJson(await callRoute('POST', '/command', recordingCtx(handled), { surface: 'tunnel', body }));
+    expect(tunnel.status).toBe(403);
+    expect(tunnel.body.error).toBe(`Command 'screenshot' is not allowed over the tunnel surface`);
+    expect(handled).toEqual([]);
+    const local = await callRoute('POST', '/command', recordingCtx(handled), { surface: 'local', body });
+    expect(local.status).toBe(200);
+    expect(handled).toEqual([body]);
+  });
+
+  test('tunnel surface still dispatches web navigation and path-free screenshots', async () => {
+    const handled: unknown[] = [];
+    const allowed = [
+      { command: 'goto', args: ['https://example.com'] },
+      { command: 'newtab', args: ['http://localhost:3000/'] },
+      { command: 'screenshot', args: ['--base64'] },
+      { command: 'screenshot', args: ['--base64', '--selector', '.hero'] },
+      { command: 'snapshot', args: ['-i'] },
+    ];
+    for (const body of allowed) {
+      const resp = await callRoute('POST', '/command', recordingCtx(handled), { surface: 'tunnel', body });
+      expect(resp.status).toBe(200);
+    }
+    expect(handled).toEqual(allowed);
+  });
 });
 
 describe('Tunnel listener lifecycle', () => {
@@ -359,6 +430,16 @@ describe('Rate limit + denial log wiring', () => {
     expect(SERVER_SRC).toContain("logTunnelDenial(req, url, 'missing_scoped_token')");
   });
 
+  test('a denial is logged under the state root current at write time (#2895)', async () => {
+    __resetTunnelDenialLog();
+    const url = new URL('http://127.0.0.1/command');
+    logTunnelDenial(new Request(url), url, 'missing_scoped_token');
+    const log = path.join(stateRoot.dir, 'security', 'attempts.jsonl');
+    const deadline = Date.now() + 2000;
+    while (!fs.existsSync(log) && Date.now() < deadline) await Bun.sleep(10);
+    expect(fs.readFileSync(log, 'utf8')).toContain('missing_scoped_token');
+  });
+
   test('/connect rate limit was loosened from 3/min to 300/min', () => {
     const registrySrc = fs.readFileSync(
       path.join(import.meta.dir, '../src/token-registry.ts'),
@@ -377,9 +458,10 @@ describe('E3: /welcome GSTACK_SLUG path traversal gate', () => {
       fs.mkdirSync(path.dirname(page(slug)), { recursive: true });
       fs.writeFileSync(page(slug), body);
     }
-    const saved = { HOME: process.env.HOME, GSTACK_SLUG: process.env.GSTACK_SLUG };
+    const saved = { HOME: process.env.HOME, GSTACK_SLUG: process.env.GSTACK_SLUG, GSTACK_HOME: process.env.GSTACK_HOME };
     try {
       process.env.HOME = home;
+      delete process.env.GSTACK_HOME;
       process.env.GSTACK_SLUG = 'good-slug_1';
       expect(await (await server.local('/welcome')).text()).toBe('GOOD-SLUG-PAGE');
       // A traversal slug (and any slug outside the charset) falls back to 'unknown'.

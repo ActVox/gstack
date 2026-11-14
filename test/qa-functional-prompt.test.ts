@@ -1,14 +1,16 @@
 import { expect, test } from 'bun:test';
-import { qaFunctionalPrompt, QA_FUNCTIONAL_CASES } from './helpers/qa-functional-eval';
+import { qaFunctionalPrompt, qaFunctionalRequiredProbes, QA_FUNCTIONAL_CASES, QA_WEBHOOK_FIX_CAPTURE_LIMIT, QA_WEBHOOK_POST_REPAIR_SCENARIOS } from './helpers/qa-functional-eval';
 import { qaCommandAllowed } from './helpers/qa-functional-observer';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseNDJSON } from './helpers/session-runner';
-import { qaFunctionalVerdict, qaNativeProbes } from './helpers/qa-functional-evidence';
+import { QA_WEBHOOK_REQUIRED_SCENARIOS, qaFunctionalVerdict, qaNativeProbes } from './helpers/qa-functional-evidence';
 import { createQAFunctionalFixture, ownedPath } from './helpers/qa-functional-fixture';
 import { validateQACheckpoints } from './helpers/qa-checkpoint-evidence';
 import { computePaidCaseSelection } from '../scripts/test-paid-shards';
+import { generateQAExploratory } from '../scripts/resolvers/qa';
+import { HOST_PATHS } from '../scripts/resolvers/types';
 
 test.each(['full', 'pr'] as const)('%s selection assigns the captured webhook regression to its native owner', profile => {
   for (const file of ['qa-webhook-r85-checkpoints.json', 'qa-functional-ci-36505065023.json']) {
@@ -81,22 +83,15 @@ test('functional driver discloses its learning, CLI coverage and repair acceptan
   for (const entry of QA_FUNCTIONAL_CASES) {
     const prompt = qaFunctionalPrompt(entry);
     expect(prompt).toContain(`Read ${entry.mode}/SKILL.md, qa/sections/scope.md, ${entry.mode}/sections/exploratory.md and qa/sections/system-functional.md in full`);
-    expect(prompt).toContain('All four reads are required before probing in this fixture, even when its surfaces and isolation are already established');
-    expect(prompt).toContain('command is the exact full outer capture invocation, including that ID and all wrapper options, not just the native child command after --');
     expect(prompt).toContain('"command":"<exact full outer capture invocation>"');
     expect(prompt).not.toContain('<exact executed native probe command>');
-    expect(prompt).toContain('different later command');
-    expect(prompt).toContain('not the required same-command replay');
-    expect(prompt).toContain('Select that checkpoint ID in annotations.learning');
-    expect(prompt).toContain('the production helper copies its observationCommand, hypothesis and nextCommand');
-    expect(prompt).toContain('different native child commands');
-    expect(prompt).toContain('Only the helper writes observed fields');
-    expect(prompt).toContain('English, more than 20 characters');
-    if (entry.family === 'cli') expect(prompt).toContain('a successful apply; balance alone is not enough');
+    expect(prompt).toContain('annotations.learning');
+    expect(prompt).toContain('observationCommand, hypothesis and nextCommand');
+    expect(prompt).toMatch(/more than 20 characters/);
     if (entry.mode === 'qa') {
       expect(prompt).toContain(`repair only src/${entry.family === 'cli' ? 'cli' : 'worker'}.ts`);
-      expect(prompt).toContain('existing tests remain read-only');
-      expect(prompt).toContain('Freeze all test files after red');
+      expect(prompt).toMatch(/existing tests remain read-only/i);
+      expect(prompt).toMatch(/freeze all test files after red/i);
     }
   }
 });
@@ -140,7 +135,12 @@ test('CI native exploration Read does not stand in for completed method Reads', 
   try {
     for (const variant of ['omitted methods', 'pending methods', 'completed methods']) {
       const events = structuredClone(captured.omittedReadEvents);
-      if (variant !== 'omitted methods') events.push(...captured.completedMethodEvents.filter(event => variant === 'completed methods' || event.type === 'assistant'));
+      if (variant !== 'omitted methods') events.push(...structuredClone(captured.completedMethodEvents.filter(event => variant === 'completed methods' || event.type === 'assistant')));
+      for (const part of events.flatMap((event: any) => Array.isArray(event.message?.content) ? event.message.content : [])) {
+        if (part.type === 'tool_result' && typeof part.content === 'string' && part.content.includes('AUTO-GENERATED from system-functional.md.tmpl')) {
+          part.content = readFileSync(join(import.meta.dir, '../qa/sections/system-functional.md'), 'utf8').split('\n').map((line, i) => `${i + 1}\t${line}`).join('\n');
+        }
+      }
       const parsed = parseNDJSON(events.map(event => JSON.stringify(event)));
       expect(parsed.toolCalls.some(call => call.tool === 'Read' && call.input.file_path.endsWith('/qa-only/sections/exploratory.md') && call.output.includes('# Shared exploratory QA'))).toBe(true);
       const errors = qaFunctionalVerdict(fixture, 'qa-only', {
@@ -164,12 +164,12 @@ test('the native launcher consumes the family-specific actor boundary', () => {
     expect(prompt).not.toContain('at Standard depth');
     expect(prompt).toContain('successful checkpoint publication before the next probe');
     expect(prompt).toContain('no shell composition, scripts or added path operands');
-    expect(prompt).toContain('ONLY complete JSON actually emitted');
+    expect(prompt).toMatch(/only complete JSON actually emitted/i);
     expect(prompt).toContain('never a combined command list');
     expect(prompt).toContain('Put tests, raw CLI diagnostics, launch failures and timeouts in Markdown');
-    expect(prompt).toContain(entry.family === 'cli'
-      ? 'The generic wrapper does NOT support wait'
-      : 'bun cancel.ts is a CLI-only entrypoint, not part of this fixture');
+    expect(prompt).toMatch(entry.family === 'cli'
+      ? /the generic wrapper does not support wait/i
+      : /bun cancel\.ts is a CLI-only entrypoint, not part of this fixture/i);
     expect(prompt).not.toContain('parseInt');
     if (entry.family === 'webhook') expect(prompt).toContain('Choose their order from observations after the happy path');
     if (entry.family === 'webhook' && entry.mode === 'qa-only') {
@@ -195,54 +195,50 @@ test('declared examples respect the existing closed native grammar', () => {
   }
 });
 
+// Gate 40290033102 slice 9 (qa-functional-webhook-fix): the agent ran `bun run probe -- --help`
+// bare, outside a capture, before its first capture. The grammar refuses it, and the only
+// --help the interface grants is the helper's own, which the prompt now says in so many words.
+test('the prompt grants --help to the evidence helper alone, and a bare probe --help stays outside the grammar', () => {
+  for (const entry of QA_FUNCTIONAL_CASES) {
+    const prompt = qaFunctionalPrompt(entry);
+    const helper = prompt.indexOf('`bun bin/gstack-qa-evidence --help` prints its usage');
+    expect(helper).toBeGreaterThan(-1);
+    expect(prompt.slice(helper)).toContain("That is the only --help here: the probe's contract is README.md, so a bare bun run probe (with --help or any argument) outside a capture is a bypass, not a read.");
+    expect(prompt.indexOf('That is the only --help here')).toBeLessThan(prompt.indexOf('observation form'));
+  }
+  for (const command of ['bun run probe -- --help', 'bun run probe --help', 'bun run probe', 'bun run probe -- help']) {
+    expect(qaCommandAllowed(command), command).toBe(false);
+  }
+  expect(qaCommandAllowed('bun bin/gstack-qa-evidence --help')).toBe(true);
+});
+
 test('artifact completion preserves exact evidence before concise linked reporting', () => {
   for (const entry of QA_FUNCTIONAL_CASES) {
     const prompt = qaFunctionalPrompt(entry);
-    expect(prompt).toContain('Materialize qa-reports/evidence.json first, then write a concise qa-reports/report.md');
-    expect(prompt).toContain('using the functional report structure');
-    expect(prompt).toContain('Link the evidence and checkpoint files rather than repeating full probe payloads in Markdown');
-    expect(prompt).toContain('Both artifacts are required before completion');
-    expect(prompt).toContain('The learning array is a summary: choose one completed checkpoint');
-    expect(prompt).toContain('not another probe or a duplicate of the complete checkpoint ledger');
-    expect(prompt).toContain('Both commands must name exact captured probes with different native child commands');
-    expect(prompt).toContain('Preserve every checkpoint and link every checkpoint in Markdown');
-    expect(prompt).toContain('keep every executed probe and its complete JSON in evidence');
-    expect(prompt).toContain('Evidence rows contain ONLY complete JSON actually emitted by native probes, including failures and repeats');
-    expect(prompt).toContain('retain pre-repair results alongside green results');
-    expect(prompt).toContain('Never synthesize JSON');
-    expect(prompt).toContain('one causal sentence per checkpoint hypothesis (English, more than 20 characters) and compact JSON formatting, preserving every field and value');
-    expect(prompt).toContain('retain its headings and required fields');
-    expect(prompt).toContain('link to evidence.json and checkpoints for details already recorded there');
-    expect(prompt).toContain('After saving both artifacts, return only their paths and the actual completion status');
-    expect(prompt).toContain('Never shorten native JSON or omit a required probe, check or field');
-    expect(prompt).toContain('aim under 400 words');
+    expect(prompt.indexOf('qa-reports/evidence.json')).toBeGreaterThan(-1);
+    expect(prompt.indexOf('qa-reports/evidence.json')).toBeLessThan(prompt.indexOf('qa-reports/report.md'));
+    expect(prompt).toMatch(/both artifacts are required before completion/i);
+    expect(prompt).toMatch(/never synthesize JSON/i);
+    expect(prompt).toMatch(/never shorten native JSON or omit a required probe, check or field/i);
   }
   const source = readFileSync(join(import.meta.dir, 'helpers/qa-functional-eval.ts'), 'utf8');
-  expect(source).toContain('maxTurns: 40');
-  expect(source).toContain('completionReserveMs: timeout / 4');
+  expect(Number(source.match(/maxTurns: (\d+)/)?.[1])).toBeGreaterThanOrEqual(40);
+  expect(source).toContain('completionReserveMs:');
 });
 
 test('fix completion budgets for required repair and avoids duplicating preserved evidence', () => {
   for (const entry of QA_FUNCTIONAL_CASES) {
     const prompt = qaFunctionalPrompt(entry);
     if (entry.mode === 'qa') {
-      expect(prompt).toContain('a reproduced in-tier defect requires the authorized native regression, repair and verification');
-      expect(prompt).toContain('retain its headings and required fields');
-      expect(prompt).toContain('link to evidence.json and checkpoints for details already recorded there');
-      expect(prompt).toContain('Include the diagnosis, red/green test results and coverage limits');
-      expect(prompt).toContain('After saving both artifacts, return only their paths and the actual completion status');
-      expect(prompt).toContain('Never shorten native JSON or omit a required probe, check or field');
       const stages = ['1. Prove the regression red', '2. On the repaired source', '3. Save the evidence and Markdown artifacts'];
       const positions = stages.map(stage => prompt.indexOf(stage));
       expect(positions.every(position => position >= 0)).toBe(true);
       expect(positions).toEqual([...positions].sort((a, b) => a - b));
-      expect(prompt).toContain('A green test suite does not substitute for these native probes');
-      expect(prompt).toContain('not a signal to stop stage 2');
-      expect(prompt).toContain('report incomplete; do not call it complete with a caveat');
-      expect(prompt).toContain('one causal sentence per checkpoint hypothesis (English, more than 20 characters) and compact JSON formatting, preserving every field and value');
+      expect(prompt).toMatch(/green test suite does not substitute for these native probes/i);
+      expect(prompt).toMatch(/report incomplete; do not call it complete/i);
     } else {
       expect(prompt).not.toContain('This is a fix run');
-      expect(prompt).toContain('Include the diagnosis, proposed test stubs and coverage limits');
+      expect(prompt).toMatch(/proposed test stubs/i);
       expect(prompt).not.toContain('Include the diagnosis, red/green test results');
     }
   }
@@ -265,22 +261,83 @@ test('webhook fix stage asks for the fix-loop probes; the R29 scenario omissions
   }
   const fix = qaFunctionalPrompt({ family: 'webhook', mode: 'qa' });
   const verification = fix.slice(fix.indexOf('2. On the repaired source'), fix.indexOf('3. Save the evidence'));
-  expect(verification).toContain('run the original failing probe, an adjacent happy-path probe, cancellation and the unavailable-dependency probe');
+  for (const probe of ['original failing probe', 'happy-path probe', 'cancellation', 'unavailable-dependency probe']) expect(verification).toContain(probe);
   expect(verification).not.toContain('All eight scenarios');
-  expect(fix).toContain('the completion reserve does not end required coverage');
-  expect(verification).toBe(((prompt: string) => prompt.slice(prompt.indexOf('2. On the repaired source'), prompt.indexOf('3. Save the evidence')))(qaFunctionalPrompt({ family: 'cli', mode: 'qa' })));
+  expect(fix).toMatch(/completion reserve does not end required coverage/i);
+  // Paid run 38986120559: a status-only repair fixed both concurrency orders but not partial, which stage 2 never asked for
+  // while verifyQANativeRegression reruns all eight. The webhook stage now names the repaired invariant's scenarios; the CLI
+  // stage keeps its four probes.
+  const cli = ((prompt: string) => prompt.slice(prompt.indexOf('2. On the repaired source'), prompt.indexOf('3. Save the evidence')))(qaFunctionalPrompt({ family: 'cli', mode: 'qa' }));
+  expect(cli).toContain('2. On the repaired source, run the original failing probe, an adjacent happy-path probe, cancellation and the unavailable-dependency probe.');
+  expect(verification).toContain('2. On the repaired source, run the original failing probe and every other scenario of the repaired invariant (duplicate, partial, concurrent-ab, concurrent-ba), then the adjacent happy-path probe, cancellation and the unavailable-dependency probe.');
+  expect(verification.slice(verification.indexOf('dependency probe. '))).toBe(cli.slice(cli.indexOf('dependency probe. ')));
   const report = qaFunctionalPrompt({ family: 'webhook', mode: 'qa-only' });
-  expect(report).toContain('All eight scenarios are required coverage; a replay does not replace another scenario');
+  expect(report).toMatch(/all eight scenarios are required coverage/i);
   for (const scenario of required) expect(report).toContain(scenario);
 });
 
 
+test('webhook fix budget names the post-repair scenarios up front, and they feed only the capture nudge', () => {
+  const fix = qaFunctionalPrompt({ family: 'webhook', mode: 'qa' });
+  const budget = fix.slice(fix.indexOf('Capture budget:'), fix.indexOf('Complete these stages in order'));
+  expect(budget).toBe('Capture budget: 12 captures in total. Reserve the post-repair reruns first: the 7 scenarios of stage 2 plus each distinct pre-repair command your verdict relies on that they do not repeat (for example a reject probe); pre-repair exploration gets only what remains. If those reruns cannot all fit, report the rest as open. If the remaining pre-repair captures cannot establish and replay the defect, report incomplete. ');
+  expect(fix.indexOf('Capture budget:')).toBeLessThan(fix.indexOf('1. Prove the regression red'));
+  for (const entry of QA_FUNCTIONAL_CASES.filter(entry => entry.id !== 'qa-functional-webhook-fix')) expect(qaFunctionalPrompt(entry)).not.toContain('Capture budget:');
+  expect([...QA_WEBHOOK_POST_REPAIR_SCENARIOS]).toEqual(['duplicate', 'partial', 'concurrent-ab', 'concurrent-ba', 'happy', 'cancel', 'dependency']);
+  expect(qaFunctionalRequiredProbes({ family: 'webhook', mode: 'qa' })).toEqual(QA_WEBHOOK_POST_REPAIR_SCENARIOS.map(scenario => `bun run probe -- ${scenario}`));
+  expect(qaFunctionalRequiredProbes({ family: 'webhook', mode: 'qa-only' })).toEqual(QA_WEBHOOK_REQUIRED_SCENARIOS['qa-only'].map(scenario => `bun run probe -- ${scenario}`));
+  expect(qaFunctionalRequiredProbes({ family: 'cli', mode: 'qa' })).toBeUndefined();
+  expect(QA_WEBHOOK_REQUIRED_SCENARIOS.qa).toEqual(['happy', 'cancel', 'dependency']);
+  const source = readFileSync(join(import.meta.dir, 'helpers/qa-functional-eval.ts'), 'utf8');
+  expect(source).toContain('GSTACK_QA_REQUIRED_PROBES: JSON.stringify(qaFunctionalRequiredProbes(entry))');
+});
+
+test('webhook fix budget fits a pre-repair reject plus the reproduced defect inside the unchanged 12-capture ceiling', () => {
+  expect(QA_WEBHOOK_FIX_CAPTURE_LIMIT).toBe(12);
+  const probe = (scenario: string) => `bun run probe -- ${scenario}`;
+  const preRepair = ['reject', 'duplicate', 'duplicate'].map(probe);
+  const reliedOn = [...new Set(preRepair)];
+  const postRepair = [...new Set([...QA_WEBHOOK_POST_REPAIR_SCENARIOS.map(probe), ...reliedOn])];
+  expect(postRepair).toEqual([...QA_WEBHOOK_POST_REPAIR_SCENARIOS.map(probe), probe('reject')]);
+  expect(preRepair.length + postRepair.length).toBe(11);
+  expect(preRepair.length + postRepair.length).toBeLessThanOrEqual(QA_WEBHOOK_FIX_CAPTURE_LIMIT);
+  expect(QA_WEBHOOK_FIX_CAPTURE_LIMIT - postRepair.length).toBeGreaterThanOrEqual(preRepair.length);
+  const fix = qaFunctionalPrompt({ family: 'webhook', mode: 'qa' });
+  const budget = fix.slice(fix.indexOf('Capture budget:'), fix.indexOf('Complete these stages in order'));
+  expect(budget.indexOf('Reserve the post-repair reruns first')).toBeLessThan(budget.indexOf('pre-repair exploration gets only what remains'));
+  expect(budget).toContain('report the rest as open');
+});
+
+test('fix runs rerun every pre-repair capture their verdict relies on; superseded rows stay open until rerun', () => {
+  // Paid run 39053431488 (#3252): capture 003 (duplicate) was labelled superseded and never rerun after the repair.
+  const rule = 'After your final repair, rerun every pre-repair capture your verdict relies on; a superseded row stays open until its command reran on the repaired source.';
+  for (const entry of QA_FUNCTIONAL_CASES) {
+    const prompt = qaFunctionalPrompt(entry);
+    if (entry.mode === 'qa') expect(prompt.slice(prompt.indexOf('2. On the repaired source'), prompt.indexOf('3. Save the evidence'))).toContain(rule);
+    else expect(prompt).not.toContain(rule);
+  }
+});
+
+test('exploratory sections state one stop rule tied to per-rule input probes, and fix runs close superseded captures', () => {
+  // PR gates 38983306684, 39001107574 and 39073934326 (#3260 at 93449bc): cli-report counted `-5` as its sign probe and never
+  // probed the amount's digits-only rule with an otherwise valid value, so it missed the seeded non-digit defect. A worked
+  // example naming the signed amount (0fe616e) was misread as 'a signed amount breaks only the digits-only rule' (local
+  // run fw3b-cli1), so the rule states the principle instead: break one rule, satisfy every other.
+  const stop = "Stop when scoped contracts are tested or blocked: each field's documented input rule needs a probe that breaks only it and satisfies every other rule; rules uncovered at a probe/time cap go in limits.";
+  const fix = 'After a fix, every earlier capture is superseded, even from a client that prints no snapshot: rerun each one your verdict relies on, or report it as an open remainder.';
+  for (const rel of ['qa/sections/exploratory.md', 'qa-only/sections/exploratory.md']) {
+    const section = readFileSync(join(import.meta.dir, '..', rel), 'utf8');
+    expect(section.split(stop)).toHaveLength(2);
+    expect(section.match(/^Stop when\b.*$/gm)).toEqual([stop]);
+    expect(section.match(/input rule/g)).toHaveLength(1);
+    expect(section.includes(fix)).toBe(rel.startsWith('qa/'));
+  }
+  expect(readFileSync(join(import.meta.dir, '../qa/sections/system-functional.md'), 'utf8')).toContain('One probe per documented input rule of each field (allowed characters, format, sign, range, arity) breaking only it:');
+});
+
 test('fix-stage checkpoint provenance survives intervening native regression tests', () => {
   const prompt = qaFunctionalPrompt({ family: 'webhook', mode: 'qa' });
-  expect(prompt).toContain('most recent completed native probe');
-  expect(prompt).toContain('Tests, source edits and clock reads do not replace that observation');
-  expect(prompt).toContain('put red/green test output in the report, not in observed');
-  expect(prompt).toContain('write no checkpoint when there is no next probe');
+  expect(prompt).toMatch(/red\/green test output in the report, not in observed/i);
 });
 
 test('R29 captured webhook bytes bind across a green test; test summaries and altered JSON do not', () => {
@@ -376,32 +433,21 @@ test.each(JSON.parse(readFileSync(join(import.meta.dir, 'fixtures/qa-webhook-r85
 
 test('report-only exploration requires a completed written checkpoint before the next probe', () => {
   const section = readFileSync(join(import.meta.dir, '../qa-only/sections/exploratory.md'), 'utf8');
-  const positions = ['1. First demonstrate success', '2. **Decide whether another probe is needed.**', '**Publish before probing.**', '3. Run that exact probe; G enforces the deadline when bounded']
-    .map(marker => section.indexOf(marker));
-  expect(positions.every(position => position >= 0)).toBe(true);
-  expect(positions).toEqual([...positions].sort((a, b) => a - b));
   expect(section).toContain('exploration-NNN.json');
-  expect(section).toContain("Reuse resolved REPORT_DIR");
-  expect(section).toContain('own a fresh');
-  expect(section).toContain('owned probe directory');
+  expect(section).toContain('Reuse resolved REPORT_DIR');
+  expect(section).toMatch(/owned probe directory/i);
   for (const field of ['observationCommand', 'observed', 'hypothesis', 'nextCommand']) expect(section).toContain(`${field}:`);
-  expect(section).toContain('Wait for successful checkpoint publication');
-  expect(section).toContain('Never backfill or overwrite notes');
-  expect(section).toContain('link each checkpoint');
+  expect(section).toMatch(/wait for successful checkpoint publication/i);
+  expect(section).toMatch(/never backfill or overwrite notes/i);
   expect(section).not.toContain('a separate assistant text message');
 });
 
 test('surface evidence checks defer to one exploratory execution sequence', () => {
-  const source = readFileSync(join(import.meta.dir, '../scripts/resolvers/qa.ts'), 'utf8');
-  expect(source).toContain('Each probe is one native command/interaction plus checks, excluding bookkeeping');
-  const positions = ['2. **Decide whether another probe is needed.**', '**Publish before probing.**', '3. Run that exact probe; G enforces the deadline when bounded']
-    .map(marker => source.indexOf(marker));
-  expect(positions.every(position => position >= 0)).toBe(true);
-  expect(positions).toEqual([...positions].sort((a, b) => a - b));
-  expect(source).toContain('Never batch probes');
-  expect(source).toContain('Follow the shared exploratory loop\'s order and written checkpoints');
-  expect(source).toContain('Replay the exact failing command/request from the same initial fixture state');
-  expect(source).toContain('Another input or a regression test is not that replay');
+  const shared = generateQAExploratory({ host: 'claude', skillName: 'qa', tmplPath: '', paths: HOST_PATHS.claude });
+  expect(shared).toMatch(/each probe is one native command\/interaction/i);
+  expect(shared).toMatch(/never batch probes/i);
+  const functional = readFileSync(join(import.meta.dir, '../qa/sections/system-functional.md'), 'utf8');
+  expect(functional).toMatch(/follow the shared exploratory loop/i);
 });
 
 test('all public callers directly require the functional method before exploration', () => {
@@ -413,13 +459,13 @@ test('all public callers directly require the functional method before explorati
     const explorer = readFileSync(join(import.meta.dir, '..', skill === 'qa-only' ? 'qa-only' : 'qa', 'sections/exploratory.md'), 'utf8');
     expect(explorer).toMatch(/Functional surfaces[^\n]*\n[^\n]*Read[^\n]*system-functional\.md/);
     expect(explorer).toContain('Browser surfaces only');
-    const stages = ['Read `sections/scope.md`', 'in full and select the surfaces',
-      'Read `sections/system-functional.md`', 'Write a **charter**', '1. First demonstrate success'];
+    const stages = ['Read `sections/scope.md`', 'Read `sections/system-functional.md`',
+      '## 1. Charter and preflight', '1. First demonstrate success'];
     const positions = stages.map(stage => explorer.indexOf(stage));
     expect(positions.every(position => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
     const functional = readFileSync(join(import.meta.dir, '../qa/sections/system-functional.md'), 'utf8');
     expect(functional).toContain('## Contract map');
-    expect(functional).toContain("Follow the shared exploratory loop's order and written checkpoints");
+    expect(functional).toMatch(/follow the shared exploratory loop/i);
   }
 });

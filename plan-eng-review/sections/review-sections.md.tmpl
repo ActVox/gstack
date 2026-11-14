@@ -35,35 +35,33 @@ path authorizes no other; implementation edits require explicit authority.
 
 | Artifact | Destination | If writing is forbidden |
 |---|---|---|
-| Working plan, ledger and complete review report | Selected report file | Ask for a permitted destination if the user can supply one; wait without completion telemetry. If none is permitted, complete the review in chat as **not persisted**, then use **Blocked outcome**. |
+| Working plan, ledger and complete review report | Selected report file | Ask for a permitted destination if the user can supply one; wait without completion telemetry. If none is permitted, use **Read-only review** below, then **Report-back outcome**. |
 | QA Test Plan and task JSONL | Discovery paths below | Present each completely as **not persisted** and continue. |
 | TODOS.md | The project's TODO file | Present accepted TODO content as **not persisted** and continue. |
-| Required Review Log | The helper's state location | Present its fields as **not persisted**; at Review Log, use **Blocked outcome** instead of publishing a saved review. The final gate cannot pass without this log. |
+| Required Review Log | The helper's state location | Present its fields as **not persisted**; at Review Log, use **Report-back outcome** instead of publishing a saved review. The final gate cannot pass without this log. |
 | Best-effort metadata/learning logs | Helper-defined locations | Skip forbidden writes; otherwise keep their best-effort behavior. |
 
-QA Test Plan/task JSONL keep discovery paths `~/.gstack/projects/{slug}/`:
+QA Test Plan/task JSONL keep discovery paths `$GSTACK_STATE_ROOT/projects/{slug}/`:
 `{user}-{branch}-eng-review-test-plan-{datetime}.md` and
-`tasks-eng-review-{datetime}.jsonl`. Keep their formats; do not relocate.
-
-A failed permitted save uses **Recovery routing → Repairable write/read failure**,
-not the forbidden-write branches above. Do not ask from an unsaved record.
-Forbidden auxiliary writes allow the review to continue; unrecovered attempted
-writes block it. Best-effort logs retain their stated non-blocking behavior.
-Apply this policy at every later write.
+`tasks-eng-review-{branch}-{datetime}.jsonl`. Keep their formats; do not relocate.
 
 **First report save:** Name the fixed target in the report header. Read an
 existing destination and preserve its content. For a new file, create permitted
 parent directories, then write that header, an unchanged copy of the original
 plan (for plan targets), and the scope record or ledger being saved. Recheck option 3's collision before
-creation; use a suffix rather than overwrite. Do not add findings or fixes before
-Scope Challenge C. Put records before an existing `## GSTACK REVIEW REPORT`, or
+creation; use a suffix rather than overwrite. Findings and fixes first enter
+through Scope Challenge C's ledger saves, never earlier. Put records before an existing `## GSTACK REVIEW REPORT`, or
 at EOF if absent; create that terminal report only at Plan File Review Report.
 
-**Read-only review:** At each scope/decision record save, present the complete
-record, grid and authorized amendments as **not persisted** instead. At both
-pre-question and post-answer verification gates, perform the same comparisons
-on that presentation instead of a saved Read. This supports chat review, never
-the saved-report gate. A failed permitted save is not this route.
+**Write routes.** A forbidden write follows its row above.
+- **Read-only review:** At each scope/decision record save, present the complete
+  record, grid and authorized amendments as **not persisted** instead. At both
+  pre-question and post-answer verification gates, perform the same comparisons
+  on that presentation instead of a saved Read. This supports chat review, never
+  the saved-report gate.
+- **Failed permitted save** (error or failed Read-back): use **Recovery routing →
+  Repairable write/read failure**, never the routes above. Do not ask from an
+  unsaved record; an unrecovered failed write blocks the review.
 
 {{LEARNINGS_SEARCH}}
 
@@ -157,8 +155,9 @@ Put the problem and file:line in the native fields. Offer 2–3 options, includi
 do-nothing when reasonable; Outside Voice retains its four-option menu.
 Each option must explain human/CC effort, risk and maintenance. Tie the
 recommendation to the engineering preferences; prefer complete coverage when
-extra CC effort is marginal. Fit headers and labels to host limits now, before
-saving. Without stated limits, keep both under 5 words; details go in descriptions.
+extra CC effort is marginal. Make the header and every label final before saving:
+within the host's stated length limits, or under 5 words each when none are stated.
+Put details in descriptions.
 
 For one fixed approved contract, coverage choices vary implementation or proof
 depth. Apply the preamble's Completeness scores or kind-note accordingly.
@@ -171,8 +170,9 @@ each option's value and work, and any approval citation. Include shared, fixed
 and pending choices.
 
 Use these three checks for every column:
-1. Vary only this choice. Keep other approved values fixed and pending choices
-   undecided. A value shared by all options still needs approval if it is new.
+1. Vary only this choice: every column repeats each other approved value
+   unchanged and leaves each other pending choice pending. A value shared by all
+   options still needs approval if it is new.
 2. Treat necessary implementation and proof of an approved contract as common
    work. Cite its answer instead of creating another approval row. Never cut an
    established contract or its required proof.
@@ -307,12 +307,9 @@ changes or write findings into the plan yet.
   Count each once, label estimates, and seek fewer moving parts. Use these counts in B.
 - **Search check:** For each new architectural pattern, infrastructure component
    or concurrency approach, research built-ins, current practice and pitfalls
-   through Aside (entrypoint readiness), one read-only request per pattern:
-
-   ```bash
-   {{ASIDE_EXEC_PRELUDE}}
-   _aside_exec "Search the web for {framework} {pattern} built-in, {pattern} best practice {current year}, and {framework} {pattern} pitfalls. Read-only: do not sign in, submit, or change anything. Reply with up to 8 bullets, each with its source URL, then stop."
-   ```
+   through Aside (entrypoint readiness), one read-only request per pattern.
+   Prompt file text (create, write and send it with the Web research runs in Aside blocks in SKILL.md):
+   `{framework} {pattern} built-in, {pattern} best practice {current year}, and {framework} {pattern} pitfalls. Reply with up to 8 bullets, each with its source URL.`
 
    If Aside is unavailable, use host WebSearch for these queries. With neither,
    skip and note: "Search unavailable — proceeding with in-distribution knowledge only."
@@ -329,6 +326,8 @@ changes or write findings into the plan yet.
 - **Distribution check:** For new artifacts, verify build/publish CI/CD, target
    OS/architectures and download/install channels. Put deferrals in "NOT in scope".
 
+{{PLAN_REALITY_ROWS:eng}}
+
 ### B. Resolve complexity selectors
 
 With fewer than 8 files AND fewer than 2 new classes/services, skip B's questions
@@ -340,18 +339,19 @@ Initial scope selectors need no grid or **pre-answer** ledger write. Ask and
 wait before changes.
 
 1. Explain the complexity. Ask each proposed feature cut/deferral separately;
-   wait before changing scope. With no proposed cuts, keep the feature list and
-   go directly to the structure question.
-2. Always ask the structure question when this gate trips, even with no cuts.
-   Compare only the file/class arrangement. Use labels `Original arrangement`
-   and `Smaller arrangement`; put files/classes in each description. Both retain
+   wait before changing scope.
+2. Always resolve the structure question when this gate trips, even with no cuts,
+   as question_id `plan-eng-review-structure` (no per-plan slug); `AUTO_DECIDE`
+   picks the recommendation. Compare only the file/class arrangement, labeled
+   `Original arrangement` and `Smaller arrangement`, with files/classes per
+   option. Both retain
    the same approved feature list, contracts and approved
    security/error/test/performance fixes. Include `Pending remedies not decided here: <ids>` in the
    question; unapproved fixes stay pending. If no smaller arrangement preserves
    these commitments, explain that and offer confirmation of the original
    arrangement or a pause to investigate a smaller one. Wait for the answer.
    A pause leaves the arrangement undecided: investigate only the agreed question,
-   then return to this structure selector. Do not continue to C until it is settled.
+   then return to the selector. Do not continue to C until it is settled.
 3. Save the actual feature and structure answers as one scope record: `feature
    answers: <refs>; structure: <A/B + ref>; accepted scope: <exact scope>;
    pending remedies: <ids or none>`.
@@ -381,14 +381,18 @@ a scope reduction. This result supplies MODE; it approves no pending remedy.
 Keep it current if later approved choices change scope.
 Continue to Section 1 only when no answer is pending.
 
+{{PLAN_REALITY_ROWS:deep}}
+
 ## Review Sections (after scope is agreed)
 
-Evaluate Architecture → Code Quality → Tests → Performance,
-at most 8 top issues each. Never condense, abbreviate or skip a section, including
-strategy/spec/infra plans. With zero findings, report "No issues found" and continue.
+Evaluate Architecture → Code Quality → Tests → Performance. Never condense,
+abbreviate or skip a section, including strategy/spec/infra plans.
 
 After each of Sections 1–4, resolve new or reopened choices through Decision
-procedure, report findings and dispositions, then continue.
+procedure, report findings and dispositions, then continue. Per section, output
+every main-report finding in the Confidence Calibration format, most severe first
+(or "No issues found"), one question per new or reopened choice, then `Dispositions:` (accepted, rejected,
+deferred or pending, with D-number or answer) for each finding.
 
 ### 1. Architecture review
 Evaluate:
@@ -398,6 +402,52 @@ Evaluate:
 * Key flows needing ASCII diagrams in plans/code.
 * One realistic production failure per new path/integration; does the plan handle it?
 * **Distribution architecture:** New artifacts' build, publish and update paths; included or deferred CI/CD.
+
+<!-- "Design it twice" and the red flags derive from pstack's architect skill (Lauren Tan, MIT), rewritten for gstack. See NOTICE.md. -->
+### Two shapes before one (design-twice)
+
+Run this only when the plan introduces a new module, service, package or
+boundary: a public surface other code calls; otherwise say so in one line.
+
+**Ask for the second shape.** A plan with one design usually took the first
+shape that compiled in the author's head. Before judging it, require a second
+shape that is structurally different: another owner for the state, another
+split of responsibilities, another place for the boundary. A point fix inside
+the first shape is not a second candidate. When the plan has none, sketch one
+in five lines (types and signatures, bodies `not implemented`) and record it
+as the alternative. Compare the candidates on interface depth: how much
+behavior and policy each hides behind how small a public surface, and prefer
+the one that hides more behind less. A deep module is not a deep call chain:
+the chain scatters the understanding across layers, the module concentrates
+it behind one interface.
+
+**The eight red flags.** Screen the chosen shape before Section 1 closes.
+Assume the next contributor is an agent that sees only the files it opened,
+copies the nearest example and takes the shortest path that compiles; prefer
+the design where a change that looks right from one file is right for the
+whole repo. A flag is a finding with a file or symbol and a reason to revise
+the shape, not a comment asking for care.
+
+1. **Shallow module.** A large interface over little hidden complexity:
+   several calls per operation, options that expose internal stages.
+2. **Information leakage.** One decision (a representation, a policy, a wire
+   or storage detail) lives in more than one module. Re-exported transport
+   types are leakage; parse external data into domain types at the boundary.
+3. **Temporal decomposition.** Modules split by execution order (load,
+   validate, transform, save) instead of by the knowledge they own.
+4. **Pass-through method.** A function that forwards the same arguments to
+   another with the same shape; remove it or move the responsibility.
+5. **Split ownership.** Two modules write the same state or each keep a copy;
+   an agent editing one cannot see the other. One owner per piece of state.
+6. **Two ways to do one task.** An agent copies whichever it meets first.
+   Keep one; move the callers and delete the rest in the same change.
+7. **Importable internals.** The shortest path that compiles imports them and
+   they become interface. Make an outside import fail the build.
+8. **Hand-synced list.** The same items in two places; an agent that sees one
+   list edits one. Derive the second, or fail the build when they disagree.
+
+Record under Architecture: both shapes, the pick, the depth argument for it,
+and each flag with its fix.
 
 ### 2. Code quality review
 Evaluate:
@@ -427,6 +477,11 @@ Evaluate:
 * Memory usage.
 * Caching opportunities.
 * Slow or complex paths.
+
+On per-request or looped paths, check queries in loops, unbounded
+queries or caches, missing indexes, whole-file loads and blocking calls without
+timeouts. Give each finding's scale (rows, requests/s, bytes) or mark it
+unknown; never invent benchmarks.
 
 {{CODEX_PLAN_REVIEW}}
 
@@ -467,14 +522,15 @@ must pass steps 1–4 again.
    if later approved decisions changed its requirements. Do not recreate unchanged output.
 2. **Save and Read back.** Use Plan File Review Report to save the complete body
    and terminal `## GSTACK REVIEW REPORT`; pass its Read-back gate. Forbidden
-   persistence or an unrecovered save requires **Blocked outcome**, not logging.
+   persistence uses **Report-back outcome**; an unrecovered save requires
+   **Blocked outcome**, not logging.
 3. **Log the saved review.** Run Review Log with saved Completion summary values.
-   If the required log is forbidden, show fields as not persisted and take **Blocked outcome**;
-   failures use the write policy's recovery. Neither supplies completion or saved-dashboard credit.
+   If the required log is forbidden, show fields as not persisted and take **Report-back outcome**;
+   failures use the write policy's recovery.
 4. **Publish.** Display the Review Readiness Dashboard, then present the saved
    Completion summary to the user.
 5. **Choose navigation.** Use Next Steps — Review Chaining; wait for its answer.
-   Navigation grants no implementation authority. A substantive change follows
+   A substantive change follows
    **Recovery routing → Late change or missing work** before navigation resumes.
 6. **Finish.** Run Learning hooks, including gated Brain Calibration Write-Back;
    then return to the entrypoint's Section self-check and read-only EXIT PLAN MODE GATE in
@@ -507,21 +563,18 @@ If any failure mode has no test AND no error handling AND would be silent, flag 
 ### Worktree parallelization strategy
 
 Group implementation into parallel git worktrees (`isolation: "worktree"`) or workspaces.
-
 With one primary module or fewer than 2 independent workstreams, write:
-"Sequential implementation, no parallelization opportunity."
-
-Otherwise provide each step/workstream's **Dependency table**:
+"Sequential implementation, no parallelization opportunity." Otherwise give a
+**Dependency table** by module, not guessed file:
 
 | Step | Modules touched | Depends on |
 |------|----------------|------------|
 | (step name) | (directories/modules, NOT specific files) | (other steps, or —) |
 
-Use modules, not guessed files. **Parallel lanes:** disjoint modules run together;
-shared modules run sequentially, dependencies later. Example:
-`Lane A: step1 → step2 (shared models/)` / `Lane B: step3 (independent)`.
-**Execution order:** name launch/wait points, e.g. "Launch A + B. Merge both. Then C."
-**Conflict flags:** identify cross-lane shared modules; sequence or coordinate them.
+**Parallel lanes:** disjoint modules together; shared modules sequentially, dependencies
+later (`Lane A: step1 → step2 (shared models/)` / `Lane B: step3 (independent)`).
+**Execution order:** launch/wait points ("Launch A + B. Merge both. Then C.").
+**Conflict flags:** cross-lane shared modules to sequence or coordinate.
 
 {{TASKS_SECTION_EMIT:eng-review}}
 
@@ -533,6 +586,7 @@ prior reviews; the terminal report adds those separately.
 ### Completion summary
 From final decisions/outputs; publish after report Read-back and Review Log:
 - Step 0: Scope Challenge — ___ (scope accepted as-is / scope reduced per recommendation)
+{{PLAN_REALITY_ROWS:summary}}
 - Architecture Review: ___ issues found
 - Code Quality Review: ___ issues found
 - Test Review: diagram produced, ___ gaps identified
@@ -544,7 +598,7 @@ From final decisions/outputs; publish after report Read-back and Review Log:
 - Unresolved decisions: ___ in this review
 - Outside voice: recorded provider, completed / unavailable / disabled / skipped (reason)
 - Parallelization: ___ lanes, ___ parallel / ___ sequential
-- Lake Score: X/Y = 10/10 choices / answered coverage choices. Exclude kind choices; N/A if Y=0.
+- Lake Score: X/Y = answers picking a 10/10 option / answers scored for Completeness; N/A if Y=0.
 
 {{PLAN_FILE_REVIEW_REPORT}}
 
@@ -590,8 +644,8 @@ copy the working plan's task prerequisites, dependencies and execution order
 without adding or strengthening them in the question or descriptions. A test
 required before editing one function does not make every independent lane wait.
 A next-step answer approves no implementation change.
-A substantive change follows **Recovery routing → Late change or missing work**
-before navigation resumes.
+
+When the user chooses C: {{IMPLEMENTATION_MODEL_HANDOFF}}
 
 ## Learning hooks
 

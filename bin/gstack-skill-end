@@ -14,7 +14,7 @@
 # Error style (F3): per-line `|| true`, never `set -e`.
 
 SKILL_NAME="unknown"; OUTCOME="unknown"; SESSION_ID=""; TEL_START=""
-USED_BROWSE="no"; ERROR_MESSAGE=""; FAILED_STEP=""
+USED_BROWSE="no"; ERROR_MESSAGE=""; FAILED_STEP=""; LOCAL_ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skill)         SKILL_NAME="$2"; shift 2 ;;
@@ -24,6 +24,12 @@ while [ $# -gt 0 ]; do
     --used-browse)   USED_BROWSE="$2"; shift 2 ;;
     --error-message) ERROR_MESSAGE="$2"; shift 2 ;;
     --failed-step)   FAILED_STEP="$2"; shift 2 ;;
+    --local-only)    LOCAL_ONLY=1; shift ;;
+    -h|--help)
+      echo 'Usage: gstack-skill-end --skill NAME --outcome success|error|abort|unknown --session-id ID --tel-start EPOCH [--used-browse yes|no] [--error-message MSG] [--failed-step STEP] [--local-only]'
+      echo 'Records skill completion. --help records nothing.'
+      echo '--local-only appends one line to analytics/skill-usage.jsonl and does nothing else (no lease, timeline, sync or telemetry).'
+      exit 0 ;;
     *) shift ;;
   esac
 done
@@ -34,22 +40,64 @@ _BIN="$_SCRIPT_DIR"
 gstack_state_root_select
 _GH="$_gstack_sr_root"
 _TEL=$("$_BIN/gstack-config" get telemetry 2>/dev/null || echo off)
+# Plan B1: an unattended session writes no usage, sends no telemetry and never
+# drains or pushes the artifacts queue, whatever the inherited settings say. The
+# upgrade offer it skipped at start becomes one line here, read from the
+# update-check cache (no network) so the parent can act on it.
+_SESSION_KIND=$("$_BIN/gstack-session-kind" 2>/dev/null || echo "interactive")
+# Local-only usage line (ActVox fork): the lean profile renders a one-line
+# completion step that calls this mode. It appends to the local usage log only;
+# nothing leaves the machine, and an unattended session still writes nothing.
+_usage_line() {
+  _s=$(printf '%s' "$SKILL_NAME" | tr -cd 'A-Za-z0-9._:-'); _o=$(printf '%s' "$OUTCOME" | tr -cd 'a-z')
+  _b=$(printf '%s' "$USED_BROWSE" | tr -cd 'a-z'); _i=$(printf '%s' "$SESSION_ID" | tr -cd 'A-Za-z0-9._-')
+  mkdir -p "$_GH/analytics" 2>/dev/null || true
+  echo '{"skill":"'"${_s:-unknown}"'","duration_s":"'"$1"'","outcome":"'"${_o:-unknown}"'","browse":"'"${_b:-no}"'","session":"'"$_i"'","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' >> "$_GH/analytics/skill-usage.jsonl" 2>/dev/null || true
+}
+if [ -n "$LOCAL_ONLY" ]; then
+  [ "$_SESSION_KIND" = "unattended" ] && exit 0
+  _LO_END=$(date +%s)
+  case "$TEL_START" in ''|*[!0-9]*) TEL_START="$_LO_END" ;; esac
+  _usage_line "$(( _LO_END - TEL_START ))"
+  echo "SKILL_END: recorded locally outcome=$OUTCOME"
+  exit 0
+fi
+if [ "$_SESSION_KIND" = "unattended" ]; then
+  _TEL="off"
+  _CACHED_UPD=$(head -1 "$_GH/last-update-check" 2>/dev/null | tr -cd 'A-Za-z0-9._+ ' || true)
+  case "$_CACHED_UPD" in
+    UPGRADE_AVAILABLE*) echo "UPGRADE_AVAILABLE: $(printf '%s\n' "$_CACHED_UPD" | awk '{ print $3 (NF >= 4 ? " (main at " $4 ")" : "") }'); run /gstack-upgrade"
+      echo "UPGRADE_COMMAND: $(cd "$_BIN/.." 2>/dev/null && pwd -P)/bin/gstack-upgrade" ;;
+  esac
+  echo "ARTIFACTS_SYNC: skipped (unattended session)"
+fi
 
 _TEL_END=$(date +%s)
 case "$TEL_START" in ''|*[!0-9]*) TEL_START="$_TEL_END" ;; esac
 _TEL_DUR=$(( _TEL_END - TEL_START ))
 [ -n "$SESSION_ID" ] && rm -f "$_GH/analytics/.pending-$SESSION_ID" 2>/dev/null || true
+# Release the workflow lease run gstack-skill-start opened (SESSION_ID starts
+# with its harness pid), so a finished run stops blocking gstack-upgrade (GST-1205).
+[ -n "$SESSION_ID" ] && "$_BIN/gstack-lease" release --pid "${SESSION_ID%%-*}" --run "$SESSION_ID" >/dev/null 2>&1 || true
 
-# Skill-end artifacts sync (drain + push; formerly its own inline fence).
-"$_BIN/gstack-brain-sync" --discover-new 2>/dev/null || true
-"$_BIN/gstack-brain-sync" --once 2>/dev/null || true
-
-# Session timeline: local-only, never sent anywhere.
+# Record completion before the final drain, including its durable enqueue.
+# The normal sync gates still decide publication: full may sync timelines,
+# artifacts-only retains them locally, and unattended never enqueues or drains.
 "$_BIN/gstack-timeline-log" '{"skill":"'"$SKILL_NAME"'","event":"completed","branch":"'"$(_b=$(git branch --show-current 2>/dev/null | tr -cd 'a-zA-Z0-9._/-'); echo "${_b:-unknown}")"'","outcome":"'"$OUTCOME"'","duration_s":"'"$_TEL_DUR"'","session":"'"$SESSION_ID"'"}' 2>/dev/null || true
 
-# Local analytics (gated on telemetry setting).
+# Skill-end artifacts sync (drain + push; formerly its own inline fence).
+if [ "$_SESSION_KIND" != "unattended" ]; then
+  "$_BIN/gstack-brain-sync" --discover-new 2>/dev/null || true
+  "$_BIN/gstack-brain-sync" --once 2>/dev/null || true
+fi
+
+# Local analytics (gated on telemetry setting). ActVox fork: local_usage=on
+# also writes the local line with telemetry off; unattended still writes nothing.
+_LOCAL_USAGE=$("$_BIN/gstack-config" get local_usage 2>/dev/null || echo off)
 if [ "$_TEL" != "off" ]; then
   echo '{"skill":"'"$SKILL_NAME"'","duration_s":"'"$_TEL_DUR"'","outcome":"'"$OUTCOME"'","browse":"'"$USED_BROWSE"'","session":"'"$SESSION_ID"'","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' >> "$_GH/analytics/skill-usage.jsonl" 2>/dev/null || true
+elif [ "$_LOCAL_USAGE" = "on" ] && [ "$_SESSION_KIND" != "unattended" ]; then
+  _usage_line "$_TEL_DUR"
 fi
 
 # Remote telemetry (opt-in, requires binary).

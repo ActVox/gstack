@@ -7,13 +7,17 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import {
   createSharedInteractiveToolHandler, createSharedLibsFixture, fixtureGit, fixtureWrite, installSourceShims,
   installHostileGitConfig, isGuardedGitRequest, reviewLifecycleInstructions, standaloneInstructions, SHARED_LIBS_ROOT, readRequests, seedOpportunitySources, sharedReadOnlyViolations, shellQuote, snapshotFixture, type SharedLibsFixture,
-  SharedCaptureAccumulator, type SharedCaptureAttempt, isInternalClaudeGitRequest, SHARED_LIBS_OLDER_OPEN_PRS, incompleteFirstFileView,
+  SharedCaptureAccumulator, type SharedCaptureAttempt, isInternalClaudeGitRequest, SHARED_LIBS_OLDER_OPEN_PRS, prCoverageRequestViolations,
+  disclosesUnavailableHistory, isReadOnlyRepoGitRequest, repoGitRequests, type SourceRequest,
 } from './helpers/shared-libs-eval-fixture';
+import unsupportedGitReports from './fixtures/shared-libs-unsupported-git-opus-reports.json';
 import { EvalCollector, type EvalTestEntry } from './helpers/eval-store';
 import { collectorOutcomeCounts } from '../scripts/test-paid-shards';
 import { E2E_TOUCHFILES, GLOBAL_TOUCHFILES, selectTests } from './helpers/touchfiles';
 import nativeNoChangeCases from './fixtures/shared-libs-no-change-ci-public.json';
 import r44 from './fixtures/shared-libs-index-flags-r44-packets.json';
+import claudeVersionProbe from './fixtures/shared-libs-claude-version-probe.json';
+import unsupportedGitRequests from './fixtures/shared-libs-unsupported-git-requests.json';
 import skipDescriptions from './fixtures/shared-libs-index-flags-skip-description-public.json';
 import { seedPathReviewPrerequisites, checkPathReviewPrerequisites } from './helpers/shared-libs-path-fixture';
 
@@ -885,6 +889,25 @@ describe('shared-code curl source isolation', () => {
     expect(after).toEqual(before);
   });
 
+  test('the provider rate-limit probe gets the same 404 over curl as over gh, not a refusal', () => {
+    // Gate census 37174266054 slice 9: shared-libs-read-only probed API availability
+    // with this exact command; gh already answers rate_limit as an unknown endpoint (404).
+    const f = createSharedLibsFixture('curl-rate-limit');
+    cleanup.push(f.root);
+    installSourceShims(f);
+    const command = 'curl -sS -m 20 -o /dev/null -w "%{http_code}\\n" "https://api.github.com/rate_limit" 2>&1';
+    const response = curl(f, ['-sS', '-m', '20', '-o', '/dev/null', '-w', '%{http_code}\\n', 'https://api.github.com/rate_limit']);
+    expect(response.status).toBe(0);
+    expect(response.stdout).toBe('404\n');
+    expect(gh(f, 'rate_limit').stderr).toContain('HTTP 404');
+    expect(sharedReadOnlyViolations([{ tool: 'Bash', input: { command } }], readRequests(f))).toEqual([]);
+    for (const args of [['-X', 'POST', 'https://api.github.com/rate_limit'], ['-o', path.join(scratch(), 'out'), 'https://api.github.com/rate_limit'],
+      ['https://api.github.com/rate_limit/extra']]) {
+      expect(curl(f, args).status, JSON.stringify(args)).toBe(2);
+      expect(sharedReadOnlyViolations([], readRequests(f).slice(-1)).length, JSON.stringify(args)).toBeGreaterThan(0);
+    }
+  });
+
   test('unknown URLs, methods and file-producing curl options are rejected by the shim', () => {
     const f = createSharedLibsFixture('curl-rejected');
     cleanup.push(f.root);
@@ -1075,7 +1098,12 @@ describe('shared-code PR coverage world', () => {
 
   test('the maximum authorized open-metadata scan still leaves older open PRs unchecked', () => {
     const periodic = fs.readFileSync(path.join(import.meta.dir, 'skill-e2e-shared-libs-periodic.test.ts'), 'utf8');
-    expect(periodic).toContain('expect(openPages.length).toBeLessThanOrEqual(5);');
+    expect(periodic).toContain('prCoverageRequestViolations(');
+    const sixth = Array.from({ length: 6 }, (_, i) => `/repos/fixture/shared-libs/pulls?state=open&per_page=100&page=${i + 1}`);
+    expect(prCoverageRequestViolations([...sixth.slice(0, 5), '/repos/fixture/shared-libs/pulls/42/files?page=1',
+      '/repos/fixture/shared-libs/pulls/42/files?page=2'])).toEqual([]);
+    expect(prCoverageRequestViolations([...sixth, '/repos/fixture/shared-libs/pulls/42/files?page=1',
+      '/repos/fixture/shared-libs/pulls/42/files?page=2'])).toEqual(['6 open-PR metadata pages exceed the budget of 5']);
     const f = createSharedLibsFixture('pr-world-budget');
     cleanup.push(f.root);
     seedOpportunitySources(f);
@@ -1128,6 +1156,11 @@ describe('shared-code PR coverage world', () => {
     const missingPr = curl(f, ['-fsS', 'https://api.github.com/repos/fixture/shared-libs/pulls/999999']);
     expect(missingPr.status).toBe(22);
     expect(JSON.parse(gh(f, 'repos/fixture/shared-libs').stdout).default_branch).toBe('main');
+    // Default-branch discovery may list branches; both transports serve the same one-branch world.
+    const branches = curl(f, ['-sS', 'https://api.github.com/repos/fixture/shared-libs/branches?per_page=100']);
+    expect(branches.status, branches.stderr).toBe(0);
+    expect(JSON.parse(branches.stdout)).toEqual(JSON.parse(gh(f, 'repos/fixture/shared-libs/branches?per_page=100').stdout));
+    expect(JSON.parse(branches.stdout).map((b: { name: string }) => b.name)).toEqual(['main']);
     // The read-only detector still rejects a raw-host fallback.
     const raw = curl(f, ['-sS', `https://raw.githubusercontent.com/fixture/shared-libs/${f.tip}/src/retry-route.ts`]);
     expect(raw.status).toBe(2);
@@ -1449,6 +1482,108 @@ test('outer-timeout', () => captures.runAttempt('outer-timeout', ['audit'], 50, 
 const nativeCallbackReceipts = {
   "intrinsic": [
     {
+      "source": "https://github.com/garrytan/gstack/actions/runs/37694473528/job/113044020494 (Claude Code 2.1.292, shared-libs-read-only)",
+      "source_sha256": "a2523bdfe2289e207127af58c83ab69268f1201922a9c30ba063dc77dbf0e023",
+      "public_request": {
+        "tool": "git",
+        "args": [
+          "-c",
+          "protocol.ext.allow=never",
+          "-c",
+          "submodule.recurse=false",
+          "-c",
+          "log.showSignature=false",
+          "-c",
+          "format.pretty=medium",
+          "-c",
+          "gc.auto=0",
+          "-c",
+          "maintenance.auto=false",
+          "-c",
+          "hook.applypatch-msg.enabled=false",
+          "-c",
+          "hook.pre-applypatch.enabled=false",
+          "-c",
+          "hook.post-applypatch.enabled=false",
+          "-c",
+          "hook.pre-commit.enabled=false",
+          "-c",
+          "hook.pre-merge-commit.enabled=false",
+          "-c",
+          "hook.prepare-commit-msg.enabled=false",
+          "-c",
+          "hook.commit-msg.enabled=false",
+          "-c",
+          "hook.post-commit.enabled=false",
+          "-c",
+          "hook.pre-rebase.enabled=false",
+          "-c",
+          "hook.post-checkout.enabled=false",
+          "-c",
+          "hook.post-merge.enabled=false",
+          "-c",
+          "hook.pre-push.enabled=false",
+          "-c",
+          "hook.pre-receive.enabled=false",
+          "-c",
+          "hook.update.enabled=false",
+          "-c",
+          "hook.proc-receive.enabled=false",
+          "-c",
+          "hook.post-receive.enabled=false",
+          "-c",
+          "hook.post-update.enabled=false",
+          "-c",
+          "hook.reference-transaction.enabled=false",
+          "-c",
+          "hook.push-to-checkout.enabled=false",
+          "-c",
+          "hook.pre-auto-gc.enabled=false",
+          "-c",
+          "hook.post-rewrite.enabled=false",
+          "-c",
+          "hook.sendemail-validate.enabled=false",
+          "-c",
+          "hook.fsmonitor-watchman.enabled=false",
+          "-c",
+          "hook.p4-changelist.enabled=false",
+          "-c",
+          "hook.p4-prepare-changelist.enabled=false",
+          "-c",
+          "hook.p4-post-changelist.enabled=false",
+          "-c",
+          "hook.p4-pre-submit.enabled=false",
+          "-c",
+          "hook.post-index-change.enabled=false",
+          "--literal-pathspecs",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "-c",
+          "core.fsmonitor=",
+          "-c",
+          "core.askPass=",
+          "-c",
+          "core.quotePath=false",
+          "-c",
+          "core.safecrlf=false",
+          "ls-files",
+          "-z",
+          "--stage"
+        ],
+        "env": {
+          "GIT_OPTIONAL_LOCKS": "0",
+          "GIT_NO_LAZY_FETCH": "1",
+          "GIT_TERMINAL_PROMPT": "0"
+        },
+        "cwd": "/home/runner/.cache/gstack-paid-shard-g3tk70/tmp/gstack-shared-read-only-9Ndx49/repo",
+        "pid": 4849,
+        "ppid": 4497,
+        "parentExecutable": "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        "parentCommand": "claude -p --model claude-fable-5-1 --output-format stream-json --verbose --dangerously-skip-permissions --max-turns 24 --allowed-tools Bash Read Write Edit Glob Grep --tools Bash,Read,Write,Edit,Glob,Grep --include-partial-messages --strict-mcp-config "
+      },
+      "matching_model_commands": []
+    },
+    {
       "source": "/home/user/.capy/work/shared-libs-captures/1790267940497-shared-libs-read-only-1-1.json",
       "source_sha256": "5c4b660f37f0a100e5eef97896241b1b139ec4c57f38d9d450fb153543da6fac",
       "public_request": {
@@ -1670,6 +1805,65 @@ describe('retained native runtime callback failures', () => {
     }
   });
 
+  test('recognizes the captured Claude Code 2.1.292 version probe as that exact argv only', () => {
+    const request = claudeVersionProbe.public_request, commands = claudeVersionProbe.matching_model_commands;
+    expect(request.args.slice(0, 2)).toEqual(['-c', 'core.askPass=']);
+    expect(request.args.at(-1)).toBe('--version');
+    expect(commands).toEqual([]);
+    expect(isInternalClaudeGitRequest(request, commands)).toBe(true);
+    expect(isGuardedGitRequest(request)).toBe(false);
+    for (const parentExecutable of ['/usr/bin/bash', '/runtime/notclaude.exe', '']) {
+      expect(isInternalClaudeGitRequest({ ...request, parentExecutable }, commands)).toBe(false);
+    }
+    expect(isInternalClaudeGitRequest({ ...request, ppid: undefined }, commands)).toBe(false);
+    for (const args of [[...request.args.slice(0, -1), 'status'], [...request.args.slice(0, -1), 'log', '-1'],
+      [...request.args, 'status'], request.args.slice(2), request.args.filter(arg => arg !== 'hook.post-index-change.enabled=false')]) {
+      expect(isInternalClaudeGitRequest({ ...request, args }, commands), args.slice(-2).join(' ')).toBe(false);
+    }
+    expect(isInternalClaudeGitRequest(request, [`git ${request.args.join(' ')}`])).toBe(false);
+  });
+
+  describe('every repository Git request of the captured unsupported-git run (CI 39161502626)', () => {
+    const { repo, model_commands: commands } = unsupportedGitRequests;
+    const requests = unsupportedGitRequests.git_requests as SourceRequest[];
+    const worktreeProbe = requests.find(request => request.args.includes('worktree'))!;
+    const replay = (rows: SourceRequest[], trace = commands) => repoGitRequests(rows, trace, repo);
+
+    test('passes the read-only Git replay, with the cwd probe after the model cd excluded as Claude\'s own', () => {
+      expect(worktreeProbe.args.slice(-6)).toEqual(['-C', repo, 'worktree', 'list', '--porcelain', '-z']);
+      expect(isInternalClaudeGitRequest(worktreeProbe, commands)).toBe(true);
+      const git = replay(requests);
+      expect(git).not.toContain(worktreeProbe);
+      expect(git.some(request => request.args.includes('--no-lazy-fetch') &&
+        request.args.includes('rev-parse') && request.args.includes('--is-inside-work-tree'))).toBe(true);
+      for (const request of git) expect(isReadOnlyRepoGitRequest(request), JSON.stringify(request.args)).toBe(true);
+      expect(requests.filter(request => !isInternalClaudeGitRequest(request, commands))
+        .filter(request => request.args.some(arg => ['show', 'log', 'cat-file', 'diff'].includes(arg)))).toEqual([]);
+    });
+
+    const prefix = worktreeProbe.args.slice(0, -6);
+    test.each<[string, Partial<SourceRequest>]>([
+      ['log -1', { args: [...prefix, '-C', repo, 'log', '-1'] }],
+      ['cat-file -p HEAD', { args: [...prefix, '-C', repo, 'cat-file', '-p', 'HEAD'] }],
+      ['worktree add', { args: [...prefix, '-C', repo, 'worktree', 'add', '/tmp/x'] }],
+      ['an appended subcommand', { args: [...prefix, '-C', repo, 'worktree', 'list', '--porcelain', '-z', 'status'] }],
+      ['a relative -C', { args: [...prefix, '-C', '.', 'worktree', 'list', '--porcelain', '-z'], cwd: repo }],
+      ['a hook flag removed', { args: worktreeProbe.args.filter(arg => arg !== 'hook.post-index-change.enabled=false') }],
+      ['a shell parent', { parentExecutable: '/usr/bin/zsh' }],
+      ['no parent pid', { ppid: undefined }],
+    ])('refuses the probe shape with %s', (_label, change) => {
+      const forged = { ...worktreeProbe, ...change };
+      expect(isInternalClaudeGitRequest(forged, commands)).toBe(false);
+      expect(replay([...requests, forged]).every(isReadOnlyRepoGitRequest)).toBe(false);
+    });
+
+    test('refuses the exact probe argv when the model issued it', () => {
+      const trace = [...commands, `git ${worktreeProbe.args.join(' ')}`];
+      expect(isInternalClaudeGitRequest(worktreeProbe, trace)).toBe(false);
+      expect(replay(requests, trace).every(isReadOnlyRepoGitRequest)).toBe(false);
+    });
+  });
+
   test('answers the exact captured two-question skip-only request without altering its input', async () => {
     const input = structuredClone(nativeCallbackReceipts.actor.public_question), before = structuredClone(input);
     const observed: unknown[] = [];
@@ -1711,23 +1905,6 @@ describe('retained native runtime callback failures', () => {
   });
 });
 
-describe('incompleteFirstFileView (census 36641820398 shared-libs-pr-coverage)', () => {
-  const call = (command: string, output: string) => ({ tool: 'Bash', input: { command }, output });
-  const page1 = 'gh api --method GET "/repos/fixture/shared-libs/pulls/42/files?per_page=100&page=1" 2>&1 | jq -c \'if type=="array" then (length, .[] | {filename,status}) else . end\'';
-  test('a first page-1 view whose jq filter failed without printing files is incomplete', () => {
-    const failed = call(`echo "--- PR 42 metadata"; gh api --method GET /repos/fixture/shared-libs/pulls/42 | jq -c .number; echo "--- PR 42 files page 1"; ${page1}`,
-      'Exit code 5\n--- PR 42 metadata\n42\n--- PR 42 files page 1 [file-list unit 1]\njq: error (at <stdin>:1): Cannot index number with string "filename"');
-    expect(incompleteFirstFileView({ toolCalls: [failed, call(page1, '{"count":100,"files":[{"filename":"docs/coordination-0.md"}]}')] }, 42)).toBe(true);
-  });
-  test('head truncation still counts; a complete first view or a later-page error does not', () => {
-    expect(incompleteFirstFileView({ toolCalls: [call(`${page1} | head -c 4000`, '{"filename":"a"')] }, 42)).toBe(true);
-    expect(incompleteFirstFileView({ toolCalls: [call(page1, '{"count":100,"files":[{"filename":"docs/coordination-0.md"}]}')] }, 42)).toBe(false);
-    expect(incompleteFirstFileView({ toolCalls: [call(page1, 'jq: error (at <stdin>:1): x\n{"filename": "docs/a.md"}')] }, 42)).toBe(false);
-    expect(incompleteFirstFileView({ toolCalls: [call(page1.replace('&page=1', '&page=2'), 'jq: error (at <stdin>:1): x')] }, 42)).toBe(false);
-    expect(incompleteFirstFileView({ toolCalls: [call(page1.replace('/pulls/42/', '/pulls/7/'), 'jq: error (at <stdin>:1): x')] }, 42)).toBe(false);
-  });
-});
-
 describe('skip actor: deferred-reuse wording in a Skip option (PR lane run 36641824710)', () => {
   const question = (skipDescription: string) => ({ questions: [{
     question: '[ADVISORY] src/retry-worker.ts:2 — the worker now duplicates the tested `retrySeconds` helper from lib/retry-after.ts. How should this be handled? RECOMMENDATION: A (Fix).',
@@ -1748,5 +1925,45 @@ describe('skip actor: deferred-reuse wording in a Skip option (PR lane run 36641
   test('a conditional tail that commits product work still refuses', async () => {
     await expect(answer('Records an explicit Skip so a future review can reuse it once we migrate the worker and then import the helper.')).rejects.toThrow('No unambiguous no-change option');
     await expect(answer('Records an explicit Skip so a future review can reuse the helper once snapshot coverage holds.')).rejects.toThrow('No unambiguous no-change option');
+  });
+});
+
+// Stored gh/curl endpoint lists for the PR coverage request budget.
+{
+  const stored = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/shared-libs/pr-coverage-endpoints.json'), 'utf8')) as
+    { known_good: Record<string, string[]>; known_bad: Record<string, string[]> };
+
+  describe('shared-libs PR coverage request budget', () => {
+    test.each(Object.entries(stored.known_good))('passes %s', (_name, endpoints) => {
+      expect(prCoverageRequestViolations(endpoints)).toEqual([]);
+    });
+    test.each(Object.entries(stored.known_bad))('fails %s', (_name, endpoints) => {
+      expect(prCoverageRequestViolations(endpoints).length).toBeGreaterThan(0);
+    });
+    test('file-list pages beyond the stated budget fail', () => {
+      const pages = Array.from({ length: 52 }, (_, i) => `/repos/fixture/shared-libs/pulls/${i < 2 ? 42 : 100 + i}/files?per_page=100&page=${i < 2 ? i + 1 : 1}`);
+      expect(prCoverageRequestViolations(pages)).toEqual(['52 file-list pages exceed the budget of 50 plus PR 7']);
+      expect(prCoverageRequestViolations(pages.slice(0, 51))).toEqual([]);
+    });
+  });
+}
+
+// Every Opus 5.5 shared-libs-unsupported-git report (runs 39157502890..39199692993). In 39157502890 the
+// old regex matched only the pasted "HTTP 403: API unavailable in this fixture"; the model's own
+// disclosure, "I couldn't read Git history or the GitHub API", has no "could not".
+describe('unsupported-Git coverage disclosure', () => {
+  test('every captured report discloses the missing history in its own words', () => {
+    expect(unsupportedGitReports.reports).toHaveLength(7);
+    for (const { run, output } of unsupportedGitReports.reports) expect(disclosesUnavailableHistory(output), run).toBe(true);
+    const first = unsupportedGitReports.reports.find(report => report.run === '39157502890')!.output;
+    const old = /unavailable|unsupported|cannot|could not|coverage|limited/i;
+    expect(old.test(first.replaceAll('API unavailable in this fixture', ''))).toBe(false);
+    expect(disclosesUnavailableHistory("I couldn't read Git history or the GitHub API, so this review is based only on the current files on disk.")).toBe(true);
+  });
+  test('a pasted tool error or a full-history claim is not a disclosure', () => {
+    for (const text of ['Reviewed 12 commits in the 14-day window on main (603d6ae6). Top idea: reuse lib/retry-after.ts in src/retry-worker.ts.',
+      'Git history read for the full window; GitHub API: "HTTP 403: API unavailable in this fixture". Five ideas below.',
+      'The probe printed "unknown option: --no-lazy-fetch", so I read history with plain git log: 4 commits, 2 PRs.',
+      'All sources checked against origin/main; every PR in the window was inspected.']) expect(disclosesUnavailableHistory(text), text).toBe(false);
   });
 });

@@ -16,6 +16,8 @@ bun install                    # install dependencies
 bin/dev-setup                  # activate dev mode
 ```
 
+`./setup` on its own installs production dependencies only. `bin/dev-setup` adds the dev toolchain the tests and evals need (the Claude Agent SDK, TypeScript and Prettier) and marks the clone as a contributor's with `git config gstack.contributor true`. In a marked clone a later `./setup` runs the full install too, so the toolchain stays at `bun.lock`'s versions. In an unmarked clone `./setup` moves back to production dependencies, which is how installs made before v1.91.231.0 drop the toolchain they never needed. If you ran plain `bun install` instead of `bin/dev-setup`, run `git config gstack.contributor true` once, or set `GSTACK_CONTRIBUTOR=1` for a single run.
+
 > **Full clone vs shallow.** The README's user-facing install uses `--depth 1` for speed. As a contributor, use a full clone (no `--depth` flag) — you'll need history for `git log`, `git blame`, `git bisect`, and reviewing PRs against earlier versions. If you already have a `--depth 1` clone from following the README, promote it to a full clone with `git fetch --unshallow`.
 
 ### First free check (no API key, no browser)
@@ -70,6 +72,17 @@ No setup needed. Learnings are logged automatically. View them with `/learn`.
 
 This is the best way to contribute: fix gstack while doing your real work, in the
 project where you actually felt the pain.
+
+**What CI does on a fork PR.** GitHub never gives a fork PR this repository's
+secrets, so CI runs everything that needs none: the required `free-tests` check
+(the Linux free suite, typecheck, the macOS and Windows gates), Windows
+Smoke, Skill Docs Freshness, Workflow Lint, Version Gate, Quality gate, the
+make-pdf gate, and any path-triggered gates your change touches. E2E Evals
+still builds the CI image from your `Dockerfile.ci` without publishing it, and
+skips its paid eval jobs, which need provider API keys. That skip is expected
+and does not block your PR. It is also not a pass: a maintainer runs the paid
+evals from a branch in this repository before merging. A first-time
+contributor's runs wait for a maintainer to approve them.
 
 ### Session awareness
 
@@ -156,22 +169,60 @@ never touches a symlinked or non-gstack directory.
 ## Testing & evals
 
 Codex evals and the GPT benchmark adapter default to `gpt-6-astra`:
-explicit model > `GSTACK_CODEX_MODEL` > default. Claude capture and judge
-defaults are `claude-fable-5-1`, resolved through `lib/eval-model.ts`:
+explicit model > `GSTACK_CODEX_MODEL` > default. The Claude model under test
+(capture) defaults to `claude-opus-5-5` and the judge to `claude-fable-5-1`,
+resolved through `lib/eval-model.ts`. The judge stays put when the model under
+test moves, because its calibration fixtures are keyed to it:
 
 - Claude session, PTY, and Agent SDK eval runners and the Claude benchmark adapter: explicit model > `EVALS_MODEL` > `GSTACK_EVAL_MODEL_CAPTURE` > `GSTACK_EVAL_MODEL` > default.
 - Shared judge calls (including benchmark quality scoring): explicit model > `GSTACK_EVAL_MODEL_JUDGE` > `GSTACK_EVAL_MODEL` > default. `EVALS_MODEL` applies to capture runners, not judges.
 
 Warmup stays on `claude-haiku-4-5`; distill stays on
 `claude-haiku-4-5-20251001`. Explicit test and historical benchmark model
-selections still win. Known frontier defaults are maintained in releases;
-there is no automatic model discovery. Paid-run costs shown below are
+selections still win. These eval defaults stay pinned independently from the
+[runtime model tiers](docs/model-policy.md); the tier freshness workflow does
+not discover or change evaluation models automatically. Paid-run costs shown below are
 historical estimates from before this default change, not measurements of
 the new defaults.
 
+### Which command do I run?
+
+| I want to… | Command | Cost / time | Needs |
+|---|---|---|---|
+| Check an ordinary edit quickly | `bun run test:quick` | Free, about a minute | Bun 1.4.2 |
+| Run one free test file while repairing | `bun test <file>` | Free, seconds | Never bare `bun test` for the suite |
+| Run full free acceptance before publishing | `bun run test` | Free, a few minutes | Bun 1.4.2 |
+| Run the full free suite from a small machine | `bun run test:ubicloud` | Free suite on a billed 16-vCPU VM, about 5 minutes | `UBICLOUD_API_KEY`, `UBI_OWNER` |
+| Clear pregate's test tier on a machine under 8 cores from CI, the default on gstack ([CI carry](docs/pregate.md#ci-carry)) | push, `gstack-ci-carry wait --base main`, then `gstack-pregate --allow-repo-commands` (a branch behind main first runs `gh workflow run free-tests.yml --ref <branch>`) | Free; reuses the green Free Tests run at your pushed tree | Pushed branch, `gh` |
+| Clear pregate's test tier on a machine under 8 cores when no CI run covers your tree ([remote gate](docs/pregate.md#remote-gate), opt-in) | `gstack-pregate --stage tests --remote --spend-cap 2 --timeout 2700 --allow-repo-commands` (same command keyed or keyless) | Keyed: one billed 16-vCPU VM, about 7 minutes and $0.06 for the whole free tier, worst case $0.38; keyless: free, local parallel shards, practical for small selections only (98 files took 103 s on 4 cores) | Keyed: `UBICLOUD_API_KEY`, `UBI_OWNER`; keyless: nothing |
+| Run the curated Windows-safe subset | `bun run test:windows` (CI: six `windows-latest` jobs, nightly on main; PRs run the shorter `windows-smoke` check, and a PR that touches path, file-name or process code also runs its changed Windows-safe test files in `Windows Scoped Tests`) | Free | Windows, Git Bash |
+| Rerun chosen Windows-safe test files on Windows CI | `gh workflow run windows-scoped-tests.yml --ref <branch> -f files='<file> <file>'` (pick files from `bun run test:windows --list`) | Free CI runners | Pushed branch, `gh` with workflow rights |
+| Refresh the Windows duration seed | `gh workflow run windows-free-tests.yml --ref <branch> -f record_durations=true`, then commit the `free-test-durations-windows` artifact | Free CI runners | Pushed branch, `gh` with workflow rights |
+| Run a native Windows qualification campaign | `gh workflow run native-qualification.yml --ref <branch> -f mode=<mode>` ([modes](docs/TESTING_INTERNALS.md#windows-free-lane)) | Free CI runners | Pushed branch, `gh` with workflow rights |
+| Preview which paid cases my diff selects | `bun run eval:select` (PR profile; `--profile full` for the plain touchfile selection) | Free | — |
+| Preview the CI paid slice plan | `bun run scripts/test-paid-shards.ts --tier periodic --list --slice-budget 420 --jobs 2` (diff-selected; `EVALS_ALL=1` lists everything) | Free | — |
+| Run paid coverage for my change (agents: detached) | `bun run eval:bg:pr` (foreground: `bun run test:pr`) | API spend for the selected cases only; about 10 minutes when dispatched to CI | Dispatch: a clean, pushed HEAD and `gh`. Local fallback: `ANTHROPIC_API_KEY`, Claude Code CLI, a plain terminal |
+| Run the full gate + periodic censuses before a release | `bun run eval:bg:release` (foreground: `bun run test:release`) | The largest API spend; local runs are capped at 4 hours | Same as above |
+| Run one paid tier | `bun run test:gate:sharded` / `bun run test:periodic:sharded` (detached: `eval:bg:gate` / `eval:bg:periodic`) | API spend for that tier | Same as above |
+| Run one paid case as its CI panel | `bun run scripts/test-paid-shards.ts --tier <tier> --case <case-id> --trials 3` | API spend for that case | Same as above |
+| Validate gate cases on a branch in CI | `gh workflow run evals.yml --ref <branch> -f evals_all=true` | CI runners + API spend | Pushed branch, `gh` with workflow rights |
+| Validate periodic cases on a branch in CI | `gh workflow run evals-periodic.yml --ref <branch>` (periodic lane only) | CI runners + API spend | Pushed branch, `gh` with workflow rights |
+| Validate periodic cases plus the weekly gate census on a branch | `gh workflow run evals-periodic.yml --ref <branch> -f include_gate_census=true` | CI runners + API spend | Pushed branch, `gh` with workflow rights |
+| Run the opt-in ML, gitleaks and Swift checks | `gh workflow run platform-qualification.yml --ref <branch>` | Free CI runners | Pushed branch, `gh` with workflow rights |
+| Render one module loadout as an eval arm ([loadouts](docs/loadouts.md)) | `bin/gstack-modules render --host claude --modules full,-section:<skill>/<id> --out-dir <dir>` (`--loadout full` for the control) | Free, about a second per host | Bun 1.4.2 |
+| See which loadout a model gets, or publish it as Capy would ([loadouts](docs/loadouts.md#how-gstack-picks-a-loadout)) | `bin/gstack-modules resolve --model <id>`; `bin/gstack-modules install --model <id> --full-root ~/.claude/skills --store <dir>` | Free, under a second | Bun 1.4.2 |
+| Look at past local eval runs | `bun run eval:list` / `eval:compare` / `eval:summary` | Free | Local eval history |
+| See a case's pass rate across recent weekly runs | `bun run eval:pass-rates --case <case-id>` | Free | `gh` with repo read access |
+| Measure one red case alone against the ship bar (MEETS 9/10) | `bun run scripts/ship-measure.ts measure --case <case-id> --round baseline` ([bar](docs/TESTING_INTERNALS.md#ship-measure)) | API spend for 10 trials (12 for behavior); asks above $2/trial, stops at $25/case | Same as paid coverage |
+| Measure main's flakiest gate cases (the weekly sweep) | `gh workflow run eval-sweep.yml --ref main [-f k=5] [-f cap_usd=150] [-f dry_run=true]`, or locally `bun run scripts/ship-measure.ts sweep --dry-run` ([sweep](docs/TESTING_INTERNALS.md#ship-measure-sweep)) | API spend up to $150 per 7 days (`ship_measure_sweep_budget_usd`); `--dry-run` is free | `gh` with repo read access; CI dispatch needs workflow rights |
+| Replay what the paid gate costs and what each selection or train policy would have cost ([replay](docs/TESTING_INTERNALS.md#replay-gate-cost)) | `bun run crew/scripts/gate-cost-replay.ts --runs <full-gate run ids> --since <date> --until <date>` (screening figures print as screen-provisional, heuristic until T2 lands) | Free; `gh` reads, cached in `.context/gate-cost-cache` | `gh` with repo read access |
+| See the audit success metrics and weekly health | `bun run test:health [--since-days 7] [--json] [--enforce]` | Free; 5–20 minutes of `gh` reads | `gh` with repo read access |
+
+Old command names are listed under [Retired commands](#retired-commands).
+
 ### Setup
 
-Development and tests require Bun 1.4.0 or newer; CI pins and tests 1.4.2.
+Development and tests require Bun 1.4.2 or newer; CI pins and tests 1.4.2.
 Earlier Linux versions can close unrelated live file descriptors during
 subprocess garbage collection, causing intermittent browser and HTTP fixture
 failures ([upstream diagnosis](https://github.com/oven-sh/bun/issues/34785#issuecomment-5020318035)).
@@ -205,43 +256,40 @@ consumed section/resolver inputs in touchfiles, tiers and the PR profile so they
 Share sanitized reproduction commands and fixture evidence when reporting a problem,
 never credentials, private payloads or an entire unreviewed agent transcript.
 
-| Tier | Command | Cost | What it tests |
-|------|---------|------|---------------|
-| 1 — Static | `bun run test` | Free | Command validation, snapshot flags, Aside contract pins, render-wrapper option mapping, SKILL.md correctness, TODOS-format.md refs, observability unit tests |
-| 2 — E2E | `bun run test:e2e` | ~$4.20 | Full skill execution via `claude -p` subprocess |
-| 3 — LLM eval | `EVALS=1 bun test test/skill-llm-eval.test.ts` | ~$0.15 standalone | LLM-as-judge scoring of generated SKILL.md docs |
-| 2+3 | `bun run test:evals` | ~$4 combined | E2E + LLM-as-judge (runs both) |
+| Tier | Runs through | What it tests |
+|------|--------------|---------------|
+| 1 — Static | `bun run test` (free) | Command validation, snapshot flags, Aside contract pins, render-wrapper option mapping, SKILL.md correctness, TODOS-format.md refs, observability unit tests |
+| 2 — E2E | The sharded paid runner (`bun run eval:bg:pr`, `eval:bg:release`) | Full skill execution via `claude -p`, PTY and Agent SDK sessions |
+| 3 — LLM judge | Inside paid cases, through `test/helpers/llm-judge.ts` | A model scores what a paid run produced |
 
-```bash
-bun run test:quick           # Measured fast free subset for ordinary edits; not full acceptance
-bun run eval:bg:pr           # Changed fast live probes + selected quality judges, detached
-bun run test                 # Final full free acceptance after focused repairs and source freeze
-bun run test:ubicloud        # Same suite on an ephemeral 16-vCPU Ubicloud VM; needs UBICLOUD_API_KEY
-bun run test:e2e             # Tier 2: E2E only (needs EVALS=1, can't run inside Claude Code)
-bun run test:evals           # Tier 2 + 3 combined (~$4.35/run)
-```
+Pick commands from [Which command do I run?](#which-command-do-i-run).
 
 The PR paid gate uses an explicit short behavioral profile. Every selected quality
 judge remains included; the manifest lists deferred behaviors separately from
-passes. Unknown source dependencies restore the full gate. A new prompt without
+passes. Unknown source dependencies restore the full gate; the job summary names
+each file that caused it and its fix ([PR paid lane fallback](docs/TESTING_INTERNALS.md#pr-paid-lane-fallback)).
+A new prompt without
 registered coverage fails planning. Known broad behaviors remain visibly deferred
 when their prompts change; they do not silently gain PR-pass credit. The full
 gate and periodic censuses run fresh weekly and on manual
-dispatch of `evals-periodic.yml`; `bun run eval:bg:release` runs both locally.
+dispatch of `evals-periodic.yml`; `bun run eval:bg:release` runs both.
 Some broad behavioral failures will therefore be found after the PR gate.
 
-Blocking paid lanes (the PR gate and the weekly periodic + gate census) aim to
-finish in about 12 minutes including setup. The planner packs recorded wall
-times (`scripts/paid-test-durations.json`, per tier) into as many ~9-minute
-runners as the work needs, one file or a tightly packed group each; files whose
-cases are short but whose total is long run one case per runner. Matrix size and
-job timeout come from that plan. Preview it for free with
-`bun run scripts/test-paid-shards.ts --tier periodic --list --slice-budget 540 --jobs 2`.
+Blocking paid lanes (the PR gate and the weekly periodic + gate census) aim for
+a median of about 10 minutes including setup. The planner packs recorded wall
+times (`scripts/paid-test-durations.json`, per tier) into as many 7-minute
+(420-second) runners as the work needs, one file or a tightly packed group each;
+files whose cases are short but whose total is long run one case per runner.
+Matrix size and each runner's job timeout come from that plan, so a hung runner
+fails within its own ceiling. Preview it for free with
+`bun run scripts/test-paid-shards.ts --tier periodic --list --slice-budget 420 --jobs 2`.
 Complete start-to-finish flows belong to the `marathon` tier
 (`describeE2ETier('marathon')`), which runs only in the non-blocking
 `evals-marathon.yml` lane (weekly and on dispatch) and never gates a merge.
 
-Verdicts: paid evals never retry. Each case's kind in `E2E_KINDS`
+Verdicts: paid evals never retry, except the gate's one flaky rerun of a red
+case verdict at the same head ([flaky reruns](docs/TESTING_INTERNALS.md#flaky-reruns)).
+Each case's kind in `E2E_KINDS`
 (`test/helpers/touchfiles-data.ts`) fixes its trials before the run, from the
 constants in `EVAL_POLICY` (`test/helpers/periodic-exclude-data.ts`):
 
@@ -253,9 +301,10 @@ constants in `EVAL_POLICY` (`test/helpers/periodic-exclude-data.ts`):
   PASS at 2 or more with no contract violation (`expectContract()`). Use it only
   when a live model choice decides the verdict and an occasional deviation is
   acceptable product behavior; the one-line reason goes in `BEHAVIOR_WHY`.
-- `judge`: an LLM judge scoring a fixed input; 3 samples of the same prompt,
-  gated on the per-dimension mean (booleans on a majority) against the
-  unchanged threshold. An erroring sample fails the panel and is never resampled.
+- `judge`: an LLM judge scoring a fixed input; exactly 3 samples of the same
+  prompt, each dimension gated on its median, at least 2 of 3 samples, against
+  the unchanged threshold (booleans on a majority; the mean is reported only).
+  An erroring sample fails the panel and is never resampled.
 
 A timed-out, crashed or infrastructure-failed trial counts as a failed trial and
 is reported with its class; a missing trial makes the case INCOMPLETE, which
@@ -265,9 +314,14 @@ this policy. Quarantine (`CASE_QUARANTINE`) and history are described in
 `docs/TESTING_INTERNALS.md`; `bun run eval:pass-rates --case <id>` shows a
 case's per-trial pass rate with its Wilson interval.
 
-CI enables verified first-attempt reuse for 16 workflow quality judges for
-24 hours within the same PR. The cookie workflow's custom input and the other 11
-quality cases stay fresh. PR-profile E2E shards that run once (no retry, so the
+**A census went red?** Follow [docs/evals/census-red.md](docs/evals/census-red.md):
+read the red line, inspect its evidence with `bun run eval:pass-rates --run <id>`,
+check `--reds` and `--headroom`, repair with a free regression test, and only
+then spend one paid run with the line's `after a repair:` command. A red census
+on `main` is reported on the weekly tracking issue; a census dispatched on a
+branch writes the same report to its run summary and `census-report` artifact.
+
+Quality judges always run fresh. PR-profile E2E shards that run once (no retry, so the
 pass is provably a first attempt) reuse a pass from the same PR when every
 consumed input is byte-identical: the test's import closure, every tracked file
 its registered cases' touchfiles and the global touchfiles match, the runner and
@@ -293,7 +347,9 @@ four and a half minutes end to end, including VM boot and setup). The
 historical six-worker result below and the
 [four-CPU portfolio comparison](docs/TEST_PORTFOLIO.md#measurement-contract)
 are machine-specific measurements. CI setup, build and queue time are reported
-separately. Refresh measurements with `bun run test:ubicloud --record-durations`;
+separately. Refresh measurements with `bun run test:ubicloud --record-durations`
+(a laptop recording is not an acceptable seed; see
+[free suite duration seed](docs/TESTING_INTERNALS.md#free-suite-duration-seed));
 before publication, classify new regressions for quick feedback using that seed
 and the existing `QUICK_CORE` list. Do not classify unknown files as fast or use
 quick results as release acceptance. The runner retains full logs in
@@ -332,7 +388,12 @@ A row is one `describe` block or table entry next to the others, for example a n
 `describe('eng-cache-writes-at', …)` in `test/eng-first-review.test.ts` that loads its fixture and asserts
 `engFirstReviewAUQ` on the captured call. Run `bun test <owner-test>`, then
 `bun test test/test-of-test-ratchet.test.ts`: the ratchet fails on any new test file that imports only
-`test/` code and names the owner test to use instead.
+`test/` code, or that reads a paid test file's source and slices it, and names the owner test to use instead.
+
+Tests on templates and generated SKILL.md use `test/helpers/prompt-structure.ts` (`between`,
+`expectTokens`, `expectAbsent`, `expectOrdered`, `expectMentions`): machine-read tokens and step order
+exactly, safety rules as case-insensitive keyword co-occurrence in one sentence. Don't pin English
+sentences; see [the test value bar](docs/test-value-bar.md).
 
 Follow [Validation discipline in AGENTS.md](AGENTS.md#validation-discipline):
 reproduce known failures with focused checks, verify adjacent source and
@@ -352,7 +413,9 @@ child stream; `--wall-timeout <secs>` overrides the per-shard kill deadline.
 and `GSTACK_FREE_RETRY_FLAKY=1` opts into one serial retry pass for
 syscall-supervised sandboxes (off by default locally — dev boxes should see
 flakes; the required CI free lane turns it on and uploads every flaky pass
-in a JSONL ledger artifact that `bun run eval:flake-rank` folds in).
+in a `flake-ledger-<shard>` JSONL artifact; the weekly test-health run fails when
+a file flakes in more than 5% of main runs, see
+[flake ledger](docs/TESTING_INTERNALS.md#flake-ledger)).
 Working in a cloud sandbox? Run `scripts/sandbox-doctor.sh` once per boot to
 make the suite run green (details in
 [docs/TESTING_INTERNALS.md](docs/TESTING_INTERNALS.md)), or skip the sandbox's
@@ -365,14 +428,15 @@ eval files, and misses the strict classifier. No API keys needed.
 - **Aside driver contract** (`test/aside-driver.test.ts`) — Browser behaviour in skills is written against `scripts/resolvers/aside.ts` (`{{ASIDE_SETUP}}`) and verified live against the Aside CLI on a Mac. CI cannot run Aside, so the Aside E2E tests self-skip where `aside` is not installed; the static pins (detection, fallback hand-off, consent, credential, one-flow-per-script, sentinel) are what CI proves.
 - **Aside render wrapper** (`test/aside-render.test.ts`) — Pins the option mapping and generated script of `lib/aside-render.ts` everywhere, and drives both engines hermetically with fake `aside` / `browse` executables (probe classification, the stdout contract, loopback-server policy, failure paths, the timeout kill, engine choice and the mid-run fallback); the live render (PDF + screenshot through a real Aside) runs only where Aside is open and self-skips elsewhere. make-pdf's render gates (`make-pdf/test/e2e/*-gate.test.ts`) and `test/skill-e2e-diagram.test.ts` are engine-agnostic: they run through whichever engine resolves (`browserAvailable()` — Aside, or the browse binary `bun run build:gates` compiles, which is what Linux CI does) and skip only when neither exists.
 - **Render CLI** (`test/gstack-render-cli.test.ts`) — Pins `bin/gstack-render.ts` against a fake daemon (`GSTACK_SKIP_ASIDE=1` + `GSTACK_BROWSE_BIN`): argv guards exit 1 with the usage line, `--help` exits 0, `ENGINE=` first then `OK <path>` then fenced `EVAL` / `PAGE_ERRORS`, `--serve-root` containment, the no-browser first line, and prompt exit after a successful render. `make-pdf/test/cli-exit-codes.test.ts` and `make-pdf/test/setup-smoke.test.ts` pin the `pdf` binary's error-to-exit-code map and `$P setup`'s engine report.
-- **Generator tests** (`test/gen-skill-docs.test.ts`) — Tests the template system: verifies placeholders resolve correctly, output includes value hints for flags (e.g. `-d <N>` not just `-d`), enriched descriptions for key commands (e.g. `is` lists valid states, `press` lists key examples).
+- **Generator tests** (`test/gen-skill-docs.test.ts`) — Tests the template system: verifies placeholders resolve correctly, output includes value hints for flags (e.g. `-d <N>` not just `-d`), enriched descriptions for key commands (e.g. `is` lists valid states, `press` lists key examples), and that a template's `codex_default_prompt:` frontmatter key reaches the Codex `agents/openai.yaml` `default_prompt` (a template without the key keeps `Use <name> for this task.`) while no host's SKILL.md render carries the key.
 - **Design detector, catalog, and DESIGN.md** (`test/gstack-design-detect.test.ts`, `test/design-detect-contract.test.ts`, `test/design-catalog.test.ts`, `test/design-checklist-sync.test.ts`, `test/design-md.test.ts`, `test/frontend-scope.test.ts`, `test/impeccable-fixtures.test.ts`) — Drive `bin/gstack-design-detect.ts` through the fake engine in `test/fixtures/fake-impeccable.ts` (probe order, the never-execute-a-repository-file rule, the `--changed` target allow-list, `design_detector: off`, analytics lines, output sanitizing), pin the catalog invariants and the generated `review/design-checklist.md`, round-trip the open DESIGN.md reader/writer, and check the real engine captures (`test/fixtures/impeccable-*.json`, engine 0.1.3) against the contract. `test/dom-dump-hygiene.test.ts` runs `lib/dom-dump.js` in a real Chromium page through the built browse binary; it self-skips without the binary and is opt-in outside CI (`GSTACK_DOM_DUMP_HYGIENE=1`).
 - **Tier-alignment invariant** (`test/e2e-tier-alignment.test.ts`) — For every self-gated `test/skill-e2e-*.test.ts` named in a touchfiles dep list, the file's `EVALS_TIER` self-gate must match its declared tier in `E2E_TIERS`. Kills the "inert demotion" class where a test is re-tiered in `touchfiles.ts` but the file still gates on the old tier and keeps running in the wrong lane. Unmapped or mixed-tier files are reported, never silently skipped.
-- **Catalog budget** (`test/catalog-budget.test.ts`) — Caps the aggregate discovery surface: the sum of every skill's frontmatter `name` + `description` (what every host loads at discovery, every session) must stay under 1,171 token-equivalents, with a 260-byte per-skill cap. Counting goes through the shared census in `test/helpers/skill-census.ts` (physical files vs authored skills vs registry entries — three deliberately different counts). Adding a skill? The failure message carries the re-measure + ratchet protocol.
+- **Catalog budget** (`test/catalog-budget.test.ts`) — Caps the aggregate discovery surface: the sum of every skill's frontmatter `name` + `description` (what every host loads at discovery, every session) must stay under 1,452 token-equivalents, with a 260-byte per-skill cap. Counting goes through the shared census in `test/helpers/skill-census.ts` (physical files vs authored skills vs registry entries — three deliberately different counts). Adding a skill? The failure message carries the re-measure + ratchet protocol.
 - **Context-budget ratchet** (`test/context-budget-ratchet.test.ts`) — CI ceilings on the two token ledgers the catalog budget doesn't cover: the always-on full-frontmatter aggregate and each skill's per-invocation eager tokens (SKILL.md + forced-read references), graded against `test/fixtures/context-budget.json` via `lib/context-bill.ts`. New skills fail until they have a ceiling; ceilings for removed skills must be pruned. Legitimate growth or a landed reduction: re-run `bun test/helpers/capture-context-budget.ts` and commit the refreshed fixture in the same commit, so the change is a visible decision in the diff.
-- **Dependency security regressions** (`test/dependency-security.test.ts`) — Run `bun test test/dependency-security.test.ts` to check the resolved `sharp` and `adm-zip` version floors, load Sharp, verify ordinary ZIP extraction, and reject extraction through destination-file and destination-directory symlinks. The symlink cases skip Windows. These checks complement the OSV scan; they do not change its existing exceptions.
+- **Skill-to-bin drift ratchet** (`test/skill-bin-drift.test.ts`) — `scripts/skill-bin-drift.ts` statically reads every gstack bin call in skill templates, carved sections, references and the Claude-host renders (it never executes a bin) and fails with `DRIFT_UNKNOWN_BIN` or `DRIFT_UNKNOWN_FLAG` at file:line when a skill names a bin missing from `bin/` or a flag that bin's parser does not accept. Known misses live in `test/fixtures/skill-bin-drift-allowlist.json`, which only shrinks: a new finding fails, and so does an entry that no longer reproduces. Check one skill with `bun run scripts/skill-bin-drift.ts --skill <name>`; bins with permissive parsers or no usage text are reported, never failed.
+- **Dependency security regressions** (`test/dependency-security.test.ts`) — Run `bun test test/dependency-security.test.ts` to check the resolved `sharp`, `adm-zip`, `qs` and `@hono/node-server` version floors, load Sharp, verify ordinary ZIP extraction, and reject extraction through destination-file and destination-directory symlinks. The symlink cases skip Windows. These checks complement the OSV scan; they do not change its existing exceptions.
 
-### Tier 2: E2E via `claude -p` (~$4.20/run)
+### Tier 2: E2E via `claude -p`
 
 Spawns `claude -p` as a subprocess with `--output-format stream-json --verbose`, streams NDJSON for real-time progress, and scans for browse errors. This is the closest thing to "does this skill actually work end-to-end?"
 
@@ -401,7 +465,7 @@ operator `~/.claude` config, MCP servers (gbrain, Conductor), skills, `~/.gstack
 decision logs, and `CONDUCTOR_*` env never leak into the child. The `GITHUB_`
 and `EVALS_` prefix rules preserve CI metadata but reject credential-shaped
 names such as `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`, and
-`GITHUB_APP_PRIVATE_KEY`. Named provider auth, runner `extraAllow` entries, and
+`GITHUB_APP_PRIVATE_KEY`. The screen reads every underscore-separated segment, so a trailing qualifier does not carry a name past it (`GITHUB_APP_PRIVATE_KEY_BASE64`, `GITHUB_TOKEN_1`), while a segment that merely contains a credential word stays metadata (`GITHUB_PATH`, `GITHUB_TOKENIZER`). Named provider auth, runner `extraAllow` entries, and
 per-test overrides are deliberate exceptions; a name-based rule cannot identify
 a secret assigned to an arbitrary metadata name. This keeps local eval signal
 aligned with CI instead of disagreeing for reasons unrelated to the code under
@@ -428,7 +492,7 @@ When E2E tests run, they produce machine-readable artifacts in `~/.gstack-dev/`:
 | NDJSON transcripts | `e2e-runs/{runId}/{test}.ndjson` | Raw `claude -p` output per test |
 | Failure JSON | `e2e-runs/{runId}/{test}-failure.json` | Diagnostic data on failure |
 
-**Live dashboard:** Run `bun run eval:watch` in a second terminal to see a live dashboard showing completed tests, the currently running test, and cost. Use `--tail` to also show the last 10 lines of progress.log.
+**Live progress:** a detached run's log under `~/.gstack-dev/eval-runs/` streams each shard's result as it lands; for a CI run use `gh run watch <run-id>`. Per-test progress is in each shard's `progress.log`.
 
 **Eval history tools:**
 
@@ -436,26 +500,38 @@ When E2E tests run, they produce machine-readable artifacts in `~/.gstack-dev/`:
 bun run eval:list            # list all eval runs (turns, duration, cost per run)
 bun run eval:compare         # compare two runs — shows per-test deltas + Takeaway commentary
 bun run eval:summary         # aggregate stats + per-test efficiency averages across runs
-bun run eval:pass-rates      # per-case trial pass rates + Wilson intervals from recent weekly runs (--case, --runs, --dir, --backfill, --json, --gate); eval:flake-rank is an alias
+bun run eval:pass-rates      # per-case trial pass rates + Wilson intervals from recent weekly runs (--case, --runs, --dir, --backfill, --json, --gate)
+bun run eval:pass-rates --reds       # verdict reds per census by failure class and cause, all-green probability
+bun run eval:pass-rates --headroom   # slowest session per case vs its armed budget (alarm above 85% in --gate)
+bun run eval:pass-rates --run <id>   # one census's reds with their values and fetched transcript evidence
 ```
 
 **Detached runs for agents and long suites.** When an agent (or you, for a run
-you don't want to babysit) launches a long eval, use the `eval:bg*` scripts. They
-wrap the eval command in `bin/gstack-detach`: a fresh session that escapes a
+you don't want to babysit) launches a long eval, use the `eval:bg:*` scripts
+(`scripts/eval-bg.ts`). Each picks a backend and prints it:
+
+- **dispatch** (a clean HEAD pushed to garrytan/gstack, with `gh`): runs the
+  lane in CI on that exact revision and follows the run from a local log;
+- **local** (anything else, or `--local`): runs the sharded paid runner on this
+  machine, capped at ceil(1.5 × planned serial seconds / `EVALS_JOBS`) + 20
+  minutes, at most 4 hours (`--timeout SECS` overrides).
+
+Both run under `bin/gstack-detach`: a fresh session that escapes a
 turn-boundary SIGTERM, a `caffeinate` wrapper that blocks idle-sleep, a machine-wide
 `gstack-evals` lock so concurrent worktrees serialize instead of saturating the
-model API, a run-scoped log under `~/.gstack-dev/eval-runs/`, a per-tier watchdog,
-and a guaranteed `### gstack-detach EXIT=<code> ###` sentinel so a poller never
-mistakes silence for success.
+model API, a run-scoped log under `~/.gstack-dev/eval-runs/`, and a guaranteed
+`### gstack-detach EXIT=<code> ###` sentinel so a poller never mistakes silence
+for success. `bun run scripts/eval-bg.ts --help` lists the flags and
+`bun run scripts/eval-bg.ts status <log-or-run-id>` reconnects to a run.
 
 ```bash
-bun run eval:bg              # detached test:evals (diff-based)
-bun run eval:bg:all          # detached test:evals:all
-bun run eval:bg:gate         # detached gate-tier suite
-bun run eval:bg:periodic     # detached periodic-tier suite
+bun run eval:bg:pr           # changed coverage (CI: evals.yml, evals_all=false)
+bun run eval:bg:release      # fresh full gate + periodic (CI: both workflows)
+bun run eval:bg:gate         # gate tier (CI: evals.yml, evals_all=true)
+bun run eval:bg:periodic     # periodic tier (CI: evals-periodic.yml)
 ```
 
-Each prints its log path. The gate and periodic variants run their tier through
+The local backend runs through
 the sharded paid runner (`scripts/test-paid-shards.ts`, also available directly
 as `bun run test:gate:sharded` / `bun run test:periodic:sharded`): one Bun
 process per test file, an external wall-clock timeout that kills the shard's
@@ -465,36 +541,31 @@ distinguishes failed vs timed-out vs never-started shards. The runner also
 selects by diff: shards untouched by your branch are reported as
 skipped-by-diff, with a selection banner naming the reason (`EVALS_ALL=1`
 forces everything). `EVALS_JOBS` sets how many shard processes run at once
-(default 8); `EVALS_CONCURRENCY` is bun's concurrency WITHIN a shard
+(default 8; `test:pr` sets 2); `EVALS_CONCURRENCY` is bun's concurrency WITHIN a shard
 (default 2) — they are deliberately separate knobs. `eval:list`,
-`eval:compare`, `eval:summary`, and `eval:flake-rank` are shard-aware. Humans running
-`bun run test:evals` foreground in their own terminal don't need this — Ctrl-C
+`eval:compare`, `eval:summary`, and `eval:pass-rates` are shard-aware. Humans running
+`bun run test:pr` foreground in their own terminal don't need this — Ctrl-C
 is intended there.
 
 **Eval comparison commentary:** `eval:compare` generates natural-language Takeaway sections interpreting what changed between runs — flagging regressions, noting improvements, calling out efficiency gains (fewer turns, faster, cheaper), and producing an overall summary. This is driven by `generateCommentary()` in `eval-store.ts`.
 
 Artifacts are never cleaned up — they accumulate in `~/.gstack-dev/` for post-mortem debugging and trend analysis.
 
-### Tier 3: LLM-as-judge (~$0.15/run)
+### Tier 3: LLM-as-judge
 
-Uses `claude-fable-5-1` by default to score generated SKILL.md docs on three dimensions.
-Override the judge model per run with `GSTACK_EVAL_MODEL_JUDGE`:
+No test asks a model to grade skill text. The judges that remain score what an
+agent produced, inside their own paid cases (for example
+`test/llm-judge-recommendation.test.ts` and the outcome judges in the QA and design
+E2E files). Facts that several skills must state the same way are checked for free
+instead, for example `test/review-bot-history-facts.test.ts`.
 
-- **Clarity** — Can an AI agent understand the instructions without ambiguity?
-- **Completeness** — Are all commands, flags, and usage patterns documented?
-- **Actionability** — Can the agent execute tasks using only the information in the doc?
-
-Each dimension is scored 1-5 by a panel of 3 samples of the same prompt, drawn
-concurrently; each dimension's panel mean must meet that judge's threshold (≥ 4
-for most dimensions; see each case). An erroring sample fails the panel. There's also a regression test that compares generated docs against the hand-maintained baseline from `origin/main` — generated must score equal or higher.
-
-```bash
-# Needs ANTHROPIC_API_KEY in .env — included in bun run test:evals
-```
-
-- Resolves the judge model through `lib/eval-model.ts`, using the override order above
-- Tests live in `test/skill-llm-eval.test.ts`
-- Calls the Anthropic API directly (not `claude -p`), so it works from anywhere including inside Claude Code
+The judge model defaults to `claude-fable-5-1`; override it per run with
+`GSTACK_EVAL_MODEL_JUDGE` (resolved through `lib/eval-model.ts`, using the override
+order above). Each scored dimension is a panel of 3 samples of the same prompt, drawn
+concurrently; each dimension's panel median (at least 2 of 3 samples) must meet that
+case's threshold. An erroring sample fails the panel. Needs `ANTHROPIC_API_KEY`.
+`test/helpers/llm-judge.ts` calls the Anthropic API directly (not `claude -p`), so it
+works from anywhere including inside Claude Code.
 
 ### Paid-test touchfiles
 
@@ -524,18 +595,43 @@ path the test builds at runtime is not visible to it, so add such paths to the k
 6. **Try the panel locally.** `bun run scripts/test-paid-shards.ts --tier <tier>
    --case <case-id> --trials 3` runs the same panel CI runs, before you push.
 
+### Retired commands
+
+These package scripts are stubs for one release: each prints its replacement
+and exits 1 (`scripts/retired-command.ts`). The next release deletes them.
+
+| Retired | Use instead | Why it was retired |
+|---|---|---|
+| `test:evals` | `bun run eval:bg:pr` | Tierless: skipped every tier-gated paid file |
+| `test:evals:all` | `bun run eval:bg:release` | Tierless: skipped every tier-gated paid file |
+| `test:e2e` | `bun run eval:bg:pr` | Tierless: skipped every tier-gated paid file |
+| `test:e2e:all` | `bun run eval:bg:release` | Tierless: skipped every tier-gated paid file |
+| `test:gate` | `bun run test:gate:sharded` | The single-process fan-out never completed a run |
+| `test:periodic` | `bun run test:periodic:sharded` | The single-process fan-out never completed a run |
+| `test:codex` | `bun run test:periodic:sharded` | Set no `EVALS_TIER`, so both periodic-tier Codex files ran zero cases |
+| `test:codex:all` | `bun run test:periodic:sharded` | Same as `test:codex` |
+| `eval:bg` | `bun run eval:bg:pr` | Detached the retired `test:evals` |
+| `eval:bg:all` | `bun run eval:bg:release` | Detached the retired `test:evals:all` |
+| `eval:flake-rank` | `bun run eval:pass-rates` | Second name for the same script |
+| `eval:watch` | Tail the `gstack-detach` log, or `gh run watch <run-id>` | Read a file only the unsharded runner wrote, so it showed nothing for sharded runs |
+| `test:audit` | `bun run test` | `test/audit-compliance.test.ts` already runs in the free suite |
+
 ### CI
 
 A GitHub Action (`.github/workflows/skill-docs.yml`) generates all hosts on pushes to main and on PRs, then rejects tracked differences and nonignored untracked output. Generation errors also fail the job. Optional ignored host caches are not compared against Git.
 
 Supply-chain gates run alongside it:
 
-- **Quality gate** (`.github/workflows/quality-gate.yml`, every PR and push) — scans the diff's added lines for credentials using gstack's own redact engine (`.github/scripts/gate-secret-scan.mjs`). HIGH findings fail the job; MEDIUM findings surface as an advisory count. Fails closed if the scan can't produce a report. Also gates critical dependency advisories and runs ShellCheck on the setup/build boundaries.
-- **Dependency review** (`.github/workflows/dependency-review.yml`) — reviews dependency changes on PRs that touch lockfiles or workflow files.
-- **OSV scanner** (`.github/workflows/osv-scanner.yml`) — weekly vulnerability scan against the OSV database. Config lives in `.osv-scanner.toml` and is loaded via an explicit `--config` flag (OSV does not auto-discover that filename); every ignore entry needs a reason and an `ignoreUntil` expiry, enforced by `test/osv-config-wiring.test.ts`.
+- **Quality gate** (`.github/workflows/quality-gate.yml`, every PR and push) — scans the diff's added lines for credentials using gstack's own redact engine (`.github/scripts/gate-secret-scan.mjs`). HIGH findings fail the job; MEDIUM findings surface as an advisory count. Fails closed if the scan can't produce a report. Also runs ShellCheck on the setup/build boundaries, and gates the `## [Unreleased]` block of `CHANGELOG.md` with `bin/gstack-prose-lint CHANGELOG.md --unreleased --gate` (autopilot vocabulary, "not just X, but Y" and the other tells it names; a stamped or absent block passes; fixes in [docs/troubleshooting.md](docs/troubleshooting.md#prose-lint-found)).
+- **Dependency review** (`.github/workflows/dependency-review.yml`) — reviews dependency changes on PRs that touch `package.json` or `bun.lock` files and fails on high or critical advisories. It and the weekly OSV scan are the dependency gates.
+- **OSV scanner** (`.github/workflows/osv-scanner.yml`) — weekly vulnerability scan against the OSV database. Config lives in `.osv-scanner.toml` and is loaded via an explicit `--config` flag (OSV does not auto-discover that filename); every ignore entry needs a reason and an `ignoreUntil` expiry, enforced by `test/osv-config-wiring.test.ts`. A failed main scan upserts the tracking issue "OSV scanner: vulnerable dependency needs triage" and a clean scan closes it; `test/osv-ignore-expiry.test.ts` fails 14 days before any `ignoreUntil`, so an expiring suppression surfaces in a PR.
+- **Weekly test health** (`.github/workflows/test-health.yml`, Mondays and on dispatch) — runs `bun run test:health --since-days 7 --enforce`. It fails when a free test file flakes in more than 5% of at least 20 main runs or more than 5 free files are missing from the duration seed, upserts one tracking issue on failure and closes it only when every previously failing check has evidence and passes. Metrics it cannot read print "unavailable: <reason>; next: <step>" and never fail the run.
 - **Dependabot** (`.github/dependabot.yml`) — grouped dependency update PRs.
+- **OpenSSF Scorecard** (`.github/workflows/scorecard.yml`) — weekly and on main pushes; results in the Security tab and api.scorecard.dev.
 
-The supply-chain workflows pin their third-party actions to commit SHAs. The PR template (`.github/PULL_REQUEST_TEMPLATE.md`) asks for evidence — tests run, eval output — not promises.
+- **Platform qualification** (`.github/workflows/platform-qualification.yml`, dispatch and quarterly) — runs the opt-in tests no other lane has prerequisites for: the ML prompt-injection classifier (`SECURITY_BENCH=1`), memory ingest against real gitleaks (`GSTACK_TEST_GITLEAKS`), and the DebugBridge Swift build (`GSTACK_TEST_SWIFT=1`, macOS). `test/platform-qualification-workflow.test.ts` pins each gate to its job.
+
+Every workflow pins its third-party actions to commit SHAs (`test/workflow-action-pins.test.ts`). The PR template (`.github/PULL_REQUEST_TEMPLATE.md`) asks for evidence — tests run, eval output — not promises.
 
 Tests run against the browse binary directly — they don't require dev mode. Anything that needs Aside itself (`test/skill-e2e-aside.test.ts`, the Aside qa/design cases, the live render in `test/aside-render.test.ts`) runs only on a Mac with the Aside app open and self-skips elsewhere; make-pdf's render gates and the `/diagram` E2E run on whichever engine resolves, so CI runs them on the browse binary it builds with `bun run build:gates`.
 
@@ -593,6 +689,31 @@ is a CLI flag) so every caller gets it on both paths. Exported test seams:
 `serveDir(root, nonce)`, `SAFE_TMP_DIR`, and `PAGE_NUMBER_FOOTER` (the one
 page-number footer make-pdf, `gstack-render`, and the browse `pdf` command share).
 
+## Prompt audit at each frontier-model release
+
+When a new frontier Claude model ships, audit the text models read for
+instructions the new model over-applies or no longer needs. The audit is
+Anthropic's `/claude-api prompt-audit`, a Claude Code skill you run in your own
+Claude Code session; gstack only prints what to feed it.
+
+```bash
+bun run audit:manifest   # slices of templates, resolvers, overlays, CLAUDE.md and wording-pinning tests (--json for a machine-readable list)
+```
+
+1. In Claude Code, run `/claude-api prompt-audit` with the new model as the
+   target, one slice at a time, giving it that slice's file list. `s01` is the
+   shared text every skill reads (CLAUDE.md, model overlays, preamble
+   resolvers); a skill's template and its sections share one slice.
+2. Fix findings in templates and resolvers, never in generated SKILL.md files,
+   then run `bun run gen:skill-docs --host all`.
+3. Treat safety rules as held: reword one only where an eval shows the model
+   obeys it both before and after the change.
+4. Work through the "tests that pin skill wording" slices last. Where prose
+   changed, replace exact-sentence pins with structural or meaning checks
+   (the prompt-bytes rule in CLAUDE.md's testing section).
+5. `test/archaeology-lint.test.ts` keeps issue numbers and incident stories out
+   of the generated text; its failure names the source file to fix.
+
 ## Jargon list (V1 writing style)
 
 gstack's Writing Style section (injected into every tier-≥2 skill's preamble)
@@ -614,11 +735,11 @@ worth the review overhead.
 
 ## Multi-host development
 
-gstack generates SKILL.md files for 10 hosts from one set of `.tmpl` templates.
+gstack generates SKILL.md files for 13 hosts from one set of `.tmpl` templates.
 Each host is a typed config in `hosts/*.ts`. The generator reads these configs
 to produce host-appropriate output (different frontmatter, paths, tool names).
 
-**Supported hosts:** Claude (primary), Codex, Factory, Kiro, OpenCode, Slate, Cursor, OpenClaw, Hermes, GBrain.
+**Supported hosts:** Claude (primary), Codex, Factory, Kiro, OpenCode, Slate, Cursor, OpenClaw, Hermes, GBrain, Copilot, Antigravity, Gemini CLI.
 
 ### Generating for all hosts
 
@@ -627,7 +748,7 @@ to produce host-appropriate output (different frontmatter, paths, tool names).
 bun run gen:skill-docs                    # Claude (default)
 bun run gen:skill-docs --host codex       # Codex
 bun run gen:skill-docs --host opencode    # OpenCode
-bun run gen:skill-docs --host all         # All 10 hosts
+bun run gen:skill-docs --host all         # All 13 hosts
 
 # Or use build, which does all hosts + compiles binaries
 bun run build
@@ -646,6 +767,7 @@ Each host config (`hosts/*.ts`) controls:
 | Hook skills | `hooks:` frontmatter vs inline safety advisory prose |
 | Suppressed sections | GBrain blocks vs GBrain blocks and Review Army; Codex retains outside-review sections routed to Claude Code |
 | Model overlay | `claude` vs `gpt` (per-host `defaultModel`; `--model` or, at setup time, the Codex `config.toml` model overrides) |
+| Metadata file | none vs `agents/openai.yaml` beside each skill (`generation.generateMetadata`); its `default_prompt` is the template's `codex_default_prompt:` frontmatter key, else `Use <name> for this task.` The key is generator input only and appears in no host's SKILL.md render |
 
 See `scripts/host-config.ts` for the full `HostConfig` interface.
 
@@ -666,22 +788,29 @@ bun run skill:check
 
 See [docs/ADDING_A_HOST.md](docs/ADDING_A_HOST.md) for the full guide. Short version:
 
-1. Create `hosts/myhost.ts` (copy from `hosts/opencode.ts`)
+1. Create `hosts/myhost.ts` (copy from `hosts/opencode.ts`), including its
+   `tier` and `capabilities`
 2. Add to `hosts/index.ts`
 3. Add `.myhost/` to `.gitignore`
 4. Run `bun run gen:skill-docs --host myhost`
 5. Run `bun run test` (parameterized tests auto-cover it)
 
-Zero generator, setup, or tooling code changes needed.
+Rendering needs no generator code. Installing does: an installable host also
+needs a setup install arm, a row in `gstack_host_tier`
+(`bin/gstack-install-registry.sh`), a README host-matrix row, and the
+conformance kit (`test/host-conformance.test.ts`). It ships as `experimental`
+until a dated certification record exists; see "Certify your host" and the
+install ownership rules in the guide.
 
 ### Adding a new skill
 
-When you add a new skill template, all hosts get it automatically:
-1. Create `{skill}/SKILL.md.tmpl`
+Write or change skill prose with `/write-skill` (edit ladder, levels, `gstack-skill-bill`, drift check). When you add a new skill template, every host renders it; a few static lists still need a row:
+1. Create `{skill}/SKILL.md.tmpl` (optionally with a one-line `codex_default_prompt:` frontmatter key, the sentence Codex's picker inserts for the skill; without it the picker gets `Use <name> for this task.`)
 2. Run `bun run gen:skill-docs --host all`
-3. The dynamic template discovery picks it up, no static list to update
-4. Budget it: run `bun test/helpers/capture-context-budget.ts` and commit the refreshed `test/fixtures/context-budget.json` — the context-budget ratchet fails any skill without a ceiling
-5. Commit `{skill}/SKILL.md`, external host output is generated at setup time and gitignored
+3. The dynamic template discovery picks it up for every host render and for `gstack/llms.txt`. Two things it does not fill in: a row in `SKILL_REQUIREMENTS` in `lib/doctor-components.ts` (the doctor's `--for <skill>` table; `test/doctor-components.test.ts` fails on a skill directory without one, and the same gen run rerenders `bin/gstack-doctor-components.sh`), and the catalog rows readers find the skill through (README.md, AGENTS.md, `docs/skills.md`, `docs/PROJECT_STRUCTURE.md`, the root `SKILL.md.tmpl` router)
+4. Budget it: run `bun test/helpers/capture-context-budget.ts` and commit the refreshed `test/fixtures/context-budget.json` — the context-budget ratchet fails any skill without a ceiling; the catalog budget (`test/catalog-budget.test.ts`) fails until its cap is ratcheted by the protocol in its failure message, and the number is quoted in CLAUDE.md, this file and `docs/CONTRIBUTOR_REFERENCE.md`
+5. Commit `{skill}/SKILL.md` (and the generated `{skill}/sections/preamble.md` when the template's `preamble-tier` is 2 or higher), external host output is generated at setup time and gitignored
+6. Give it a row in the evidence ledger, `docs/inventory/evidence.json` ([ETHOS.md: 9. Earn Its Place](ETHOS.md#9-earn-its-place)): evidence that it helps on frontier models (`sources`, `models`, `prompt: preset`, `scope`, `masked: true`, and `caveats` for any limits on the result), or `status: untested` with its `reason`, a concrete `plan` (a `test/fixtures/skill-evals/<skill>/tasks.json` or an /eval-plan preregistration), an `owner` and a `measure_by` date. `test/inventory.test.ts` fails on a skill without a valid row; `bin/gstack-inventory --check` names the problem, and `bin/gstack-inventory` refreshes the dated snapshot in `docs/inventory.md`
 
 ## Conductor workspaces
 
@@ -702,7 +831,7 @@ When Conductor creates a new workspace, `bin/dev-setup` runs automatically. It d
 
 ## Things to know
 
-- **SKILL.md files are generated.** Edit the `.tmpl` template, not the `.md`. Run `bun run gen:skill-docs` to regenerate. The same run generates `review/design-checklist.md` from `lib/design-catalog.ts` and `lib/dom-dump.js` from `lib/dom-dump-script.ts`: edit those sources, never the generated files (`test/design-checklist-sync.test.ts` fails on drift).
+- **SKILL.md files are generated.** Edit the `.tmpl` template, not the `.md`. Run `bun run gen:skill-docs` to regenerate. The same run generates `review/design-checklist.md` from `lib/design-catalog.ts` and `lib/dom-dump.js` from `lib/dom-dump-script.ts`: edit those sources, never the generated files (`test/design-checklist-sync.test.ts` fails on drift). Tier 2+ skills also get a generated `sections/preamble.md`, the shared preamble rendered by `scripts/resolvers/preamble-hoist.ts`: change the preamble resolvers, never that file.
 - **TODOS.md is the unified backlog.** Organized by skill/component with P0-P4 priorities. `/ship` auto-detects completed items. All planning/review/retro skills read it for context.
 - **Browse, make-pdf, design, and `lib/` source changes need a rebuild.** If you touch `browse/src/*.ts`, `make-pdf/src/*.ts`, `design/src/*.ts`, or anything under `lib/` (the canonical `claude-bin.ts`, `error-handling.ts`, and `aside-render.ts` the binaries embed, plus `design-catalog.ts`, whose `MOCKUP_NEVER_NAMES` the design binary's mockup prompt embeds; `browse/src` re-exports the first three), run `bun run build`. `./setup` makes the same call on its own: it rebuilds when any of the three binaries is missing or when those sources, `package.json`, or `bun.lock` are newer than the browse binary (`test/setup-needs-build.test.ts` pins the decision).
 - **Dev mode shadows your global install.** Project-local skills take priority over `~/.claude/skills/gstack`. `bin/dev-teardown` restores the global one.
@@ -711,7 +840,7 @@ When Conductor creates a new workspace, `bin/dev-setup` runs automatically. It d
 - **`.claude/skills/` is gitignored.** The symlinks never get committed.
 - **Never write raw `ln -snf` in `setup`.** Every link site in `setup` MUST route through the `_link_or_copy SRC DST` helper near the `IS_WINDOWS` detection. The helper preserves `ln -snf` on Unix and switches to `cp -R` / `cp -f` on Windows without Developer Mode, where plain `ln -snf` produces frozen file copies that don't refresh on `git pull`. `test/setup-windows-fallback.test.ts` enforces this with a static invariant — a single raw `ln` call outside the helper body fails CI.
 - **Synchronous subagent dispatches must state the flag.** Claude Code runs Agent-tool subagents in the background by default (since v2.1.198), so any template step that dispatches a subagent and consumes its output must carry `run_in_background: false`. Use the `{{FOREGROUND_DISPATCH_NOTE}}` placeholder (`scripts/resolvers/constants.ts`) instead of hand-writing the guidance, and add the generated carrier file to `GENERATED_WITH_GUIDANCE` in `test/run-in-background-guidance.test.ts` in the same commit — its structural scanner fails CI on any generated dispatch imperative that lacks the flag.
-- **Never delete or link over a skill entry `setup` cannot prove is gstack's.** Every destructive site in `setup` (the linker, the alias installer, both prefix-flip cleanups) and in `bin/gstack-relink` goes through the ownership helpers (`_claude_entry_is_ours` / `_claude_entry_owned_strongly` in `setup`, `_entry_is_ours` / `_entry_owned_strongly` in relink). The retired-skill prune (`_prune_stale_generated`) applies the same strong/weak split through its own gate: a real host directory is a candidate only when its SKILL.md carries the generated banner (`_owned_for_windows_refresh`), a host symlink is removed only when it resolves into gstack (`_gstack_target_is_ours`), a bannered real directory is cleaned through `_cleanup_weak_dir`, and a symlink inside the render tree is never followed. A symlink into gstack or the `.gstack-owned` marker proves the whole directory; a byte-identical or generated-banner SKILL.md proves only that file, and a differing one is moved to `~/.gstack/backups/skills/<ts>/` first. `test/setup-link-ownership.test.ts`, `test/setup-cleanup-orphans.test.ts`, `test/setup-prune-stale-generated.test.ts`, and `test/relink.test.ts` pin it. The rule is duplicated in the two scripts until the shared helper filed in TODOS.md lands: change both.
+- **Never delete or link over a skill entry `setup` cannot prove is gstack's.** Every destructive site in `setup` (the linker, the alias installer, both prefix-flip cleanups) and in `bin/gstack-relink` goes through the ownership helpers (`_claude_entry_is_ours` / `_claude_entry_owned_strongly` in `setup`, `_entry_is_ours` / `_entry_owned_strongly` in relink). The retired-skill prune (`_prune_stale_generated`) applies the same strong/weak split through its own gate: a real host directory is a candidate only when its SKILL.md carries the generated banner (`_owned_for_windows_refresh`), a host symlink is removed only when it resolves into gstack (`_gstack_target_is_ours`), a bannered real directory is cleaned through `_cleanup_weak_dir`, and a symlink inside the render tree is never followed. A symlink into gstack or the `.gstack-owned` marker proves the whole directory; a byte-identical or generated-banner SKILL.md proves only that file, and a differing one is moved to `~/.gstack/backups/skills/<ts>/` first. `test/setup-link-ownership.test.ts`, `test/setup-cleanup-orphans.test.ts`, `test/setup-prune-stale-generated.test.ts`, and `test/relink.test.ts` pin it. The rule is duplicated in the two scripts until the shared helper filed in TODOS.md lands: change both. The host-render prune (`gstack_prune_host_renders` in `bin/gstack-host-renders.sh`, #1694) applies the same split to the render dirs of hosts a checkout does not serve: a link into the checkout goes, a file proven generated moves to `~/.gstack/backups/host-renders/<ts>-<id>/`, anything else stays, and only emptied directories are removed (`test/host-renders-prune.test.ts`).
 - **`./setup` never fails on Chromium.** The Playwright bootstrap (section `# 2` of `setup`) is best-effort and bounded: every failure becomes a reason code (`skipped`, `chromium-install`, `chromium-install-timeout`, `chromium-install-locked`, `windows-no-node`, `windows-node-modules`, `post-install-launch`) printed in the final summary alongside the browser-dependent skills, and skill registration always runs. `GSTACK_PLAYWRIGHT_INSTALL_TIMEOUT=<seconds>` (default 600) bounds the download; `GSTACK_SKIP_PLAYWRIGHT=1` skips it, the right knob for a no-browser box or a setup-only test loop. `GSTACK_SKIP_ASIDE=1` makes the browser summary (like the skills' probe and the renderer) treat Aside as absent, so the summary never promises a fallback the bootstrap did not deliver (`test/setup-browser-hint.test.ts`). Anything you add after the bootstrap must stay independent of the browser. `test/setup-playwright-best-effort.test.ts` pins the block.
 
 ## Testing your changes in a real project
@@ -783,6 +912,18 @@ bun install && bun run build && ./setup
 
 This affects all projects. To revert: `git checkout main && git pull && bun run build && ./setup`.
 
+## Issue triage
+
+An issue is open, parked or closed, and closed means fixed, duplicate or won't
+fix, each with its reason in the closing comment. An issue we intend to fix
+later stays open under the `parked` label with one comment saying where it is
+tracked (a TODOS.md theme or a tracking issue) and what fixes it. An agent
+triaging for the maintainer posts these comments under its bot identity
+(`capy-ai[bot]` on Capy), never the maintainer's own account. On Capy, comment only through
+`tools.pr.comment`, never `gh pr comment`, `gh issue comment` or `gh api`, because
+`gh` runs as the maintainer. The full rule,
+including the labels and the close reasons, is in [docs/triage.md](docs/triage.md).
+
 ## Community PR triage (wave process)
 
 When community PRs accumulate, batch them into themed waves:
@@ -794,11 +935,52 @@ When community PRs accumulate, batch them into themed waves:
    conflicts for dirty ones, verify with `bun run test && bun run build`
 4. **Close with context** — every closed PR gets a comment explaining
    why and what (if anything) supersedes it. Contributors did real work;
-   respect that with clear communication.
+   respect that with clear communication. An agent running the wave posts
+   these notes under its bot identity, never the maintainer's own account.
 5. **Ship as one PR** — single PR to main with all attributions preserved
    in merge commits. Include a summary table of what merged and what closed.
 
 See [PR #205](../../pull/205) (v0.8.3) for the first wave as an example.
+
+## How a contributor's PR lands
+
+We read every outside PR as a bug report, and a crew lane writes the fix itself. Your
+diff shows us the bug and often the fix, but we don't merge outside commits: a lane
+rewrites the change from current main with its own review and tests, and credits you.
+The maintainer crew follows the same rule
+([crew/docs/captain.md](crew/docs/captain.md#contributions-from-outside-the-crew)).
+
+1. **Treat the diff as untrusted input.** Read it as text only, for scope, network
+   egress, credentials, new dependencies, CI permission changes and weakened or
+   deleted tests. Never check it out, run it or build it. A fork's green checks
+   prove nothing about this checkout.
+2. **Give a verdict within 7 days.** Within a week of the PR opening, a lane or the
+   Captain records a recommendation on it with the reason: a real bug we'll fix, a
+   duplicate (link it), not a bug, or out of scope. An agent posts it under its bot
+   identity. "Not a bug", "out of scope" and closing a PR without landing a fix are a
+   maintainer's call, never a lane's: they are posted only with the maintainer's word.
+3. **Rewrite the fix from current main.** The lane writes the change on its own branch
+   with its own tests, the repo's gates and a CHANGELOG fragment. No contributor
+   commit enters the tree. A commit that carries the contributor's lines over
+   unchanged gets a `Co-authored-by:` trailer for them. Fetch their PR head as a ref
+   without checking it out (`git fetch origin +pull/<n>/head:refs/contrib/<n>`; the
+   `+` lets a re-fetch follow a force-push), then run
+   `crew/bin/gstack-coauthor-trailers origin/main..refs/contrib/<n>` to list the
+   authors of their commits; its default range holds only your own commits and finds
+   no co-author. A fork's commits can name anyone, so keep only the authors whose
+   lines you carry: drop the rest with `--exclude <email>` when you rerun it with
+   `--message <msgfile>`. Never guess an email: use the identity on their commits.
+4. **Credit them in the fix.** The PR body names the original PR and its author in
+   the first paragraph and says what differs from their diff. The CHANGELOG fragment
+   thanks them by handle.
+5. **Close the original with a specific thank-you.** After the fix lands, comment on
+   their PR with what landed (the PR number and version), what changed from their
+   diff and why, and thank them by name for the specific thing they found. Then close
+   it. An agent posts that comment under its bot identity, never the maintainer's own
+   account.
+
+If we won't fix what the PR reports, say why on the PR and close or park it under
+[Issue triage](#issue-triage), with the maintainer's word.
 
 ## Upgrade migrations
 
@@ -852,10 +1034,16 @@ executable and parse without syntax errors.
 
 ## Shipping your changes
 
+Write the pull request title as what changed for someone using gstack, in everyday words, for example
+"Stop gstack from hitting GitHub's rate limit while it waits on PRs". Skip `type(scope):` prefixes, and if
+you reference an issue, put it at the end in parentheses. The "Plain title" check on every pull request
+names any word it refuses; editing the title reruns it. The full rule is in
+[docs/ship-policy.md](docs/ship-policy.md#plain-titles).
+
 When you're happy with your skill edits:
 
 ```bash
 /ship
 ```
 
-This runs tests, reviews the diff, triages Greptile comments (with 2-tier escalation), manages TODOS.md, bumps the version, and opens a PR. See `ship/SKILL.md` for the full workflow.
+This runs tests, reviews the diff, triages the comments of every review bot you configured (Greptile's with 2-tier escalation), manages TODOS.md, bumps the version, and opens a PR. See `ship/SKILL.md` for the full workflow.

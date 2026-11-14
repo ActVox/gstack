@@ -17,6 +17,24 @@
 import type { Model } from './models';
 import { validateModel } from './models';
 
+export type HostTier = 'full' | 'experimental' | 'instruction-only';
+export const HOST_TIERS: readonly HostTier[] = ['full', 'experimental', 'instruction-only'];
+
+export interface HostCapabilities {
+  /** Runs shell commands, so bin/ helpers and preambles execute. */
+  toolExecution: boolean;
+  /** 'native': a structured question tool; 'prose': questions are plain text. */
+  questions: 'native' | 'prose';
+  /** Has plan-mode transitions (enter/exit plan mode). */
+  planMode: boolean;
+  /** Can delegate work to sub-agents. */
+  delegation: boolean;
+  /** Can drive gstack's browser (needs toolExecution). */
+  browser: boolean;
+  /** 'enforced': hooks can block a tool call; 'advisory': safety skills only warn. */
+  safetyHooks: 'enforced' | 'advisory';
+}
+
 export interface HostConfig {
   /** Unique host identifier (e.g., 'opencode'). Must match filename in hosts/. */
   name: string;
@@ -29,6 +47,17 @@ export interface HostConfig {
 
   /** Model overlay used when generation does not receive an explicit --model. */
   defaultModel: Model;
+
+  // --- Support Contract (docs/ADDING_A_HOST.md "Host tiers and capabilities") ---
+  /**
+   * full: installs, renders, and has a dated certification record (a real
+   * workflow run plus an upgrade from an existing install).
+   * experimental: installs and renders; not certified by a real run.
+   * instruction-only: no install arm; setup prints instructions and changes nothing.
+   */
+  tier: HostTier;
+  /** What the host runtime offers. Rendering and docs must not claim more. */
+  capabilities: HostCapabilities;
 
   // --- Path Configuration ---
   /** Global install path relative to $HOME (e.g., '.config/opencode/skills/gstack'). */
@@ -52,8 +81,20 @@ export interface HostConfig {
     descriptionLimit?: number | null;
     /** What to do when description exceeds limit. Default: 'error'. */
     descriptionLimitBehavior?: 'error' | 'truncate' | 'warn';
+    /**
+     * Put a trigger-first lead of at most this many chars on the first line of
+     * the description (lib/skill-triggers.ts withTriggerLead), for hosts whose
+     * skills index shows only the start of a description.
+     */
+    descriptionLead?: number;
     /** Additional frontmatter fields to inject (host-wide). */
     extraFields?: Record<string, unknown>;
+    /**
+     * Write the installed directory name (gstack-<skill>) into `name:`. For
+     * hosts that index and de-duplicate skills by frontmatter name, where a
+     * bare `review` would be shadowed by any other `review` skill (#2825).
+     */
+    nameMatchesDirectory?: boolean;
     /** Rename fields from template (e.g., { 'voice-triggers': 'triggers' }). */
     renameFields?: Record<string, string>;
     /** Conditionally add fields based on template frontmatter values. */
@@ -62,7 +103,7 @@ export interface HostConfig {
 
   // --- Generation ---
   generation: {
-    /** Whether to create a metadata file alongside skills (always openai.yaml; gen-skill-docs hardcodes the format). */
+    /** Whether to create a metadata file alongside skills (always openai.yaml; gen-skill-docs hardcodes the format and reads the template's `codex_default_prompt:` key for its default_prompt). */
     generateMetadata: boolean;
     /** Skill directories to exclude from generation for this host. */
     skipSkills?: string[];
@@ -90,12 +131,11 @@ export interface HostConfig {
     /** How skills are linked into the host dir. */
     linkingStrategy: 'real-dir-symlink' | 'symlink-generated';
     /**
-     * Instruction-only fallback tier: a committed rules digest this host's
-     * users can hand-copy when there is no full install arm. Delivery is
-     * print-path + user-performed copy ONLY — setup must never write or
-     * overwrite a user's own AGENTS.md. See scripts/gen-agents-digest.ts.
+     * 'harness': setup's arm for this host is `gstack-harness register <host>`
+     * (lib/harness-register.ts): the host's render copied into the harness's own
+     * skills folder with an ownership ledger, not linked into a host skills dir.
      */
-    instructionTier?: { rulesFile: string };
+    registration?: 'harness';
   };
 
   // --- Host-Specific Behavioral Config ---
@@ -105,6 +145,17 @@ export interface HostConfig {
   learningsMode?: 'full' | 'basic';
   /** Anti-prompt-injection boundary instruction for cross-model invocations. */
   boundaryInstruction?: string;
+
+  // --- Session transcripts ---
+  /**
+   * Where this host keeps its own chat transcripts on disk, read by
+   * /context-restore's no-checkpoint fallback (sections/transcripts.md).
+   * `root` is the path pattern shown to the user; `layout` says how the
+   * current workspace's files are told apart from another project's. Absent:
+   * the host declares no transcript store, and the skill says so and falls
+   * back to the shared record and git.
+   */
+  transcripts?: { root: string; layout: string };
 }
 
 // --- Validation ---
@@ -131,6 +182,20 @@ export function validateHostConfig(config: HostConfig, validResolverNames?: Read
         errors.push(`cliAlias '${alias}' contains invalid characters`);
       }
     }
+  }
+  if (!HOST_TIERS.includes(config.tier)) {
+    errors.push(`tier '${config.tier}' must be one of ${HOST_TIERS.join(', ')}`);
+  }
+  const caps = config.capabilities;
+  if (!caps) {
+    errors.push('capabilities are required');
+  } else {
+    if (caps.browser && !caps.toolExecution) errors.push('capabilities.browser requires toolExecution');
+    if (!['native', 'prose'].includes(caps.questions)) errors.push(`capabilities.questions must be 'native' or 'prose'`);
+    if (!['enforced', 'advisory'].includes(caps.safetyHooks)) errors.push(`capabilities.safetyHooks must be 'enforced' or 'advisory'`);
+  }
+  if (config.install.registration === 'harness' && config.tier !== 'experimental') {
+    errors.push('install.registration harness needs tier experimental (setup registers it through gstack-harness)');
   }
   const modelError = validateModel(config.defaultModel);
   if (modelError) {

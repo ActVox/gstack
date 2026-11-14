@@ -75,6 +75,9 @@ function runPrune(src: string, gen: string, host?: string) {
   const script = [
     'set -e',
     'log() { echo "$@"; }',
+    // A copy that differs from its render, or whose render is gone, is backed up, not deleted (GST-1717).
+    `_SKILL_BACKUP_ROOT="${path.join(path.dirname(src), 'backup')}"`,
+    '_BACKED_UP_SKILL_MDS=()',
     // _cleanup_weak_dir and the helpers it leans on come from main's ownership
     // gate; the prune routes bannered real dirs through it.
     extractFn('_gstack_link_target_abs'),
@@ -93,8 +96,9 @@ function runPrune(src: string, gen: string, host?: string) {
 describe('setup: _prune_stale_generated', () => {
   test('call sites: every host link + the always-run codex render are pruned', () => {
     for (const site of [
-      '"$SOURCE_GSTACK_DIR/.agents/skills"',
-      '"$SOURCE_GSTACK_DIR/.agents/skills" "$CODEX_SKILLS"',
+      '"$AGENTS_DIR" "$CODEX_SKILLS"',
+      // The Codex arm prunes the render it links from: the source's, or a per-install render (#1882).
+      '"${_CODEX_RENDER_ROOT:-$SOURCE_GSTACK_DIR}/.agents/skills" "$CODEX_SKILLS"',
       '"$SOURCE_GSTACK_DIR/.factory/skills" "$FACTORY_SKILLS"',
       '"$SOURCE_GSTACK_DIR/.opencode/skills" "$OPENCODE_SKILLS"',
       '"$SOURCE_GSTACK_DIR/.cursor/skills" "$CURSOR_SKILLS"',

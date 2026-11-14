@@ -17,6 +17,7 @@ import os from "os";
 import path from "path";
 
 import { __testInternals__ } from "../src/daemon";
+import { readStateFile } from "../src/daemon-state";
 
 export const DAEMON_SCRIPT = path.join(import.meta.dir, "..", "src", "daemon.ts");
 
@@ -38,19 +39,24 @@ export function resetDaemon(): void {
   __testInternals__.resetForTest();
 }
 
-/** Build a Request for the in-process fetchHandler tests. */
+/**
+ * Build a Request for the in-process fetchHandler tests. Every route but
+ * /health is addressed under the daemon's secret prefix.
+ */
 export function req(method: string, urlPath: string, body?: unknown): Request {
   const init: RequestInit = { method };
   if (body !== undefined) {
     init.body = typeof body === "string" ? body : JSON.stringify(body);
     init.headers = { "Content-Type": "application/json" };
   }
-  return new Request(`http://127.0.0.1:1234${urlPath}`, init);
+  const prefix = urlPath === "/health" ? "" : `/${__testInternals__.token}`;
+  return new Request(`http://127.0.0.1:1234${prefix}${urlPath}`, init);
 }
 
 export interface SpawnedDaemon {
   proc: ChildProcess;
   port: number;
+  token: string;
   stateFile: string;
   stop: () => Promise<void>;
 }
@@ -72,6 +78,7 @@ export async function spawnDaemonForTest(
     DESIGN_DAEMON_IDLE_MS: String(opts.idleMs ?? 60_000),
     DESIGN_DAEMON_CHECK_MS: String(opts.checkMs ?? 1000),
     DESIGN_DAEMON_VERSION: "test-version",
+    GSTACK_HOME: path.join(path.dirname(stateFile), "gstack-home"),
     ...(opts.env ?? {}),
   };
 
@@ -113,6 +120,7 @@ export async function spawnDaemonForTest(
   return {
     proc,
     port,
+    token: readStateFile(stateFile)?.token ?? "",
     stateFile,
     stop: async () => {
       if (proc.exitCode !== null || proc.signalCode !== null) return;

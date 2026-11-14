@@ -2,60 +2,45 @@
  * Case and trial shard keys for the paid lane: which files shard per case, how a case shard and its trials are named, and expansion of files into case/trial shards. Moved from scripts/test-paid-shards.ts.
  */
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { createBootstrapRetentionScope } from '../../test/helpers/bootstrap-retention';
-import {
-  BunTestOutputClassifier,
-  createShardSandbox,
-  exactTestFileSelectors,
-  forwardAndClassify,
-  isTerminationRequested,
-  nextShardLogPath,
-  normalizeRelativePath,
-  openShardLog,
-  parseCliFlags,
-  readDurationSeed,
-  removeShardSandbox,
-  runShardChild,
-  strictShardStatus,
-  writeDurationSeed,
-  zeroExecutionVerdict,
-  type LanePolicy,
-  type ShardChildResult,
-  type ShardLog,
-} from './shard-engine';
-import { PAID_TEST_GLOBS, isPaidTestFile } from '../../test/helpers/paid-test-set';
-import { CASE_CI_EXCLUDE, CASE_QUARANTINE, EVAL_POLICY, PERIODIC_CI_EXCLUDE } from '../../test/helpers/periodic-exclude-data';
-import { FILE_RETRY_BUDGETS, STRICT_RETRY_CASE_BUDGETS } from '../../test/helpers/eval-budgets';
-import {
-  getProjectEvalDir, getClaudeCliVersion, isFinalizedEvalResultFile, evalEntryOutcome, failureClassOf, panelVerdict,
-  sanitizeTrialError, formatTrialOutcomes, CONTRACT_VIOLATIONS_FILE, TRIAL_ENV, TRIAL_OUTCOME_SCHEMA, TRIAL_OUTCOMES_FILE,
-  type EvalCaseKind, type PanelShape, type PanelVerdict, type TrialFailureClass, type TrialOutcome, type TrialOutcomeRecord,
-} from '../../test/helpers/eval-store';
+import { normalizeRelativePath } from './shard-engine';
+import { CASE_CI_EXCLUDE, CASE_QUARANTINE, EVAL_POLICY } from '../../test/helpers/periodic-exclude-data';
+import type { EvalCaseKind, PanelShape } from '../../test/helpers/eval-store';
 import { E2E_KINDS } from '../../test/helpers/touchfiles-data';
-import { manualReviewProblem } from '../../test/helpers/cookie-workflow-manual-review';
-import { preflightAnthropicApi } from '../../test/helpers/anthropic-preflight';
-import { OVERLAY_MIN_FILE_WALL_MS } from '../../test/helpers/overlay-case-policy';
-import { PR_PROFILE_CASE_IDS, PR_PROFILE_FILES, packageChangeOnlyVersion, selectPrProfile, type PrProfileSelection } from '../test-pr-profile';
-import { e2eReuseLaneProblem, prepareE2EShardReuse, selectPlanReceipts, writeNegativeReceipt, writePanelReceipt } from '../e2e-shard-reuse';
+import { E2E_TOUCHFILES, E2E_TIERS } from '../../test/helpers/touchfiles';
+import { type PaidTier, ROOT } from './paid-types';
+import { type EvalHost, hostSkipReason, resolveEvalHost } from '../../test/helpers/e2e-hosts';
 
-import {
-  detectBaseBranch,
-  getChangedFiles,
-  selectTests,
-  E2E_TOUCHFILES,
-  E2E_TIERS,
-  LLM_JUDGE_TOUCHFILES,
-  GLOBAL_TOUCHFILES,
-} from '../../test/helpers/touchfiles';
+/**
+ * The E2E ids a paid file registers: the touchfile registrations that list the
+ * file. `known` is true only when those ids are complete: no computed
+ * registration (testName, *IfSelected, describeIfSelected with a non-literal
+ * argument) and every literal registration argument is among them
+ * (`unregistered` lists the literal ids that are not). Quoted strings
+ * elsewhere (comments, skill paths) never count.
+ */
+export function fileCaseRegistration(
+  file: string, source: string,
+  touchfiles: Record<string, string[]> = E2E_TOUCHFILES,
+  tiers: Record<string, string> = E2E_TIERS,
+): { registered: string[]; known: boolean; computed: boolean; unregistered: string[] } {
+  const rel = normalizeRelativePath(file);
+  const registered = Object.keys(touchfiles).filter(key => touchfiles[key]!.includes(rel));
+  const computed = /testName\s*:\s*(?!string\b)(?:`[^`]*\$\{|[A-Za-z_$])/.test(source)
+    || /\btest(?:Concurrent)?IfSelected\s*\(\s*(?:`[^`]*\$\{|[A-Za-z_$])/.test(source)
+    || /\bdescribeIfSelected\s*\([^,]*,(?!\s*\[)/.test(source)
+    || [...source.matchAll(/\bdescribeIfSelected\s*\([^,]*,\s*\[([^\]]*)\]/g)].some(m => m[1]!.split(',')
+      .map(item => item.trim()).some(item => item && !/^(['"`])[^'"`$]*\1$/.test(item)));
+  const literal = [
+    ...[...source.matchAll(/testName\s*:\s*(['"`])([^'"`]+)\1/g)].map(m => m[2]!),
+    ...[...source.matchAll(/\btest(?:Concurrent)?IfSelected\s*\(\s*(['"`])([^'"`]+)\1/g)].map(m => m[2]!),
+    ...[...source.matchAll(/\bdescribeIfSelected\s*\([^,]*,\s*\[([^\]]*)\]/g)]
+      .flatMap(m => [...m[1]!.matchAll(/(['"`])([^'"`]+)\1/g)].map(n => n[2]!)),
+  ].filter(id => id in tiers);
+  const unregistered = [...new Set(literal.filter(id => !registered.includes(id)))];
+  return { registered, known: registered.length > 0 && !computed && unregistered.length === 0, computed, unregistered };
+}
 
-export { PAID_TEST_GLOBS, isPaidTestFile };
-export { PERIODIC_CI_EXCLUDE };
-
-type E2EShardReuse = NonNullable<ReturnType<typeof prepareE2EShardReuse>>;
-import { type PaidTier, ROOT, fileCaseRegistration } from '../test-paid-shards';
 
 /**
  * Files whose cases run in separate processes, one shard per registered E2E
@@ -67,6 +52,9 @@ import { type PaidTier, ROOT, fileCaseRegistration } from '../test-paid-shards';
  * id or its CASE_TEST_NAMES label (test/paid-shards.test.ts scans the sources).
  */
 export const CASE_SHARDED_FILES: readonly string[] = [
+  // W5a: one carved skill per case shard (was 15 one-line wrapper files under one case id).
+  'test/carve-section-loading.test.ts',
+  'test/skill-e2e-deploy.test.ts',
   'test/skill-e2e-design.test.ts',
   'test/skill-e2e-plan.test.ts',
   'test/skill-e2e-review-army.test.ts',
@@ -74,6 +62,8 @@ export const CASE_SHARDED_FILES: readonly string[] = [
   'test/skill-e2e-shared-libs.test.ts',
   'test/skill-e2e-ship-docsync.test.ts',
   'test/skill-e2e-qa-callers.test.ts',
+  // W5c: its gate cases (qa-quick, qa-only-no-fix, qa-bootstrap) no longer share one ~7-minute runner.
+  'test/skill-e2e-qa-workflow.test.ts',
 ];
 
 /** Bun test names that differ from their E2E id. */
@@ -81,6 +71,11 @@ export const CASE_TEST_NAMES: Record<string, string> = {
   'plan-review-report': '/plan-eng-review writes GSTACK REVIEW REPORT to plan file',
   'auq-format-gate': "/plan-ceo-review's first AskUserQuestion is a compliant decision brief (7/7 + substance)",
   'autoplan-dual-voice': 'both Claude + Codex voices produce output in Phase 1 (within timeout)',
+  'cso-full-audit': '/cso persists supported tenant-boundary findings with redacted evidence',
+  'cso-diff-mode': '/cso --diff records its base and investigates changed security paths',
+  'cso-infra-scope': '/cso --infra finds an attacker-to-credential execution path',
+  'plan-ceo-review-plan-mode': 'first terminal outcome is asked (Step 0 fires before any plan write)',
+  'plan-eng-review-artifact': 'an interactive review writes one QA test plan about the reviewed change',
 };
 
 export const CASE_KEY_SEPARATOR = '#';
@@ -229,4 +224,92 @@ export function partitionCaseExclusions(keys: string[]): { runnable: string[]; e
     return !exclusion;
   });
   return { runnable, excluded };
+}
+
+/**
+ * Host exclusions (EVALS_HOST, test/helpers/e2e-hosts.ts): on a non-Claude
+ * host a case key whose case is Claude-only, or a file key none of whose
+ * `tier` cases runs on the host, is excluded with its reason. A file that
+ * keeps one host case stays runnable; its Claude-only cases skip at module
+ * load and the report deselects them. The Claude host excludes nothing.
+ */
+export function partitionHostExclusions(keys: string[], tier: PaidTier, host: EvalHost, rootDir = ROOT): { runnable: string[]; excluded: Array<{ file: string; reason: string }> } {
+  if (host === 'claude') return { runnable: keys, excluded: [] };
+  const excluded: Array<{ file: string; reason: string }> = [];
+  const runnable = keys.filter(key => {
+    const caseId = shardCaseId(key);
+    const ids = caseId !== null ? [caseId]
+      : fileCaseRegistration(shardFile(key), fs.readFileSync(path.join(rootDir, shardFile(key)), 'utf8')).registered.filter(id => E2E_TIERS[id] === tier);
+    if (ids.some(id => hostSkipReason(id, host) === null)) return true;
+    const reason = ids.length === 1 ? hostSkipReason(ids[0]!, host)!
+      : ids.length === 0 ? `Claude-only on the ${host} host: no Codex host metadata (no ${tier} case registered)`
+      : `Claude-only on the ${host} host: no case runs on it (${ids.join(', ')})`;
+    excluded.push({ file: key, reason: `skipped: ${reason}` });
+    return false;
+  });
+  return { runnable, excluded };
+}
+
+/**
+ * Codex access in the CI eval image, scoped per paid shard.
+ *
+ * The image installs the pinned Codex CLI off PATH (GSTACK_CI_CODEX_BIN_DIR)
+ * and the eval workflows log it in under a non-default home
+ * (GSTACK_CI_CODEX_HOME). On the Codex host (EVALS_HOST=codex) Codex is the
+ * agent, so every shard gets the CLI on PATH and the home as CODEX_HOME.
+ * Otherwise a gate shard never sees either. A non-gate shard
+ * whose every file exercises Codex gets the CLI on PATH and the home as
+ * CODEX_HOME. A file that mixes one Codex case with other cases keeps only
+ * the two variables, and that case opts in on its own session; hermetic
+ * child environments drop GSTACK_* names, so its sibling sessions see no
+ * Codex. Every other shard sees neither, so a skill's outside-voice probe
+ * (`command -v codex`) reports not_installed exactly as it did before Codex
+ * entered the image. Outside CI neither variable is set and nothing changes.
+ */
+export const CODEX_CI_ENV = { binDir: 'GSTACK_CI_CODEX_BIN_DIR', home: 'GSTACK_CI_CODEX_HOME' } as const;
+
+/** Paid files whose every case exercises the real Codex CLI. */
+export const CODEX_CI_FILES: readonly string[] = [
+  'test/codex-e2e.test.ts',
+  'test/codex-e2e-shared-libs.test.ts',
+  'test/codex-e2e-recommendation-substance.test.ts',
+  'test/skill-e2e-outside-voice.test.ts',
+  'test/skill-e2e-outside-plan-disabled.test.ts',
+  'test/skill-e2e-safety-codex-boundary.test.ts',
+  'test/codex-e2e-multiblock-live.test.ts',
+];
+
+/**
+ * Codex cases inside files whose other cases must not see Codex. Each listed
+ * case opts in by putting $GSTACK_CI_CODEX_BIN_DIR on its own session PATH
+ * (inline, so the file's other touchfile keys do not grow a helper).
+ */
+export const CODEX_CI_CASES: Readonly<Record<string, readonly string[]>> = {
+  'test/skill-e2e-workflow.test.ts': ['codex-review'],
+};
+
+export type CodexShardAccess = 'none' | 'case-opt-in' | 'path';
+
+/** What one shard, given the test files behind its keys, may see of the CI Codex install in `tier`. */
+export function codexShardAccess(files: readonly string[], tier: string | undefined, host: EvalHost = 'claude'): CodexShardAccess {
+  if (files.length === 0) return 'none';
+  if (host === 'codex') return 'path';
+  if (tier === 'gate') return 'none';
+  if (files.every(file => CODEX_CI_FILES.includes(file))) return 'path';
+  return files.every(file => file in CODEX_CI_CASES) ? 'case-opt-in' : 'none';
+}
+
+/** Scope one shard's child environment in place; `files` are the shard keys' test files. */
+export function scopeCodexAccess(env: NodeJS.ProcessEnv, files: readonly string[]): void {
+  const binDir = env[CODEX_CI_ENV.binDir];
+  if (!binDir) return;
+  const home = env[CODEX_CI_ENV.home];
+  const access = codexShardAccess(files, env.EVALS_TIER, resolveEvalHost(env));
+  delete env.CODEX_HOME;
+  if (access === 'case-opt-in') return;
+  delete env[CODEX_CI_ENV.binDir];
+  delete env[CODEX_CI_ENV.home];
+  if (access !== 'path') return;
+  env.PATH = env.PATH ? `${binDir}${path.delimiter}${env.PATH}` : binDir;
+  if (home) env.CODEX_HOME = home;
 }

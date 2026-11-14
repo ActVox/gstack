@@ -14,7 +14,7 @@ const ROOT = path.resolve(import.meta.dir, '..');
 const source = fs.readFileSync(path.join(ROOT, 'test/skill-e2e-design.test.ts'), 'utf8');
 const id = 'design-review-detector-shim';
 
-type Mode = 'captured' | 'literal' | 'other-variable' | 'wrong-base' | 'no-scan' | 'wrong-files'
+type Mode = 'captured' | 'literal' | 'other-variable' | 'base-variable' | 'browser-variable' | 'wrong-base' | 'no-scan' | 'wrong-files'
   | 'extra-file' | 'no-probe' | 'no-report' | 'no-finding' | 'no-rule' | 'npx' | 'browser'
   | 'timeout' | 'browse-error' | 'runner-throw' | 'report-read-throw'
   | 'quoted-path' | 'relative-path' | 'symlink-path' | 'claimed-probe' | 'wrong-probe-host' | 'wrong-probe-cwd';
@@ -125,6 +125,9 @@ Then write <repo>/detector-output.md: one FINDING-NNN row per rule in the DETECT
       else toolCalls.push({ tool: 'Bash', input: { command }, output: 'DETECT_TOP total=6 rules=4\nDETECT_SUMMARY: total=6\nDETECT_EXIT: 2' });
       if (mode === 'npx') toolCalls.push({ tool: 'Bash', input: { command: 'npx impeccable detect .' }, output: '' });
       if (mode === 'browser') toolCalls.push({ tool: 'Bash', input: { command: '$B goto http://localhost' }, output: '' });
+      // PR run 37184467123: the model named its base-branch variable B.
+      if (mode === 'base-variable') toolCalls.push({ tool: 'Bash', input: { command: 'B=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null); [ -n "$B" ] || B=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null); echo "GH_BASE=[$B]"' }, output: 'GH_BASE=[]' });
+      if (mode === 'browser-variable') toolCalls.push({ tool: 'Bash', input: { command: 'B=~/.claude/skills/gstack/browse/dist/browse; [ -x "$B" ] && "$B" snapshot -i' }, output: '' });
       if (mode !== 'no-report') {
         let report = captured.report;
         if (mode === 'no-finding') report = report.replaceAll('FINDING-001', 'ROW-001');
@@ -175,7 +178,7 @@ Then write <repo>/detector-output.md: one FINDING-NNN row per rule in the DETECT
   }
 }
 
-test.each(['captured', 'literal', 'other-variable'] as const)('source detector callback accepts executed main scope: %s', async mode => {
+test.each(['captured', 'literal', 'other-variable', 'base-variable'] as const)('source detector callback accepts executed main scope: %s', async mode => {
   const result = await exercise([mode]);
   expect(result.outputs.join('\n')).toContain('DETECT_TOP total=6 rules=4');
   expect(result.outputs.join('\n')).toContain('DETECT_EXIT: 2');
@@ -185,7 +188,7 @@ test.each(['captured', 'literal', 'other-variable'] as const)('source detector c
     duration_ms: 42513, turns_used: 5, tokens_used: 93719, model: 'claude-fable-5-1', transcript: [{ type: 'public-replay' }] });
 });
 
-test.each(['wrong-base', 'no-scan', 'wrong-files', 'extra-file', 'no-probe', 'no-report', 'no-finding', 'no-rule', 'npx', 'browser', 'timeout', 'browse-error'] as const)(
+test.each(['wrong-base', 'no-scan', 'wrong-files', 'extra-file', 'no-probe', 'no-report', 'no-finding', 'no-rule', 'npx', 'browser', 'browser-variable', 'timeout', 'browse-error'] as const)(
   'source detector callback rejects and records invalid evidence once: %s', async mode => {
     const result = await exercise([mode]);
     expect(result.errors[0]).toBeDefined();
@@ -248,4 +251,65 @@ test.each(['directory', 'write-error'] as const)('source detector preserves its 
   expect(result.rows[0].error).toContain(result.controlledError.message);
   if (retention === 'directory') expect(result.retained).toHaveLength(1);
   else expect(result.notices.some(note => note.includes('Detector artifact write failed:'))).toBe(true);
+});
+
+// PR gate run 38980005793 (design-review-detector-shim-dom): the agent scanned "$_REPORT/dom/$_RUN" with _RUN="run1"
+// assigned in the same command, and the check looked for the literal dom/run1. These rows run the real
+// `domScanOfRun` (and the `executedShellText` it uses) from test/skill-e2e-design.test.ts.
+const declaration = (name: string) => {
+  const start = source.indexOf(`function ${name}(`);
+  const end = source.indexOf('\n}\n', start);
+  if (start < 0 || end < 0) throw new Error(`${name} not found in test/skill-e2e-design.test.ts`);
+  return source.slice(start, end + 2);
+};
+const domScanModule = new Bun.Transpiler({ loader: 'ts' }).transformSync(
+  `globalThis.__domScanOfRun = (() => { ${declaration('executedShellText')}\n${declaration('domScanOfRun')}\nreturn domScanOfRun; })();`);
+new Function(domScanModule)();
+const domScanOfRun = (globalThis as any).__domScanOfRun as (command: string, runDir: string) => boolean;
+
+const REPORT = '/fixture/gstack-home/projects/shim/designs/design-audit-20260908';
+const RUN_DIR = `${REPORT}/dom/run1`;
+// Captured from 38980005793 (design-review-detector-shim-dom, head 3f4a98ecac3fc434f8aeef61bc9def17080718d9);
+// /fixture/gstack-home stands for the fixture's GSTACK_HOME and /checkout for the checkout.
+const CAPTURED = `_D="/tmp/gstack-dom.fDVsi2/home.dom.html"; _REPORT="${REPORT}"; _RUN="run1"
+if [ ! -s "$_D" ]; then echo "DOM_DUMP_MISSING: home (the dump script wrote nothing)"
+elif [ "$(wc -c < "$_D")" -gt 10485760 ]; then echo "DOM_DUMP_TOO_LARGE: home $(wc -c < "$_D")"; rm -f "$_D"
+elif /checkout/bin/gstack-redact --from-file "$_D" --max-bytes 10485760 >/dev/null 2>&1; _RC=$?; [ "$_RC" -ne 0 ] && [ "$_RC" -ne 2 ]; then echo "DOM_DUMP_REDACTION_BLOCKED: home redact-exit=$_RC"; rm -f "$_D"
+else mkdir -p "$_REPORT/dom/$_RUN" && cp "$_D" "$_REPORT/dom/$_RUN/" && chmod 600 "$_REPORT/dom/$_RUN/home.dom.html" && rm -f "$_D" && echo "DOM_DUMP_OK: home"; fi
+echo "REDACT_RC=$_RC"; ls -la "$_REPORT/dom/$_RUN/" 2>/dev/null
+if [ -s "$_REPORT/dom/$_RUN/home.dom.html" ]; then
+  _DJ=$(mktemp "/tmp/gstack-detect.XXXXXX"); bun --no-env-file run /checkout/bin/gstack-design-detect.ts scan --format gstack --host claude "$_REPORT/dom/$_RUN" > "$_DJ" 2>/tmp/gstack-detect.stderr; echo "DETECT_EXIT_CODE=$?"; echo "DETECT_JSON=$_DJ"
+  echo "----STDERR----"; cat /tmp/gstack-detect.stderr
+  echo "----JSON----"; cat "$_DJ"
+fi`;
+const SCAN = 'bun --no-env-file run /checkout/bin/gstack-design-detect.ts scan --format gstack --host claude';
+
+test('shim-dom: the captured generated DOM block counts as a scan of the run directory', () => {
+  expect(domScanOfRun(CAPTURED, RUN_DIR)).toBe(true);
+});
+
+test('shim-dom: literal, braced, bare and trailing-slash forms of the same scan count', () => {
+  for (const command of [
+    `${SCAN} "${RUN_DIR}" > out.json`,
+    `${SCAN} ${RUN_DIR}/`,
+    `_REPORT=${REPORT} _RUN=run1; ${SCAN} $_REPORT/dom/$_RUN`,
+    `_REPORT='${REPORT}'; _RUN='run1'; ${SCAN} "${'$'}{_REPORT}/dom/${'$'}{_RUN}"`,
+  ]) expect(domScanOfRun(command, RUN_DIR), command).toBe(true);
+});
+
+test('shim-dom: a source-mode scan, another directory, report text and unresolvable assignments never count', () => {
+  for (const command of [
+    CAPTURED.replace('scan --format gstack --host claude', 'scan --changed main --format gstack --host claude'),
+    CAPTURED.replace('"$_REPORT/dom/$_RUN" >', '--changed "$_REPORT/dom/$_RUN" >'),
+    CAPTURED.replace('_RUN="run1"', '_RUN="run2"'),
+    CAPTURED.replace('"$_REPORT/dom/$_RUN" >', '"$_REPORT/dom/other" >'),
+    CAPTURED.replace('_RUN="run1"', '_RUN="run1"; _RUN="run2"'),
+    CAPTURED.replace('_RUN="run1"', '_RUN="$(date +%s)"'),
+    CAPTURED.replace('_RUN="run1"', '_RUN=$RUN_ID'),
+    CAPTURED.replace(`_REPORT="${REPORT}"`, '_REPORT="$HOME/report"'),
+    `mkdir -p "${RUN_DIR}" && ${SCAN} /elsewhere`,
+    `cat > detector-output.md <<'EOF'\nScan: \`${SCAN} ${RUN_DIR}\`\nEOF`,
+    `echo "${SCAN} ${RUN_DIR}"`.replace('scan --format', 'scan-later --format'),
+    `${SCAN} ${RUN_DIR}1`,
+  ]) expect(domScanOfRun(command, RUN_DIR), command).toBe(false);
 });
