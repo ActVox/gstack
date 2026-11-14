@@ -98,7 +98,8 @@ for (const host of ['claude', 'codex'] as const) {
     });
     test('MEDIUM pauses dispatch pending its existing user disposition', () => {
       const body = 'Notify the launch contact at owner@private-customer.io';
-      expect(content(host)).toContain('mktemp "${TMPDIR:-/tmp}/gstack-redact.XXXXXX"');
+      // ActVox fork: the handoff file still comes from a secure mktemp template (upstream 1.99 form).
+      expect(content(host)).toContain('mktemp "${_GT:?}/spec.XXXXXX"');
       const result = runScan(host, body);
       expect(result.code).toBe(2);
       expect(result.sinks).toEqual([]);
