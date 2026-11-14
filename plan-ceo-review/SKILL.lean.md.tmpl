@@ -23,13 +23,13 @@ gbrain:
   context_queries:
     - id: prior-ceo-plans
       kind: filesystem
-      glob: "~/.gstack/projects/{repo_slug}/ceo-plans/*.md"
+      glob: "{gstack_state_root}/projects/{repo_slug}/ceo-plans/*.md"
       sort: mtime_desc
       limit: 5
       render_as: "## Prior CEO plans for this project"
     - id: recent-design-docs
       kind: filesystem
-      glob: "~/.gstack/projects/{repo_slug}/*-design-*.md"
+      glob: "{gstack_state_root}/projects/{repo_slug}/*-design-*.md"
       sort: mtime_desc
       limit: 3
       render_as: "## Recent design docs for this project"
