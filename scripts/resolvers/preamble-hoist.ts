@@ -18,7 +18,7 @@
 import { createHash } from 'node:crypto';
 import * as path from 'node:path';
 import type { TemplateContext } from './types';
-import { preambleSections } from './preamble';
+import { generatePreamble, preambleSections } from './preamble';
 
 /** A skill name no generator special-cases; a section that mentions it names the skill. */
 const SHARED_SKILL = 'gstack-shared-preamble';
@@ -91,6 +91,8 @@ function sharedPath(ctx: TemplateContext): string {
 
 /** {{PREAMBLE}}: the full preamble for tier 1, else the pointer plus this skill's own sections. */
 export function generateSkillPreamble(ctx: TemplateContext): string {
+  // ActVox lean profile: the short operational preamble stays inline; nothing is hoisted.
+  if (ctx.instructionProfile === 'lean') return generatePreamble(ctx);
   const own = preambleSections(ctx);
   if (!hoistsPreamble(ctx)) return own.join('\n\n');
   const shared = sharedSections(ctx);
