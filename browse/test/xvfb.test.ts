@@ -157,12 +157,11 @@ describe('pickFreeDisplay (Xvfb installed)', () => {
 describe('xvfb spawn → cleanup round trip (Linux + Xvfb only)', () => {
   test.skipIf(!HAS_XVFB)('spawn, validate ownership, cleanup', async () => {
     const { spawnXvfb } = await import('../src/xvfb');
-    const display = pickFreeDisplay(99, 110);
-    if (display == null) {
-      // No free display in range — skip.
-      return;
-    }
-    const handle = await spawnXvfb(display);
+    // A range no other allocator in the suite uses: headed daemons in parallel
+    // shards take displays from the default :99-:120 between this pick and the spawn.
+    const display = pickFreeDisplay(25000, 25100);
+    expect(display).not.toBeNull();
+    const handle = await spawnXvfb(display!);
     try {
       expect(handle.pid).toBeGreaterThan(0);
       expect(handle.display).toBe(`:${display}`);
@@ -173,7 +172,7 @@ describe('xvfb spawn → cleanup round trip (Linux + Xvfb only)', () => {
       const lock = fs.readFileSync(lockPath, 'utf8');
       cleanupXvfb({ ...handle, startTime: 'stale-start-time' });
       expect(isOurXvfb(handle.pid, handle.startTime)).toBe(true);
-      await expect(spawnXvfb(display)).rejects.toThrow('already reserved');
+      await expect(spawnXvfb(display!)).rejects.toThrow('already reserved');
       expect(fs.readFileSync(lockPath, 'utf8')).toBe(lock);
       expect(isOurXvfb(handle.pid, handle.startTime)).toBe(true);
     } finally {
@@ -191,7 +190,7 @@ describe.skipIf(process.platform !== 'linux')('display allocation failure contro
     const marker = path.join(root, 'spawned');
     fs.writeFileSync(path.join(root, 'Xvfb'), `#!/bin/sh\nprintf started > ${JSON.stringify(marker)}\nexit 0\n`, { mode: 0o755 });
     try {
-      const display = pickFreeDisplay();
+      const display = pickFreeDisplay(23000, 23100); // a range no other allocator in the suite uses
       expect(display).not.toBeNull();
       const child = Bun.spawnSync([process.execPath, '-e', `
         import { spawnXvfb } from ${JSON.stringify(path.resolve(import.meta.dir, '../src/xvfb.ts'))};
@@ -246,7 +245,9 @@ describe.skipIf(process.platform !== 'linux')('display allocation failure contro
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-xvfb-failure-'));
     fs.writeFileSync(path.join(root, 'Xvfb'), '#!/bin/sh\nexit 42\n', { mode: 0o755 });
     try {
-      const display = pickFreeDisplay();
+      // Ubicloud run 23: a concurrent daemon took a default-range display between
+      // this pick and the stub's exit, so startup read as a lost race instead.
+      const display = pickFreeDisplay(22000, 22100);
       expect(display).not.toBeNull();
       const child = Bun.spawnSync([process.execPath, '-e', `
         import { spawnXvfb } from ${JSON.stringify(path.resolve(import.meta.dir, '../src/xvfb.ts'))};
@@ -260,6 +261,57 @@ describe.skipIf(process.platform !== 'linux')('display allocation failure contro
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test.skipIf(!HAS_XVFB)('a display whose short-lived holder is gone by the exit check still counts as taken', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-xvfb-gone-'));
+    const realXvfb = Bun.which('Xvfb')!;
+    const first = pickFreeDisplay(26000, 26100);
+    expect(first).not.toBeNull();
+    // Run 10 (1ffd38e): another test's Xvfb held the display just long enough
+    // to win the lock, then closed before the exit check looked for it.
+    fs.writeFileSync(path.join(root, 'Xvfb'), [
+      '#!/bin/sh',
+      `if [ "$1" = ":${first}" ]; then printf '(EE) Server is already active for display ${first}\\n' >&2; exit 1; fi`,
+      `exec ${JSON.stringify(realXvfb)} "$@"`, '',
+    ].join('\n'), { mode: 0o755 });
+    try {
+      const child = Bun.spawn([process.execPath, '-e', `
+        import { spawnFreeXvfb } from ${JSON.stringify(path.resolve(import.meta.dir, '../src/xvfb.ts'))};
+        try { const handle = await spawnFreeXvfb(${first}, ${first! + 3}); console.log(handle.display); handle.close(); }
+        catch (err) { console.log(err.message); }
+      `], { env: { ...process.env, PATH: `${root}:${process.env.PATH}` }, stdout: 'pipe', stderr: 'pipe', timeout: 20000 });
+      const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+      expect(exitCode).toBe(0);
+      expect(stdout.trim()).toBe(`:${first! + 1}`);
+      expect(isDisplayFree(first!)).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  test.skipIf(!HAS_XVFB)('concurrent allocators that pick the same display both get one', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gstack-xvfb-race-'));
+    const realXvfb = Bun.which('Xvfb')!;
+    fs.writeFileSync(path.join(root, 'Xvfb'), `#!/bin/sh\nsleep 0.3\nexec ${JSON.stringify(realXvfb)} "$@"\n`, { mode: 0o755 });
+    try {
+      const first = pickFreeDisplay(24000, 24100);
+      expect(first).not.toBeNull();
+      const child = Bun.spawn([process.execPath, '-e', `
+        import { spawnFreeXvfb } from ${JSON.stringify(path.resolve(import.meta.dir, '../src/xvfb.ts'))};
+        const results = await Promise.allSettled([spawnFreeXvfb(${first}, ${first! + 5}), spawnFreeXvfb(${first}, ${first! + 5})]);
+        console.log(JSON.stringify(results.map(r => r.status === 'fulfilled' ? r.value.display : r.reason.message)));
+        for (const r of results) if (r.status === 'fulfilled') r.value.close();
+      `], { env: { ...process.env, PATH: `${root}:${process.env.PATH}` }, stdout: 'pipe', stderr: 'pipe', timeout: 20000 });
+      const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+      expect(exitCode).toBe(0);
+      const displays: string[] = JSON.parse(stdout.trim());
+      expect(displays[0]).toBe(`:${first}`);
+      expect(displays[1]).toMatch(/^:\d+$/);
+      expect(displays[1]).not.toBe(displays[0]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30000);
 });
 
 describe.skipIf(process.platform !== 'linux')('daemon-owned display lifecycle', () => {
@@ -321,6 +373,7 @@ describe.skipIf(process.platform !== 'linux')('daemon-owned display lifecycle', 
       fs.writeFileSync(preload, `
         import * as fs from 'node:fs';
         import { BrowserManager } from ${JSON.stringify(path.resolve(import.meta.dir, '../src/browser-manager.ts'))};
+        import { atomicWriteSync } from ${JSON.stringify(path.resolve(import.meta.dir, '../../lib/fs-atomic.ts'))};
         const getPage = BrowserManager.prototype.getPage;
         const wrapped = new WeakSet();
         let rejectWelcome;
@@ -331,7 +384,7 @@ describe.skipIf(process.platform !== 'linux')('daemon-owned display lifecycle', 
             const goto = page.goto.bind(page);
             page.goto = async (url, options) => {
               if (new URL(url).pathname === '/welcome') {
-                fs.writeFileSync(${JSON.stringify(entered)}, JSON.stringify(this.getXvfbHandle()));
+                atomicWriteSync(${JSON.stringify(entered)}, JSON.stringify(this.getXvfbHandle()));
                 if (${JSON.stringify(mode)} === 'shutdown') {
                   return new Promise((resolve, reject) => {
                     rejectWelcome = () => reject(new Error('Welcome interrupted during shutdown'));
@@ -418,7 +471,10 @@ describe.skipIf(process.platform !== 'linux')('daemon-owned display lifecycle', 
           if (!response.ok) throw new Error(`${name}: ${response.status}: ${await response.text()}`);
           return response.text();
         };
-        if (mode === 'welcome') expect(await command('url')).toContain('/welcome');
+        if (mode === 'welcome') {
+          const url = await command('url');
+          expect(url, `daemon log tail: ${fs.readFileSync(path.join(root, 'daemon.log'), 'utf8').slice(-800)}`).toContain('/welcome');
+        }
         if (mode === 'welcome failure') {
           expect(fs.readFileSync(path.join(root, 'daemon.log'), 'utf8')).toContain('Welcome test navigation failure');
           expect(await command('url')).toContain('about:blank');

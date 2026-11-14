@@ -16,10 +16,9 @@ import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { capturePlanCountQuestion, createPlanCountPermissionGuard, matchesNativePlanQuestion, planCountPrerequisitePick, planCountQuestionInput } from '../auq';
 import { resolveClaudeBinary } from '../binary';
-import { pickDesignFocusAll } from '../boundaries';
 import { SANCTIONED_WRITE_SUBSTRINGS, isProseAUQVisible, planCountSubmissionInput } from '../classify';
 import type { ClaudePtySession } from '../launch';
-import { isNumberedOptionListVisible, isPermissionDialogVisible, isPlanReadyVisible, isRejectedSlashCommand, stripPtyResidue } from '../screen';
+import { idleTurnEnd, isNumberedOptionListVisible, isPermissionDialogVisible, isPlanReadyVisible, isRejectedSlashCommand, stripPtyResidue } from '../screen';
 import { realPtyDriver, runPtySession, type PtyDriver, type PtyStep } from '../session';
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -41,7 +40,9 @@ export interface PlanSkillFloorObservation {
     | 'silent_write'
     | 'exited'
     | 'timeout'
-    | 'assessment_error';
+    | 'assessment_error'
+    | 'permission_unanswered'
+    | 'api_error';
   summary: string;
   /** Public current viewport for an accepted finding; terminal tail otherwise. */
   evidence: string;
@@ -120,9 +121,10 @@ export function planFloorDXReplyInput(visible: string, call: NativePlanQuestionC
   const first = lines.findIndex(line => /^  1\. /.test(line));
   if (first < 0) return null;
   lines[first] = lines[first]!.replace(/^  1\./, '❯ 1.');
-  const pane = planFloorDXPane(lines.map(line => line.replace(
-    /^(Enter to select · ↑\/↓ to navigate · (?:n to add notes · )?)ctrl\+g to edit in [^\x00-\x1f\x7f·]+ · (Esc to cancel)$/,
-    '$1$2')).join('\n'), call);
+  // Only the final footer line is presentation; question text that resembles it stays verbatim.
+  const footer = lines.findLastIndex(line => line.trim().length > 0);
+  lines[footer] = lines[footer]!.replace(/^[ \t]*(Enter to select · ↑\/↓ to navigate(?: · n to add notes)?) · ctrl\+g to edit in [^\x00-\x1f\x7f·]+( · Esc to cancel)[ \t]*$/, '$1$2');
+  const pane = planFloorDXPane(lines.join('\n'), call);
   if (!pane || compact(pane) !== compact(state.pane)) return null;
   return state.stage === 'paste'
     ? { input: '\x1b[200~' + state.reply + '\x1b[201~', stage: 'submit' }
@@ -143,6 +145,8 @@ export interface PlanSkillFloorOptions {
   productType?: 'sdk-documentation';
   /** Literal persona/journey correction declared before DX setup; approves no offered remedy. */
   devexSetupContext?: string;
+  /** Case-owned answer to a declared setup menu (the design seed's Step 0D focus choice); null leaves the question to the floor review. */
+  pickSetupChoice?: (question: NativePlanQuestionCall['questions'][number]) => number | null;
   /** Installation cwd retained for caller compatibility; review uses an owned seeded project. */
   cwd?: string;
   /** Total budget. Default 600000 (10 min). Tests exit early on AUQ. */
@@ -171,7 +175,7 @@ export async function runPlanSkillFloorCheck(opts: PlanSkillFloorOptions): Promi
     // Runs 36626737820 and 36776104571: CEO read scope preservation as approving
     // approach A, so the seeded premise gap never reached a question. Run 36794871032:
     // CEO read this request as supplying every answer up front and asked nothing.
-    ...(opts.skillName === 'plan-ceo-review' ? ['Preserving scope does not approve the plan\'s premise, approach or any remedy. This request answers only the routing, recall, outside-reviewer and review-mode questions named above.'] : []),
+    ...(opts.skillName === 'plan-ceo-review' ? ['Preserving scope does not approve the plan\'s premise, approach or any remedy. The routing, recall, outside-reviewer and review-mode choices above are already answered. Premise, approach and remedy decisions remain unanswered; follow the skill\'s normal interactive decision workflow for those choices.'] : []),
     ...(opts.productType === 'sdk-documentation' ? [
       'Product type is confirmed: SDK quickstart documentation, with the complete journey to the first SDK call as context. If asked to classify, choose SDK + Docs when offered, otherwise Documentation. This confirms the review lens; it does not expand the plan.',
       'Target persona is confirmed: a hands-on developer integrating this SDK for the first time, trying to make one successful call. Product type and persona setup are already answered; proceed to reviewing the supplied plan.',
@@ -189,9 +193,10 @@ export async function runPlanSkillFloorCheck(opts: PlanSkillFloorOptions): Promi
     since: 0, commandStartedAt: 0, targetDelivery: undefined, saveSnapshot: undefined, nativeCandidates: [],
     validatedPendingQuestion: undefined, sampledAt: undefined, lastCheckpointAt: 0, lastCheckpointState: '',
     artifactError: undefined, finished: false, started: false, start: 0, deadlineAt: 0, screenDeadlineAt: 0,
+    permissionUnansweredSince: undefined, idleVisible: undefined, idleSince: 0,
   } as unknown as FloorRun;
   return runPtySession<PlanSkillFloorObservation>({
-    driver,
+    driver, budgetMs: timeoutMs,
     cleanup: () => fixture.cleanup(),
     launch: {
       permissionMode: 'plan',
@@ -265,6 +270,11 @@ interface FloorRun {
   start: number;
   deadlineAt: number;
   screenDeadlineAt: number;
+  /** When the current permission render was first left unanswered by this actor. */
+  permissionUnansweredSince: number | undefined;
+  /** The idle turn end with an error panel being settled, and when it was first seen unchanged. */
+  idleVisible: string | undefined;
+  idleSince: number;
 }
 
 async function floorStart(run: FloorRun, session: ClaudePtySession): Promise<undefined> {
@@ -387,11 +397,34 @@ async function floorTick(run: FloorRun, session: ClaudePtySession): Promise<PtyS
     ? planFloorDXPane(run.viewport, call) !== null : matchesNativePlanQuestion(run.viewport, call, run.planningDirectory));
   run.pendingQuestion = matching.length === 1 ? matching[0] : undefined;
   floorCheckpoint(run, session);
-  if (floorPermission(run, session)) return 'continue';
+  if (floorPermission(run, session)) {
+    const waited = run.permissionUnansweredSince === undefined ? 0 : driver.now() - run.permissionUnansweredSince;
+    return waited < PERMISSION_UNANSWERED_MS ? 'continue' : finish({ auqObserved: false, outcome: 'permission_unanswered',
+      summary: `PERMISSION_DIALOG_UNANSWERED: a Claude Code permission dialog stayed open for ${waited}ms without an owned grant`,
+      evidence: run.viewport.slice(-3000), elapsedMs: driver.now() - run.startedAt });
+  }
   const question = floorQuestion(run, session, currentCalls);
   if (question) return question;
-  return floorAssess(run, session, visible);
+  const assessed = floorAssess(run, session, visible);
+  if (assessed !== 'continue') return assessed;
+  const idle = idleTurnEnd(visible);
+  if (!idle?.apiError || visible !== run.idleVisible) {
+    run.idleVisible = idle?.apiError ? visible : undefined;
+    run.idleSince = driver.now();
+    return 'continue';
+  }
+  if (driver.now() - run.idleSince < IDLE_SETTLE_MS) return 'continue';
+  return finish({ auqObserved: false, outcome: 'api_error',
+    summary: `the CLI turn ended at an idle prompt (${idle.done}) after its public error panel: ${idle.apiError}`,
+    evidence: visible.slice(-3000), elapsedMs: driver.now() - run.startedAt });
 }
+
+/** An idle turn end must hold still this long, re-reading the transcript each tick, before its error panel ends the
+ * check, so a question whose transcript line lands after the screen draws "done" is still credited. */
+const IDLE_SETTLE_MS = 10_000;
+
+/** This actor answers only owned file grants; any other permission render fails fast with a named cause. */
+const PERMISSION_UNANSWERED_MS = 20_000;
 
 /** An authorized owned file write enables the review, but never supplies its
  * finding question. True when an active permission render owns this tick. */
@@ -399,7 +432,7 @@ function floorPermission(run: FloorRun, session: ClaudePtySession): boolean {
   const { fixture, viewport } = run;
   const permissionIsActiveRender = !run.pendingQuestion &&
     (isPermissionDialogVisible(viewport) || isCroppedEditPermissionVisible(viewport));
-  if (!permissionIsActiveRender) return false;
+  if (!permissionIsActiveRender) { run.permissionUnansweredSince = undefined; return false; }
   // Exclude the permission's old render after approval.
   const owned = currentFilePermissionBinding(run.ownedFilePermissions, fixture.cwd,
     session.hermeticConfigDir, run.startedAt, run.transcript, viewport);
@@ -411,8 +444,10 @@ function floorPermission(run: FloorRun, session: ClaudePtySession): boolean {
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
     ordinaryOwnedTarget = parent === fs.realpathSync(fixture.cwd) && (!target || target.isFile());
   } catch { /* No authority for a linked, foreign, or unreadable target. */ }
-  if (owned && ordinaryOwnedTarget && owned.binding.guard(viewport, session.visibleText(), owned.epoch) === 'grant')
-    session.send('1\r');
+  const decision = owned && ordinaryOwnedTarget ? owned.binding.guard(viewport, session.visibleText(), owned.epoch) : null;
+  if (decision === 'grant') session.send('1\r');
+  // A grant or its lingering render is answered; anything else waits on no one.
+  run.permissionUnansweredSince = decision ? undefined : run.permissionUnansweredSince ?? run.driver.now();
   return true;
 }
 
@@ -429,7 +464,7 @@ function floorQuestion(run: FloorRun, session: ClaudePtySession, currentCalls: N
     const chosen = run.setupChoices.get(key) ?? new Set<number>();
     const pick = pickPlanFloorMode(opts.skillName, question) ?? planCountPrerequisitePick(fp, fp)
       ?? (opts.skillName === 'plan-devex-review' ? pickPlanFloorProductType(question, opts.productType) : null)
-      ?? (opts.skillName === 'plan-design-review' ? pickDesignFocusAll(question) : null);
+      ?? opts.pickSetupChoice?.(question) ?? null;
     if (pick !== null) {
       if (!chosen.has(index)) {
         session.send(planCountQuestionInput(viewport, fp, pick));

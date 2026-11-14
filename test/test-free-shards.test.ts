@@ -2,7 +2,6 @@ import { describe, test, expect, spyOn } from 'bun:test';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { readPidStartTime } from '../browse/src/xvfb';
 import {
   isFreeTestFile,
   collectFreeTestFiles,
@@ -15,19 +14,25 @@ import {
   runFreeShard,
   FreeRunReporter,
   buildRunEpilogue,
+  failureExcerpt,
   FREE_TEST_TIMEOUT_MS,
   DEFAULT_WALL_TIMEOUT_MS,
   PER_FILE_WALL_MS,
   wallTimeoutForShard,
+  FLAKY_RETRY_CAP,
+  recordingWallTimeoutMs,
+  parseCliOptions,
   KNOWN_WINDOWS_INCOMPATIBLE,
   TEST_ROOTS,
   TREE_MUTATING,
-  WORKER_HOSTILE,
 } from '../scripts/test-free-shards';
 import {
   loadFreeTestDurations,
   packShardsByDuration,
   wallTimeoutForPackedShard,
+  ciShardJobTimeoutMinutes,
+  ciPlanMatrix,
+  MAX_CI_JOB_TIMEOUT_MINUTES,
   createFreeCiPlan,
   validateFreeCiPlan,
   verifyFreeCiResults,
@@ -40,278 +45,6 @@ import {
 } from '../scripts/test-free-shards';
 
 const ROOT = path.resolve(import.meta.dir, '..');
-
-const OWNERSHIP_ACTOR = `
-import * as fs from 'fs';
-import * as path from 'path';
-import { spawn } from 'child_process';
-import { spyOn } from 'bun:test';
-import { readPidStartTime } from ${JSON.stringify(path.join(ROOT, 'browse/src/xvfb.ts'))};
-const [role, directory, mode, name = 'owned'] = process.argv.slice(2);
-const file = (suffix) => path.join(directory, name + suffix);
-const wait = async (filename) => {
-  const deadline = Date.now() + 5000;
-  while (!fs.existsSync(filename)) {
-    if (Date.now() > deadline) throw new Error('fixture readiness deadline');
-    await Bun.sleep(10);
-  }
-};
-const write = (filename, value) => {
-  fs.mkdirSync(path.dirname(filename), {recursive:true});
-  fs.writeFileSync(filename + '.tmp', JSON.stringify(value));
-  fs.renameSync(filename + '.tmp', filename);
-};
-const identity = (pid) => ({pid, start: readPidStartTime(pid), ticks: process.platform === 'linux'
-  ? fs.readFileSync('/proc/' + pid + '/stat', 'utf8').split(') ')[1].trim().split(/\\s+/)[19] : null});
-if (role === 'leaf') {
-  setInterval(() => {}, 1000);
-} else if (role === 'daemon') {
-  const children = [0,1].map(index => spawn(process.execPath, [import.meta.filename, 'leaf', directory, mode, name], {
-    detached:true, stdio:'ignore', env:process.env,
-  }));
-  await Bun.sleep(50);
-  const owned = [identity(process.pid), ...children.map(child => identity(child.pid))];
-  const server = Bun.serve({hostname:'127.0.0.1', port:0, fetch() {
-    fs.appendFileSync(file('.http'), 'request\\n'); return new Response('ok');
-  }});
-  const state = {pid:process.pid, instanceId:name + '-' + process.pid, port:server.port, token:crypto.randomUUID(),
-    chromiumPid:owned[1].pid, chromiumStartTime:owned[1].start};
-  const agent = {pid:owned[2].pid, startTime:owned[2].start, gen:'fixture', ownerPid:process.pid, ownerStartTime:owned[0].start};
-  write(process.env.BROWSE_STATE_FILE, state);
-  write(path.join(path.dirname(process.env.BROWSE_STATE_FILE), 'terminal-agent-pid'), agent);
-  write(file('.ready'), {owned, state, agent, stateFile:process.env.BROWSE_STATE_FILE});
-  process.on('SIGTERM', () => {});
-  process.on('SIGINT', () => {
-    write(file('.interrupted'), {at:Date.now()});
-    if (mode === 'cancel-force') return;
-    const current = JSON.parse(fs.readFileSync(path.join(path.dirname(process.env.BROWSE_STATE_FILE), 'terminal-agent-pid'), 'utf8'));
-    try { process.kill(current.pid, 'SIGTERM'); } catch {}
-    for (const child of children) try { child.kill('SIGTERM'); } catch {}
-    const finish = () => {
-      fs.rmSync(process.env.BROWSE_STATE_FILE, {force:true});
-      fs.rmSync(path.join(path.dirname(process.env.BROWSE_STATE_FILE), 'terminal-agent-pid'), {force:true});
-      process.exit(0);
-    };
-    if (mode === 'cancel-cold-probes') setTimeout(finish, 2200);
-    else if (mode === 'exit-environment-race') setTimeout(finish, 200);
-    else finish();
-  });
-} else if (role === 'shard') {
-  const daemon = spawn(process.execPath, [import.meta.filename, 'daemon', directory, mode], {
-    detached:true, stdio:'ignore', env:process.env,
-  });
-  daemon.unref();
-  await wait(file('.ready'));
-  if (!mode.endsWith('cold-probes')) await Bun.sleep(400);
-  const own = JSON.parse(fs.readFileSync(file('.ready'), 'utf8'));
-  if (mode.includes('mix') || mode === 'replaced-pid') {
-    const sibling = JSON.parse(fs.readFileSync(path.join(directory, 'sibling.ready'), 'utf8'));
-    if (mode === 'endpoint-mix') write(process.env.BROWSE_STATE_FILE, {...own.state, port:sibling.state.port, token:sibling.state.token});
-    if (mode === 'full-state-mix') {
-      write(process.env.BROWSE_STATE_FILE, sibling.state);
-      write(path.join(path.dirname(process.env.BROWSE_STATE_FILE), 'terminal-agent-pid'), sibling.agent);
-    }
-    if (mode === 'terminal-mix') write(path.join(path.dirname(process.env.BROWSE_STATE_FILE), 'terminal-agent-pid'),
-      {...sibling.agent, ownerPid:own.state.pid, ownerStartTime:own.owned[0].start});
-    if (mode === 'chromium-mix') write(process.env.BROWSE_STATE_FILE,
-      {...own.state, chromiumPid:sibling.state.chromiumPid, chromiumStartTime:sibling.state.chromiumStartTime});
-    if (mode === 'replaced-pid') write(process.env.BROWSE_STATE_FILE, {...own.state, pid:sibling.state.pid});
-  }
-  if (mode === 'stale-child-start') write(process.env.BROWSE_STATE_FILE, {...own.state, chromiumStartTime:'stale'});
-  if (mode === 'replaced-start') write(file('.replace-start'), true);
-  write(file('.shard-ready'), true);
-  if (mode === 'timeout' || mode.startsWith('cancel')) await new Promise(() => {});
-  console.log('Ran 3 tests across 1 files. [12.00ms]');
-  process.exit(mode === 'failure' ? 3 : 0);
-} else if (role === 'harness') {
-  if (mode === 'settle-cold-probes') Object.defineProperty(process, 'platform', {value:'darwin'});
-  let spy;
-  if (['replaced-start', 'exit-environment-race', 'unavailable-environment'].includes(mode)) {
-    const original = fs.readFileSync;
-    spy = spyOn(fs, 'readFileSync').mockImplementation((filename, ...args) => {
-      const value = original(filename, ...args);
-      if (String(filename).endsWith('/environ') && fs.existsSync(file('.ready'))
-        && (mode === 'unavailable-environment' || mode === 'exit-environment-race' && fs.existsSync(file('.interrupted')))) {
-        const own = JSON.parse(original(file('.ready'), 'utf8'));
-        if (String(filename) === '/proc/' + own.state.pid + '/environ') {
-          fs.appendFileSync(file('.denials'), 'denied\\n');
-          throw Object.assign(new Error('controlled unavailable environment ' + own.state.token), {code:'EACCES', path:String(filename)});
-        }
-      }
-      if (String(filename).endsWith('/stat') && fs.existsSync(file('.replace-start'))) {
-        const own = JSON.parse(original(file('.ready'), 'utf8'));
-        if (String(filename) === '/proc/' + own.state.pid + '/stat') {
-          const split = value.lastIndexOf(') ') + 2;
-          const fields = value.slice(split).trim().split(/\\s+/); fields[19] = String(Number(fields[19]) + 1);
-          return value.slice(0, split) + fields.join(' ');
-        }
-      }
-      return value;
-    });
-  } else if (mode === 'directory-remove-failure') {
-    const original = fs.rmSync;
-    spy = spyOn(fs, 'rmSync').mockImplementation((filename, ...args) => {
-      if (fs.existsSync(file('.ready'))) {
-        const own = JSON.parse(fs.readFileSync(file('.ready'), 'utf8'));
-        if (String(filename) === path.dirname(path.dirname(own.stateFile))) {
-          throw Object.assign(new Error('controlled directory removal failure'), {code:'EACCES'});
-        }
-      }
-      return original(filename, ...args);
-    });
-  }
-  try {
-    const {runFreeShard} = await import(${JSON.stringify(path.join(ROOT, 'scripts/test-free-shards.ts'))});
-    const result = await runFreeShard(['ownership-fixture'], 1, 1, {
-      rootDir:${JSON.stringify(ROOT)}, quiet:true, log:() => {}, wallTimeoutMs:mode === 'timeout' ? 1200 : 15000,
-      env:mode.endsWith('cold-probes') ? {...process.env, PATH:process.env.GSTACK_FIXTURE_PATH} : process.env,
-      commandFor:() => ({command:process.execPath, args:[import.meta.filename, 'shard', directory, mode]}),
-    });
-    write(file('.result'), result);
-  } finally { spy?.mockRestore(); }
-}
-`;
-
-function ownershipProcessAlive(identity: { pid: number; start: string; ticks: string | null }): boolean {
-  if (process.platform === 'linux') {
-    try {
-      const raw = fs.readFileSync(`/proc/${identity.pid}/stat`, 'utf8');
-      const fields = raw.slice(raw.lastIndexOf(') ') + 2).trim().split(/\s+/);
-      return fields[0] !== 'Z' && fields[0] !== 'X' && fields[19] === identity.ticks;
-    } catch { return false; }
-  }
-  return readPidStartTime(identity.pid) === identity.start;
-}
-
-describe('test-free-shards: owned detached browser settlement', () => {
-  for (const mode of ['success', 'failure', 'timeout', 'cancel', 'cancel-force', 'endpoint-mix', 'full-state-mix',
-    'terminal-mix', 'chromium-mix', 'replaced-pid', 'stale-child-start', 'replaced-start', 'exit-environment-race',
-    'unavailable-environment', 'directory-remove-failure', 'cancel-cold-probes', 'settle-cold-probes']) {
-    test.skipIf(process.platform === 'win32' || ((['replaced-start', 'exit-environment-race', 'unavailable-environment'].includes(mode) || mode.endsWith('cold-probes')) && process.platform !== 'linux'))(mode, async () => {
-      const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'free-owned-browser-'));
-      const actor = path.join(directory, 'actor.ts');
-      fs.writeFileSync(actor, OWNERSHIP_ACTOR);
-      const probeLog = path.join(directory, 'probes.jsonl');
-      const bin = path.join(directory, 'bin');
-      if (mode.endsWith('cold-probes')) {
-        fs.mkdirSync(bin);
-        for (const tool of ['ps', 'pgrep']) {
-          fs.writeFileSync(path.join(bin, tool), `#!/usr/bin/env bun
-import * as fs from 'node:fs';
-const args = process.argv.slice(2);
-const record = (event) => fs.appendFileSync(${JSON.stringify(probeLog)}, JSON.stringify({event, pid:process.pid, parent:process.ppid, at:Date.now(), args}) + '\\n');
-record('start');
-await Bun.sleep(args.includes('lstart=') ? 1700 : 350);
-const child = Bun.spawn([${JSON.stringify(Bun.which(tool))}, ...args], {stdout:'inherit', stderr:'inherit', timeout:1000});
-const code = await child.exited;
-record('complete');
-process.exit(code);
-`, { mode: 0o755 });
-        }
-      }
-      const waitFor = async (filename: string) => {
-        const deadline = Date.now() + 8000;
-        while (!fs.existsSync(filename)) {
-          if (Date.now() > deadline) throw new Error('ownership fixture did not become ready');
-          await Bun.sleep(10);
-        }
-      };
-      const processes: ReturnType<typeof Bun.spawn>[] = [];
-      try {
-        const sibling = Bun.spawn([process.execPath, actor, 'daemon', directory, 'sibling', 'sibling'], {
-          env: { ...process.env, BROWSE_STATE_FILE: path.join(directory, 'sibling-state', 'browse.json'), GSTACK_FREE_SHARD_ID: 'sibling' },
-          stdout: 'ignore', stderr: 'ignore',
-        });
-        processes.push(sibling);
-        await waitFor(path.join(directory, 'sibling.ready'));
-        const harness = Bun.spawn([process.execPath, actor, 'harness', directory, mode], {
-          env: mode.endsWith('cold-probes') ? { ...process.env, PATH: bin + path.delimiter + process.env.PATH, GSTACK_FIXTURE_PATH: process.env.PATH } : process.env,
-          stdout: 'ignore', stderr: 'pipe',
-        });
-        processes.push(harness);
-        const stderr = new Response(harness.stderr).text();
-        await waitFor(path.join(directory, 'owned.shard-ready'));
-        const readyAt = Date.now();
-        let cancelledAt: number | undefined;
-        if (mode.startsWith('cancel')) {
-          cancelledAt = Date.now();
-          harness.kill('SIGTERM');
-        }
-        const watchdog = setTimeout(() => harness.kill('SIGKILL'), 20000);
-        let exit: number;
-        try { exit = await harness.exited; } finally { clearTimeout(watchdog); }
-        const output = await stderr;
-        expect({ exit, output }).toEqual({ exit: mode.startsWith('cancel') ? 143 : 0, output: expect.any(String) });
-        const own = JSON.parse(fs.readFileSync(path.join(directory, 'owned.ready'), 'utf8'));
-        const other = JSON.parse(fs.readFileSync(path.join(directory, 'sibling.ready'), 'utf8'));
-        const result = JSON.parse(fs.readFileSync(path.join(directory, 'owned.result'), 'utf8'));
-        expect(output).not.toContain(own.state.token);
-        expect(output).not.toContain(other.state.token);
-        const invalid = ['full-state-mix', 'terminal-mix', 'chromium-mix', 'replaced-pid', 'stale-child-start', 'replaced-start',
-          'unavailable-environment', 'directory-remove-failure', 'settle-cold-probes'].includes(mode);
-        expect(result.status).toBe(mode === 'timeout' ? 'timed-out' : invalid || mode === 'failure' || mode.startsWith('cancel') ? 'failed' : 'passed');
-        expect(result.unattributedFailures).toBe(invalid || mode === 'timeout' || mode.startsWith('cancel') ? 1 : 0);
-        if (invalid) {
-          expect(fs.existsSync(path.dirname(own.stateFile))).toBe(true);
-          expect(fs.existsSync(path.join(directory, 'owned.interrupted'))).toBe(mode === 'directory-remove-failure');
-          expect(eligibleFreeRetryFiles([result])).toBeNull();
-        } else {
-          await Bun.sleep(100);
-          expect(fs.existsSync(path.dirname(path.dirname(own.stateFile)))).toBe(false);
-          expect(fs.existsSync(path.join(directory, 'owned.interrupted'))).toBe(true);
-        }
-        if (cancelledAt !== undefined) {
-          const interruption = JSON.parse(fs.readFileSync(path.join(directory, 'owned.interrupted'), 'utf8'));
-          expect(interruption.at - cancelledAt).toBeLessThan(mode === 'cancel-cold-probes' ? 2500 : 1000);
-          expect(Date.now() - cancelledAt).toBeLessThan(mode === 'cancel-cold-probes' ? 6500 : 7000);
-        }
-        if (mode.endsWith('cold-probes')) {
-          if (mode === 'settle-cold-probes') expect(Date.now() - readyAt).toBeLessThan(10400);
-          const before = fs.readFileSync(probeLog, 'utf8');
-          const probes = before.trim().split('\n').map(line => JSON.parse(line));
-          const starts = probes.filter(row => row.event === 'start');
-          expect(starts.length).toBeGreaterThan(0);
-          if (mode === 'cancel-cold-probes') {
-            expect(starts.every(row => row.at >= cancelledAt!)).toBe(true);
-            expect(probes.filter(row => row.event === 'complete').length).toBe(3);
-          }
-          for (const probe of starts) {
-            expect(fs.existsSync('/proc/' + probe.pid)).toBe(false);
-            const completed = probes.find(row => row.pid === probe.pid && row.event === 'complete');
-            if (completed) expect(completed.at - probe.at).toBeLessThan(probe.args.includes('lstart=') ? 2000 : 500);
-          }
-          await Bun.sleep(300);
-          expect(fs.readFileSync(probeLog, 'utf8')).toBe(before);
-        }
-        expect(own.owned.map(ownershipProcessAlive)).toEqual(mode === 'unavailable-environment'
-          ? [true, true, true] : [mode === 'replaced-start', false, false]);
-        expect(other.owned.map(ownershipProcessAlive)).toEqual([true, true, true]);
-        expect(fs.existsSync(path.join(directory, 'sibling.interrupted'))).toBe(false);
-        expect(fs.existsSync(path.join(directory, 'sibling.http'))).toBe(false);
-        expect(fs.existsSync(path.join(directory, 'owned.http'))).toBe(false);
-        if (mode === 'exit-environment-race' || mode === 'unavailable-environment') expect(fs.existsSync(path.join(directory, 'owned.denials'))).toBe(true);
-      } finally {
-        for (const name of ['owned', 'sibling']) {
-          const receipt = path.join(directory, `${name}.ready`);
-          if (!fs.existsSync(receipt)) continue;
-          const metadata = JSON.parse(fs.readFileSync(receipt, 'utf8'));
-          for (const identity of metadata.owned) if (ownershipProcessAlive(identity)) process.kill(identity.pid, 'SIGKILL');
-          const ownedRoot = path.dirname(path.dirname(metadata.stateFile));
-          if (name === 'owned' && path.dirname(ownedRoot) === fs.realpathSync(os.tmpdir())
-            && /^gstack-free-shard-[A-Za-z0-9]+$/.test(path.basename(ownedRoot))
-            && fs.existsSync(ownedRoot) && fs.realpathSync(ownedRoot) === ownedRoot) {
-            fs.rmSync(ownedRoot, { recursive: true, force: true });
-          }
-        }
-        for (const child of processes) {
-          if (child.exitCode === null) child.kill('SIGKILL');
-          await child.exited;
-        }
-        fs.rmSync(directory, { recursive: true, force: true });
-      }
-    }, 30000);
-  }
-});
 
 describe('test-free-shards: isolated CI and explicit quick feedback', () => {
   const files = Array.from({ length: 8 }, (_, i) => `test/sample-${i}.test.ts`);
@@ -467,7 +200,7 @@ describe('test-free-shards: exclusive host-state phase', () => {
     let child: ReturnType<typeof Bun.spawn> | undefined;
     let watchdog: ReturnType<typeof setTimeout> | undefined;
     try {
-      for (const file of ['scripts/test-free-shards.ts', 'scripts/test-strict-output.ts', 'scripts/lib/shard-engine.ts', 'lib/state-root.ts',
+      for (const file of ['scripts/test-free-shards.ts', 'scripts/test-strict-output.ts', 'scripts/lib/shard-engine.ts', 'scripts/lib/free-home-guard.ts', 'scripts/lib/free-ci-health.ts', 'scripts/lib/windows-curation.ts', 'scripts/lib/shard-jobs.ts', 'lib/state-root.ts', 'lib/fixture-marker.ts',
         'test/helpers/paid-test-set.ts', 'test/helpers/touchfiles.ts', 'test/helpers/touchfiles-data.ts', 'test/helpers/test-selection.ts']) {
         const target = path.join(directory, file);
         fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -544,6 +277,12 @@ describe('test-free-shards: exclusive host-state phase', () => {
         expect(counts).toEqual(mode === 'retry-reader' ? [2, 1, 1] : mode === 'retry-exclusive' ? [1, 1, 2] : [1, 1, 1]);
         if (mode.startsWith('retry-')) {
           expect(output).toContain('FLAKY-PASS');
+          expect(output).toContain('      Expected: 2');
+          const [flake] = fs.readFileSync(path.join(directory, 'flakes.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+          expect(flake.file).toBe(selected[mode === 'retry-reader' ? 0 : 2]);
+          expect(flake.tests).toHaveLength(1);
+          expect(flake.tests[0].name).toBe('selected fixture');
+          expect(flake.tests[0].excerpt.slice(0, 3)).toEqual(['error: expect(received).toBe(expected)', 'Expected: 2', 'Received: 1']);
           expect(events[6]).toEqual({ file: selected[mode === 'retry-reader' ? 0 : 2], event: 'start' });
         } else if (mode === 'truncated-exclusive') {
           expect(output).toContain('flaky-retry skipped');
@@ -756,12 +495,6 @@ describe('test-free-shards: shard args', () => {
     expect(args).toContain('--max-concurrency=1');
     expect(args).not.toContain('--parallel');
     expect(args).not.toContain('--concurrent');
-  });
-
-  test('parallel mode swaps serial max-concurrency for --parallel', () => {
-    const args = buildShardArgs(['test/foo.test.ts'], { rootDir: ROOT, parallel: true });
-    expect(args).toContain('--parallel');
-    expect(args).not.toContain('--max-concurrency=1');
   });
 
   test('per-test timeout matches the 30s the package.json test script used before the repoint', () => {
@@ -1087,12 +820,55 @@ describe('test-free-shards: output contract (log capture, quiet console, failure
     expect(lines.some((l) => l.startsWith('[test:free] FAIL — '))).toBe(true);
   }, 30_000);
 
+  test('a test process that aborts before its summary names the in-flight file and its last output', () => {
+    const reporter = new FreeRunReporter(['test/done.test.ts', 'test/aborted.test.ts']);
+    reporter.write('::group::test/done.test.ts:\n(pass) fine\n::endgroup::\n', 'stdout');
+    reporter.write('::group::test/aborted.test.ts:\n(pass) first\n', 'stdout');
+    reporter.write('GetQueuedCompletionStatusEx: (735) ERROR_ABANDONED_WAIT_0\n', 'stderr');
+    reporter.end();
+    const lines = buildRunEpilogue('failed', reporter.report(), 16_000, '/tmp/x.log');
+    expect(lines).toContain('  ⚠ test process ended before its summary; in flight: test/aborted.test.ts');
+    expect(lines).toContain('  ⚠ last output: GetQueuedCompletionStatusEx: (735) ERROR_ABANDONED_WAIT_0');
+  });
+
   test('timeout with no observable header falls back to the buffered-parallel explanation', () => {
     const reporter = new FreeRunReporter(['test/a.test.ts', 'test/b.test.ts']);
     reporter.end();
     const lines = buildRunEpilogue('timed-out', reporter.report(), 5_000, '/tmp/x.log');
     expect(lines.some((l) => l.includes('in flight at kill: unknown'))).toBe(true);
     expect(lines.some((l) => l.includes('2 planned file(s) produced no output'))).toBe(true);
+  });
+
+  // Windows run 39448730953 attempt 1, windows-free-shard (6): the team-init PowerShell case as bun printed it.
+  test('a failure keeps the assertion bun printed before its (fail) line, and the epilogue shows it', () => {
+    const reporter = new FreeRunReporter(['test/team-init-hook-shell-neutral.test.ts']);
+    reporter.write([
+      '::group::test\\team-init-hook-shell-neutral.test.ts:',
+      '(pass) required team hook: shell-neutral registration > through the default shell: deny with exit 2 when no install resolves, {} when one does [211.85ms]',
+      'killed 1 dangling process',
+      '66 |       const denied = runner(hookEnv({ HOME: home, USERPROFILE: home }));',
+      '67 |       expect(denied.status).toBe(denyStatus);',
+      '                                 ^',
+      'error: expect(received).toBe(expected)',
+      '',
+      'Expected: 1',
+      'Received: null',
+      '',
+      '      at <anonymous> (D:\\a\\gstack\\gstack\\test\\team-init-hook-shell-neutral.test.ts:67:29)',
+      '',
+      '::error file=test\\team-init-hook-shell-neutral.test.ts,line=67,col=29,title=error: expect(received).toBe(expected)::Expected: 1',
+      '(fail) required team hook: shell-neutral registration > through PowerShell: deny with exit 2 when no install resolves, {} when one does [30108.20ms]',
+      '  ^ this test timed out after 30000ms.',
+      '',
+    ].join('\n'), 'stderr');
+    reporter.end();
+    const [failure] = reporter.report().failures;
+    expect(failure.excerpt).toEqual(['error: expect(received).toBe(expected)', 'Expected: 1', 'Received: null',
+      '      at <anonymous> (D:\\a\\gstack\\gstack\\test\\team-init-hook-shell-neutral.test.ts:67:29)']);
+    const lines = buildRunEpilogue('failed', reporter.report(), 30_000, '/tmp/x.log');
+    expect(lines).toContain('      Received: null');
+    expect(failureExcerpt(['noise', 'one', 'two', 'three'])).toEqual(['one', 'two', 'three']);
+    expect(failureExcerpt(['error: x'.padEnd(300, 'y'), ...Array.from({ length: 10 }, (_, i) => 'line ' + i)])).toHaveLength(8);
   });
 
   test('duplicate fail lines dedupe; pre-header failures are labeled unattributed', () => {
@@ -1175,10 +951,10 @@ describe('test-free-shards: GitHub Actions log-group attribution', () => {
 describe('test-free-shards: curated-list census pins', () => {
   // A renamed test file must FAIL here, not silently drop its serialization
   // (a phantom TREE_MUTATING key means the reader races regenerating shards
-  // again) or its serial-child quarantine (WORKER_HOSTILE).
-  test('every TREE_MUTATING and WORKER_HOSTILE key names a real free test file', () => {
+  // again).
+  test('every TREE_MUTATING key names a real free test file', () => {
     const census = new Set(collectFreeTestFiles(ROOT));
-    const stale = [...Object.keys(TREE_MUTATING), ...Object.keys(WORKER_HOSTILE)]
+    const stale = Object.keys(TREE_MUTATING)
       .filter((key) => !census.has(key));
     expect(stale).toEqual([]);
   });
@@ -1211,6 +987,11 @@ describe('test-free-shards: wall-timeout scaling', () => {
   test('an explicit base above the scaled value wins', () => {
     expect(wallTimeoutForShard(10, 10 * 60_000)).toBe(10 * 60_000);
   });
+
+  test('--record-durations times each file under the one-file default unless --wall-timeout is explicit', () => {
+    expect(recordingWallTimeoutMs(parseCliOptions(['--record-durations']))).toBe(wallTimeoutForShard(1));
+    expect(recordingWallTimeoutMs(parseCliOptions(['--record-durations', '--wall-timeout', '1200']))).toBe(1_200_000);
+  });
 });
 
 
@@ -1237,12 +1018,12 @@ describe('test-free-shards: duration-aware packing (full-suite LPT)', () => {
     expect(one.shards).toEqual(two.shards);
   });
 
-  test('unknown files get 75th-percentile pessimism (placed early, never the tail)', () => {
+  test('unknown files get 99th-percentile pessimism (placed early, never the tail)', () => {
     const durations = {
       'test/a.test.ts': 1_000,
       'test/b.test.ts': 2_000,
       'test/c.test.ts': 100_000,
-      // test/d.test.ts unrecorded → p75 of known = 100_000 (pessimistic)
+      // test/d.test.ts unrecorded → p99 of known = 100_000 (pessimistic)
     };
     const { shards } = packShardsByDuration(files, 2, durations);
     // The unknown must NOT be packed as if free: it lands opposite the
@@ -1325,5 +1106,86 @@ describe('test-free-shards: duration-aware packing (full-suite LPT)', () => {
     expect(wallTimeoutForPackedShard(242_000, WALL_BASE_MS, 253)).toBe(253 * 5_000);
     // When the prediction is the larger bound, it still wins.
     expect(wallTimeoutForPackedShard(600_000, WALL_BASE_MS, 10)).toBe(1_800_000);
+  });
+
+  test('a shard\'s job timeout is its runner wall plus the flaky-retry wall plus setup, rounded up (#3850)', () => {
+    // 750 s predicted -> 2250 s wall, + 360 s retry, + 300 s setup = 2910 s -> 49 min.
+    expect(ciShardJobTimeoutMinutes({ shard: 1, files: ['a'], predictedMs: 750_000 }, 300)).toBe(49);
+    // A tiny shard still covers the 6-minute base wall and the retry pass.
+    expect(ciShardJobTimeoutMinutes({ shard: 2, files: ['a'], predictedMs: 1_000 }, 60)).toBe(13);
+  });
+
+  test('a shard that would need a job over the cap fails the plan instead of being truncated', () => {
+    const predictedMs = MAX_CI_JOB_TIMEOUT_MINUTES * 60_000 / 3;
+    expect(() => ciShardJobTimeoutMinutes({ shard: 4, files: ['a'], predictedMs }, 300)).toThrow(/FREE_JOB_TIMEOUT_OVER_CAP: CI shard 4 needs a 101-minute job/);
+  });
+
+  test('the matrix carries per-shard timeouts only when the plan is given a setup margin', () => {
+    const plan = createFreeCiPlan(['a.test.ts', 'b.test.ts'], 2, { 'a.test.ts': 750_000, 'b.test.ts': 1_000 }, 'rev');
+    expect(ciPlanMatrix(plan)).toEqual({ shard: [1, 2] });
+    expect(ciPlanMatrix(plan, 300)).toEqual({ include: [{ shard: 1, timeout_minutes: 49 }, { shard: 2, timeout_minutes: 17 }] });
+  });
+
+  test('unseeded files never push a shard past the job cap; their packed share is cut to fit (GST-2193)', () => {
+    // A stale seed packs every unseeded file at the seed's 99th percentile. On
+    // 2026-11-09 196 unseeded files put each shard at 77 of the 90-minute cap,
+    // and about 60 more would have failed every PR's plan. Recorded durations
+    // keep their full weight; only the unseeded estimate gives way.
+    const durations: Record<string, number> = { 'test/slow.test.ts': 1_200_000 };
+    for (let i = 0; i < 99; i += 1) durations[`test/s${i}.test.ts`] = 1_000;
+    const files = [...Object.keys(durations), 'test/new-a.test.ts', 'test/new-b.test.ts'];
+    expect(() => ciPlanMatrix(createFreeCiPlan(files, 1, durations, 'rev'), 300)).toThrow(/FREE_JOB_TIMEOUT_OVER_CAP/);
+    const plan = createFreeCiPlan(files, 1, durations, 'rev', 1, 300);
+    validateFreeCiPlan(plan, files, 'rev');
+    expect(plan.shards[0].files).toEqual([...files].sort());
+    expect(ciPlanMatrix(plan, 300)).toEqual({ include: [{ shard: 1, timeout_minutes: MAX_CI_JOB_TIMEOUT_MINUTES }] });
+    const neededMs = wallTimeoutForPackedShard(plan.shards[0].predictedMs, WALL_BASE_MS, files.length) + wallTimeoutForShard(FLAKY_RETRY_CAP) + 300_000;
+    expect(neededMs).toBeLessThanOrEqual(MAX_CI_JOB_TIMEOUT_MINUTES * 60_000);
+    expect(plan.shards[0].predictedMs).toBeGreaterThanOrEqual(1_299_000);
+  });
+
+  test('a plan under the job cap is unchanged by the unseeded cap (GST-2193 hold)', () => {
+    const seeded = { 'test/a.test.ts': 750_000, 'test/b.test.ts': 1_000 };
+    const plain = createFreeCiPlan(Object.keys(seeded), 2, seeded, 'rev');
+    expect(createFreeCiPlan(Object.keys(seeded), 2, seeded, 'rev', 1, 300)).toEqual(plain);
+    expect(ciPlanMatrix(plain, 300)).toEqual({ include: [{ shard: 1, timeout_minutes: 49 }, { shard: 2, timeout_minutes: 17 }] });
+    const partly = { 'test/a.test.ts': 600_000 };
+    const files = ['test/a.test.ts', 'test/b.test.ts'];
+    const plainPartly = createFreeCiPlan(files, 1, partly, 'rev');
+    expect(plainPartly.shards[0].predictedMs).toBe(1_200_000);
+    expect(createFreeCiPlan(files, 1, partly, 'rev', 1, 300)).toEqual(plainPartly);
+    expect(ciPlanMatrix(plainPartly, 300)).toEqual({ include: [{ shard: 1, timeout_minutes: 71 }] });
+  });
+
+  test('recorded durations over the job cap still fail the plan; only the unseeded share is cut (GST-2193 hold)', () => {
+    const durations = { 'test/slow.test.ts': 1_700_000, 'test/b.test.ts': 99_000 };
+    const plan = createFreeCiPlan([...Object.keys(durations), 'test/new.test.ts'], 1, durations, 'rev', 1, 300);
+    expect(plan.shards[0].predictedMs).toBe(1_799_000 + 1_700_000);
+    expect(() => ciPlanMatrix(plan, 300)).toThrow(/FREE_JOB_TIMEOUT_OVER_CAP: CI shard 1/);
+  });
+
+  test('--ci-plan with a stale seed keeps every job under the cap instead of failing the plan (GST-2193)', () => {
+    const committed = loadFreeTestDurations() ?? {};
+    const kept = Object.keys(committed).sort().filter((_, index) => index % 4 === 0);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'free-seed-stale-'));
+    try {
+      const seedPath = path.join(dir, 'seed.json');
+      fs.writeFileSync(seedPath, JSON.stringify({ version: 1, durations: Object.fromEntries(kept.map(file => [file, committed[file]])) }));
+      const planned = Bun.spawnSync([process.execPath, path.join(ROOT, 'scripts/test-free-shards.ts'), '--ci-plan', path.join(dir, 'plan.json'),
+        '--shards', '10', '--shard-jobs', '4', '--job-setup-seconds', '300'], { env: { ...process.env, GSTACK_FREE_TEST_DURATIONS: seedPath }, timeout: 10_000 });
+      expect(planned.exitCode, planned.stderr.toString()).toBe(0);
+      const matrix = JSON.parse(planned.stdout.toString()) as { include: Array<{ timeout_minutes: number }> };
+      expect(matrix.include.length).toBeGreaterThan(0);
+      expect(matrix.include.every(entry => entry.timeout_minutes <= MAX_CI_JOB_TIMEOUT_MINUTES)).toBe(true);
+      expect(planned.stderr.toString()).toMatch(/WARNING: \d+ free test files have no recorded duration/);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('--job-setup-seconds is a --ci-plan flag with whole seconds from 1 to 3600', () => {
+    expect(parseCliOptions(['--ci-plan', 'p.json', '--job-setup-seconds', '300']).jobSetupSeconds).toBe(300);
+    expect(() => parseCliOptions(['--shards', '2', '--job-setup-seconds', '300'])).toThrow('--job-setup-seconds applies only to --ci-plan');
+    for (const bad of ['0', '3601', '1.5', 'x']) {
+      expect(() => parseCliOptions(['--ci-plan', 'p.json', '--job-setup-seconds', bad])).toThrow('--job-setup-seconds needs a whole number of seconds from 1 to 3600');
+    }
   });
 });

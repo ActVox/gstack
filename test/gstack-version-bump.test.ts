@@ -9,8 +9,11 @@ import { describe, test, expect, afterAll } from 'bun:test';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { classifyState, VERSION_RE } from '../bin/gstack-version-bump';
+import { checkChangelog, normalizeChangelog, parseChangelog } from '../lib/changelog-check';
+import { EXIT } from '../lib/headless-artifacts';
+import { cleanup, makeFixtureRepo, makePr, readFile, restamp, runBin } from './helpers/restamp-fixture';
 
 const BIN = path.join(import.meta.dir, '..', 'bin', 'gstack-version-bump');
 
@@ -79,6 +82,22 @@ describe('write (FRESH bump)', () => {
     try { execFileSync('bun', [BIN, 'write', '--version', '1.2.3.4.5'], { cwd: dir, stdio: 'pipe', timeout: 30_000 }); }
     catch (e: any) { code = e.status; }
     expect(code).toBe(2);
+  });
+
+  test('--manifest-form full keeps a four-part manifest and its lockfile as written', () => {
+    const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-full-'));
+    fs.writeFileSync(path.join(d2, 'VERSION'), '0.60.482.0\n');
+    fs.writeFileSync(path.join(d2, 'package.json'), JSON.stringify({ name: 'g', version: '0.60.482.0' }, null, 2) + '\n');
+    fs.writeFileSync(path.join(d2, 'package-lock.json'), JSON.stringify({ name: 'g', version: '0.60.482.0', lockfileVersion: 3, packages: { '': { version: '0.60.482.0' } } }, null, 2) + '\n');
+    const out = JSON.parse(execFileSync('bun', [BIN, 'write', '--version', '0.60.483.0', '--manifest-form', 'full'], { cwd: d2, timeout: 30_000 }).toString());
+    expect(out.packageJsonVersion).toBe('0.60.483.0');
+    expect(JSON.parse(fs.readFileSync(path.join(d2, 'package.json'), 'utf-8')).version).toBe('0.60.483.0');
+    const lock = JSON.parse(fs.readFileSync(path.join(d2, 'package-lock.json'), 'utf-8'));
+    expect([lock.version, lock.packages[''].version]).toEqual(['0.60.483.0', '0.60.483.0']);
+    const bad = spawnSync('bun', [BIN, 'write', '--version', '0.60.484.0', '--manifest-form', 'wide'], { cwd: d2, timeout: 30_000 });
+    expect(bad.status).toBe(2);
+    expect(fs.readFileSync(path.join(d2, 'VERSION'), 'utf-8').trim()).toBe('0.60.483.0');
+    fs.rmSync(d2, { recursive: true, force: true });
   });
 
   test('VERSION-only repo (no package.json) writes just VERSION', () => {
@@ -737,9 +756,11 @@ describe('#2600: classify must surface versionFileExists=false when VERSION is m
     const out = execFileSync('bun', [BIN, 'classify', '--base', 'main'], { cwd: dir, timeout: 30_000 }).toString();
     const result = JSON.parse(out);
 
+    // G1 (#2334/#2343) deliberately replaced the fabricated 0.0.0.0 / FRESH
+    // classification: no configured version source is its own state.
     expect(result.versionFileExists).toBe(false);
-    expect(result.currentVersion).toBe('0.0.0.0'); // fabricated default
-    expect(result.state).toBe('FRESH'); // base also reads 0.0.0.0, no pkg drift
+    expect(result.currentVersion).toBeNull();
+    expect(result.state).toBe('NO_VERSION');
   });
 
   test('classify reports versionFileExists=true when VERSION is present', () => {
@@ -841,3 +862,234 @@ describe('write --regen-digest regenerates the gstack agents digest (explicit op
     fs.rmSync(dir, { recursive: true, force: true });
   });
 });
+
+/**
+ * G1 (#2334, #2343): four resolution outcomes. Most repos /ship runs in have
+ * no VERSION file. Before, classify folded "no file" into 0.0.0.0 — a repo
+ * with a real package.json version then hit DRIFT_UNEXPECTED (VERSION "equals"
+ * base at 0.0.0.0 while package.json disagrees) and /ship stopped, and a repo
+ * without one classified FRESH and had a VERSION file invented. A pinned file
+ * that was missing or malformed read as 0.0.0.0 too.
+ */
+describe('G1: version source outcomes (absent / valid / ambiguous / broken)', () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const d of dirs) { try { fs.chmodSync(d, 0o755); fs.rmSync(d, { recursive: true, force: true }); } catch { /* noop */ } }
+  });
+
+  function repo(files: Record<string, string>): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-g1-'));
+    dirs.push(dir);
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: dir, stdio: 'pipe', timeout: 30_000 });
+    git('init', '-q', '-b', 'main');
+    git('config', 'user.email', 't@t'); git('config', 'user.name', 't');
+    fs.writeFileSync(path.join(dir, 'README.md'), 'x\n');
+    for (const [rel, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(dir, rel), body);
+    }
+    git('add', '-A'); git('commit', '-q', '-m', 'base');
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: dir, timeout: 30_000 }).toString().trim();
+    fs.mkdirSync(path.join(dir, '.git', 'refs', 'remotes', 'origin'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.git', 'refs', 'remotes', 'origin', 'main'), head + '\n');
+    return dir;
+  }
+
+  function run(dir: string, args: string[]): { code: number; stdout: string; stderr: string } {
+    try {
+      const stdout = execFileSync('bun', [BIN, ...args], { cwd: dir, stdio: 'pipe', timeout: 30_000 }).toString();
+      return { code: 0, stdout, stderr: '' };
+    } catch (e: any) {
+      return { code: e.status, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? '') };
+    }
+  }
+
+  const NOTICE =
+    'Shipped without a version change: no version source is configured (no VERSION file, no .gstack/version-path). ' +
+    "To version releases, create VERSION or write the version file's path (for example package.json) to .gstack/version-path.";
+
+  test('versionless app with a real package.json version: NO_VERSION + exact notice, not DRIFT_UNEXPECTED', () => {
+    const dir = repo({ 'package.json': JSON.stringify({ name: 'app', version: '2.3.4' }, null, 2) + '\n' });
+    const r = run(dir, ['classify', '--base', 'main']);
+    expect(r.code).toBe(0);
+    const out = JSON.parse(r.stdout);
+    expect(out.state).toBe('NO_VERSION');
+    expect(out.versionSource.outcome).toBe('absent');
+    expect(out.notice).toBe(NOTICE);
+    expect(out.currentVersion).toBeNull();
+    expect(out.baseVersion).toBeNull();
+  });
+
+  test('write in a versionless repo refuses and never creates VERSION', () => {
+    const dir = repo({ 'package.json': JSON.stringify({ name: 'app', version: '2.3.4' }, null, 2) + '\n' });
+    const r = run(dir, ['write', '--version', '0.0.1.0']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('Shipped without a version change');
+    expect(fs.existsSync(path.join(dir, 'VERSION'))).toBe(false);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8')).version).toBe('2.3.4');
+  });
+
+  const ambiguous: Array<[string, Record<string, string>, string]> = [
+    ['monorepo (pnpm workspace)', { 'pnpm-workspace.yaml': 'packages:\n  - apps/*\n', 'apps/web/package.json': '{"name":"web","version":"1.0.0"}' }, 'monorepo'],
+    ['monorepo (package.json workspaces)', { 'package.json': JSON.stringify({ name: 'root', private: true, workspaces: ['packages/*'] }) }, 'monorepo'],
+    ['release-please', { 'release-please-config.json': '{}', '.release-please-manifest.json': '{".":"1.4.0"}', 'package.json': '{"name":"a","version":"1.4.0"}' }, 'release-please'],
+    ['semantic-release placeholder', { 'package.json': JSON.stringify({ name: 'a', version: '0.0.0-development' }) }, 'placeholder'],
+  ];
+  for (const [name, files, reason] of ambiguous) {
+    test(`ambiguous: ${name} ships without a version and says why`, () => {
+      const dir = repo(files);
+      const r = run(dir, ['classify', '--base', 'main']);
+      expect(r.code).toBe(0);
+      const out = JSON.parse(r.stdout);
+      expect(out.state).toBe('NO_VERSION');
+      expect(out.versionSource.outcome).toBe('ambiguous');
+      expect(out.versionSource.reason).toContain(reason);
+      expect(out.notice).toContain('Shipped without a version change');
+      expect(out.notice).toContain(out.versionSource.reason);
+    });
+  }
+
+  test('valid: a package.json pinned in .gstack/version-path is used', () => {
+    const dir = repo({
+      '.gstack/version-path': 'package.json\n',
+      'package.json': JSON.stringify({ name: 'app', version: '2.3.4' }, null, 2) + '\n',
+    });
+    const out = JSON.parse(run(dir, ['classify', '--base', 'main']).stdout);
+    expect(out.state).toBe('FRESH');
+    expect(out.versionSource.outcome).toBe('valid');
+    expect(out.currentVersion).toBe('2.3.4');
+  });
+
+  const brokenPins: Array<[string, Record<string, string>, string]> = [
+    ['missing', { '.gstack/version-path': 'apps/web/package.json\n' }, 'apps/web/package.json does not exist'],
+    ['empty', { '.gstack/version-path': 'VERSION.txt\n', 'VERSION.txt': '\n' }, 'VERSION.txt is empty'],
+    ['malformed JSON', { '.gstack/version-path': 'package.json\n', 'package.json': '{ not json' }, 'package.json contains no parsable version'],
+    ['malformed text', { 'VERSION': 'release-candidate\n' }, 'VERSION contains no parsable version'],
+    ['unreadable (a directory)', { '.gstack/version-path': 'ver\n', 'ver/keep': '' }, 'ver is unreadable'],
+  ];
+  for (const [name, files, reason] of brokenPins) {
+    test(`broken pin (${name}) stops with the path and never reads as 0.0.0.0`, () => {
+      const dir = repo(files);
+      const r = run(dir, ['classify', '--base', 'main']);
+      expect(r.code).toBe(2);
+      expect(r.stdout).toBe('');
+      expect(r.stderr).toContain(reason);
+      expect(r.stderr).toContain('never substitutes 0.0.0.0');
+      const w = run(dir, ['write', '--version', '1.0.0.0']);
+      expect(w.code).toBe(2);
+      expect(w.stderr).toContain(reason);
+    });
+  }
+});
+
+describe('write --changelog re-heads [Unreleased] (opt-in, restamp-compatible)', () => {
+  const dirs: string[] = [];
+  afterAll(() => { for (const d of dirs) fs.rmSync(d, { recursive: true, force: true }); });
+  const RELEASED = '## [1.0.0.0] - 2026-10-01\n\n- first release\n';
+  const ENTRY = '## [Unreleased]\n\n### Fixed\n- the branch change\n';
+  const repo = (changelog: string | null) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbump-changelog-'));
+    dirs.push(dir);
+    fs.writeFileSync(path.join(dir, 'VERSION'), '1.0.0.0\n');
+    if (changelog !== null) fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), changelog);
+    return dir;
+  };
+  const run = (dir: string, args: string[]) => {
+    const r = spawnSync('bun', [BIN, 'write', ...args], { cwd: dir, encoding: 'utf8', timeout: 30_000 });
+    return { code: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  };
+  const today = () => new Date().toISOString().slice(0, 10);
+  const readCl = (dir: string) => fs.readFileSync(path.join(dir, 'CHANGELOG.md'), 'utf8');
+
+  test('without the flag write leaves [Unreleased] and the output shape unchanged', () => {
+    const before = `# Changelog\n\n${ENTRY}\n${RELEASED}`;
+    const dir = repo(before);
+    const r = run(dir, ['--version', '1.0.1.0']);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout)).not.toHaveProperty('changelog');
+    expect(readCl(dir)).toBe(before);
+  });
+
+  test('re-heads [Unreleased] to the written version, dated today (UTC), keeping every other byte', () => {
+    const before = `# Changelog\n\n${ENTRY}\n${RELEASED}`;
+    const dir = repo(before);
+    const d0 = today();
+    const r = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    const d1 = today();
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout).changelog).toEqual({ path: 'CHANGELOG.md', moved: true, detail: 'Unreleased -> 1.0.1.0' });
+    const after = readCl(dir);
+    expect([d0, d1].map(d => `# Changelog\n\n## [1.0.1.0] - ${d}\n\n### Fixed\n- the branch change\n\n${RELEASED}`)).toContain(after);
+    expect(normalizeChangelog(after)).toBe(normalizeChangelog(before));
+    expect(checkChangelog(after, '1.0.1.0')).toEqual([]);
+  });
+
+  test('an [Unreleased] entry below the predecessor (after a main merge) moves to the top', () => {
+    const dir = repo(`# Changelog\n\n${RELEASED}\n${ENTRY}`);
+    expect(run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']).code).toBe(0);
+    const sections = parseChangelog(readCl(dir)).sections;
+    expect(sections.map(s => s.version)).toEqual(['1.0.1.0', '1.0.0.0']);
+    expect(sections[1]!.lines.join('\n').trimEnd()).toBe(RELEASED.trimEnd());
+  });
+
+  test('a rerun is a no-op, and a CHANGELOG with no [Unreleased] never has a released heading renamed', () => {
+    const dir = repo(`# Changelog\n\n${ENTRY}\n${RELEASED}`);
+    expect(run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']).code).toBe(0);
+    const once = readCl(dir);
+    const again = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    expect(JSON.parse(again.stdout).changelog).toEqual({ path: 'CHANGELOG.md', moved: false, detail: 'no [Unreleased] section' });
+    expect(readCl(dir)).toBe(once);
+    const released = repo(`# Changelog\n\n${RELEASED}`);
+    expect(run(released, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']).code).toBe(0);
+    expect(readCl(released)).toBe(`# Changelog\n\n${RELEASED}`);
+  });
+
+  test('an absent CHANGELOG is a no-op that creates nothing', () => {
+    const dir = repo(null);
+    const r = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    expect(r.code).toBe(0);
+    expect(JSON.parse(r.stdout).changelog).toEqual({ path: 'CHANGELOG.md', moved: false, detail: 'CHANGELOG.md absent' });
+    expect(fs.existsSync(path.join(dir, 'CHANGELOG.md'))).toBe(false);
+  });
+
+  test('a heading the move would duplicate refuses with exit 2 before VERSION is written', () => {
+    const before = `# Changelog\n\n${ENTRY}\n## [1.0.1.0] - 2026-10-02\n\n- taken\n\n${RELEASED}`;
+    const dir = repo(before);
+    const r = run(dir, ['--version', '1.0.1.0', '--changelog', 'CHANGELOG.md']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('1.0.1.0 already headed');
+    expect(fs.readFileSync(path.join(dir, 'VERSION'), 'utf8')).toBe('1.0.0.0\n');
+    expect(readCl(dir)).toBe(before);
+  });
+
+  test('a missing value or an escaping path refuses with exit 2 and writes nothing', () => {
+    const dir = repo(`# Changelog\n\n${ENTRY}`);
+    for (const args of [['--changelog'], ['--changelog', '--regen-digest'], ['--changelog', '../CHANGELOG.md']]) {
+      const r = run(dir, ['--version', '1.0.1.0', ...args]);
+      expect(r.code).toBe(2);
+      expect(fs.readFileSync(path.join(dir, 'VERSION'), 'utf8')).toBe('1.0.0.0\n');
+    }
+  });
+
+  test('gstack-restamp composes: an already re-headed entry is kept, and a later stamp moves it as the branch stamp', () => {
+    const fx = makeFixtureRepo({ prefix: 'vbump-restamp-' });
+    try {
+      makePr(fx, 'pr-a');
+      const w = runBin(fx, 'gstack-version-bump', ['write', '--version', '1.2.4.0', '--changelog', 'CHANGELOG.md']);
+      expect(w.status).toBe(0);
+      fx.git('commit', '-qam', 'bump 1.2.4.0');
+      const headed = readFile(fx, 'CHANGELOG.md');
+      const same = restamp(fx, ['--version', '1.2.4.0']);
+      expect(same.status).toBe(EXIT.ok);
+      expect(same.out).toContain('already headed 1.2.4.0');
+      expect(readFile(fx, 'CHANGELOG.md')).toBe(headed);
+      const next = restamp(fx, ['--version', '1.2.5.0']);
+      expect(next.status).toBe(EXIT.ok);
+      expect(next.out).toContain('1.2.4.0 -> 1.2.5.0');
+      expect(parseChangelog(readFile(fx, 'CHANGELOG.md')).sections.map(s => s.version)).toEqual(['1.2.5.0', '1.2.3.0', '1.2.2.0']);
+    } finally {
+      cleanup(fx);
+    }
+  });
+});
+

@@ -1,12 +1,13 @@
 /**
- * Visual diff between two mockups using GPT-4o vision.
+ * Visual diff between two mockups using the picked provider's vision model.
  * Identifies what changed between design iterations or between
  * an approved mockup and the live implementation.
  */
 
 import fs from "fs";
-import { requireApiKey } from "./auth";
+import { requireProvider } from "./auth";
 import { receiptedFetch } from "./receipted-fetch";
+import { visionErrorHint, visionRequest } from "./provider";
 
 export interface DiffResult {
   differences: { area: string; description: string; severity: string }[];
@@ -21,7 +22,7 @@ export async function diffMockups(
   beforePath: string,
   afterPath: string,
 ): Promise<DiffResult> {
-  const apiKey = requireApiKey();
+  const provider = requireProvider();
   const beforeData = fs.readFileSync(beforePath).toString("base64");
   const afterData = fs.readFileSync(afterPath).toString("base64");
 
@@ -29,20 +30,12 @@ export async function diffMockups(
   const timeout = setTimeout(() => controller.abort(), 60_000);
 
   try {
-    const response = await receiptedFetch("diff-screenshots-request", "https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o",
-        messages: [{
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text: `Compare these two UI images. The first is the BEFORE (or design intent), the second is the AFTER (or actual implementation). Return valid JSON only:
+    const request = visionRequest(provider, [{
+        role: "user",
+        content: [
+          {
+            type: "text",
+            text: `Compare these two UI images. The first is the BEFORE (or design intent), the second is the AFTER (or actual implementation). Return valid JSON only:
 
 {
   "differences": [
@@ -56,26 +49,22 @@ export async function diffMockups(
 severity: "high" = noticeable to any user, "medium" = visible on close inspection, "low" = minor/pixel-level.
 matchScore: 100 = identical, 0 = completely different.
 Focus on layout, typography, colors, spacing, and element presence/absence. Ignore rendering differences (anti-aliasing, sub-pixel).`,
-            },
-            {
-              type: "image_url",
-              image_url: { url: `data:image/png;base64,${beforeData}` },
-            },
-            {
-              type: "image_url",
-              image_url: { url: `data:image/png;base64,${afterData}` },
-            },
-          ],
-        }],
-        max_tokens: 600,
-        response_format: { type: "json_object" },
-      }),
-      signal: controller.signal,
-    });
+          },
+          {
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${beforeData}` },
+          },
+          {
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${afterData}` },
+          },
+        ],
+      }], 600, { response_format: { type: "json_object" } });
+    const response = await receiptedFetch("diff-screenshots-request", request.url, { ...request.init, signal: controller.signal }, globalThis.fetch, request.receipt);
 
     if (!response.ok) {
       const error = await response.text();
-      console.error(`Diff API error (${response.status}): ${error.slice(0, 200)}`);
+      console.error(`Diff API error (${response.status}): ${error.slice(0, 200)}${visionErrorHint(provider, response.status, error)}`);
       return { differences: [], summary: "Diff unavailable", matchScore: -1 };
     }
 

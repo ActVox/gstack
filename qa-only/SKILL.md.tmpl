@@ -6,8 +6,7 @@ description: |
   Report browser/API/CLI/job/worker/webhook bugs. Produces a
   structured report with contract evidence or browser scores and repro steps — but never
   fixes anything. Use when asked to "just report bugs", "qa report only", or
-  "test but don't fix". For the full test-fix-verify loop, use /qa instead.
-  Proactively suggest when the user wants a bug report without any code changes. (gstack)
+  "test but don't fix". For the full test-fix-verify loop, use /qa instead. (gstack)
 voice-triggers:
   - "bug report"
   - "just check for bugs"
@@ -73,7 +72,7 @@ If neither exists, use git diff analysis.
 
 Load the shared preparation gate now (the exploratory STOP just below): complete its scope and selected-method Reads,
 await their results, and select the surfaces. Defer charters, clocks and probes to
-Run the Selected Checks, after report ownership and conditional browser setup below.
+Run the Selected Checks; its §1 then reuses the REPORT_DIR resolved under Prepare Report Artifacts.
 
 {{SECTION:exploratory}}
 
@@ -83,8 +82,8 @@ For mixed Regression, the argument is the prior combined report. Resolve its fun
 replay evidence and browser baseline links first, then give each method its own baseline.
 A missing baseline blocks that surface's regression coverage, not independent checks.
 In mixed runs, use the user's surface order, defaulting to functional then browser.
-Finish one surface's probes before starting the next surface's clock; any supplied
-absolute deadline still applies to both. Do not reset a clock when switching surfaces.
+Each surface's clock starts with its probes; finish one surface before starting the
+next. A supplied absolute deadline is shared; switching surfaces does not extend it.
 
 ## Prepare Report Artifacts
 
@@ -195,8 +194,8 @@ The shared loop's mixed-surface split applies only to clocks and checkpoints:
 | Mixed: browser probes | `$REPORT_DIR/browser` |
 | Mixed: functional probes | `$REPORT_DIR/functional` |
 
-Each probe directory holds its own `exploration-NNN.json` sequence and, only when
-timed, `deadline.json`. Caller-fixed paths override this layout. Do not reassign
+Each probe directory holds its own `exploration-NNN.json` sequence, `annotations.json`
+and materialize step, and, only when timed, `deadline.json`. Caller-fixed paths override this layout. Do not reassign
 `REPORT_DIR` to a surface directory or move the shared browser artifact paths.
 
 ## Additional Rules (qa-only specific)

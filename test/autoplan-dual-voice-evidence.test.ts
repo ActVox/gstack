@@ -29,17 +29,20 @@ function fixture(plan?:string){
  return {dir,method,snapshot,file,events,options,read:(rows=events)=>autoplanDualVoiceEvidence(rows,options)};
 }
 test('actual6bd source Read, unused probe branch and0Hspec Agent earn zero phase voice credit',()=>{
- const f=fixture(),actual=f.read(clone(captured.events));
+ const f=fixture();
+ // Judge the capture against the probe block it executed (B1 later added the sandbox preflight).
+ f.options.commands={...f.options.commands,probe:captured.sourceBoundB176.commandContract.probe};
+ const actual=f.read(clone(captured.events));
  expect(actual).toMatchObject({claudeVoiceFired:false,codexVoiceFired:false,codexUnavailable:false,reviewDispatched:false,probeMode:'ready'});
 });
 test('actual snapshot producer and complete parent request/ACK pairs establish both voices',()=>{
  const f=fixture();expect(f.read()).toMatchObject({claudeVoiceFired:true,codexVoiceFired:true,codexUnavailable:false,reviewDispatched:true,nativeToolUseId:'native',outsideToolUseId:'outside'});
 });
-test.each(['not_installed','not_authed','broken_install','model_unusable'])('actual final probe result supports unavailable fallback: %s',mode=>{
+test.each(['not_installed','not_authed','broken_install','sandbox_unavailable','model_unusable'])('actual final probe result supports unavailable fallback: %s',mode=>{
  const f=fixture();f.events.splice(4);f.events[1]=ack('probe','CODEX_MODE: '+mode);
  expect(f.read()).toMatchObject({claudeVoiceFired:true,codexVoiceFired:false,codexUnavailable:true});
 });
-test.each(['ready','disabled','under_codex','unknown'])('probe outcome supplies no unavailable credit: %s',mode=>{
+test.each(['ready','unverified','disabled','under_codex','unknown'])('probe outcome supplies no unavailable credit: %s',mode=>{
  const f=fixture();f.events.splice(4);f.events[1]=ack('probe','CODEX_MODE: '+mode);expect(f.read().codexUnavailable).toBe(false);
 });
 test.each(['missing','error','foreign','child','unowned','method','phase','math','no-launch','wrong-input','mutable'])('native dispatch rejects %s evidence',kind=>{
@@ -169,6 +172,8 @@ test.each([
  'Outside review unavailable: empty response; missing coverage.',
  'Outside review unavailable: review refused; missing coverage.',
  'Outside review unavailable: missing review completion recommendation; missing coverage.',
+ 'Codex outside review unavailable: the reviewer process failed (exit 1: error: 401 Unauthorized). No review ran; this is missing coverage, not a pass. Fix: read the provider diagnosis above (auth, model, network), repair it, then re-run the review.',
+ 'Codex outside review unavailable: the response lacks the markers this gate requires (missing review completion recommendation). No review ran; this is missing coverage, not a pass. Fix: re-run the review; a response without its required markers never counts as a pass.',
 ])('actual owned post-execution error proves attempted outside voice, not completion: %s',diagnostic=>{
  const f=fixture();f.events[7]=ack('outside','Exit code 1\n'+diagnostic,true);
  expect(f.read()).toMatchObject({claudeVoiceFired:true,codexAttempted:true,codexVoiceFired:false,codexUnavailable:true,failedOutsideToolUseId:'outside'});
@@ -232,8 +237,8 @@ test.each(['before','after'])('guard blocks retain command separators around the
 test.each(['assignment-only','set-config','other-config','foreign-reader','or-config','and-cli','inverted-cli','no-exit','return','dynamic-exit','out-of-range-exit','command-substitution','backticks','redirect','diagnostic-command','completed-diagnostic','variable-change','duplicate-config','duplicate-cli','extra-command','conditional-body','inside-harness','inside-body','before-cd','changed-harness','changed-timeout','changed-sandbox','changed-prompt','skipped-validator','suffix'])('availability guards reject changed dispatch or non-stop shell: %s',kind=>{
  const f=fixture();let guards=configStop(f)+'\n'+cliStop;
  if(kind==='assignment-only')guards=configRead(f);
- if(kind==='set-config')guards=guards.replace('get codex_reviews','set codex_reviews enabled');
- if(kind==='other-config')guards=guards.replace('get codex_reviews','get telemetry');
+ if(kind==='set-config')guards=guards.replace('get --stored codex_reviews','set codex_reviews enabled');
+ if(kind==='other-config')guards=guards.replace('get --stored codex_reviews','get --stored telemetry');
  if(kind==='foreign-reader')guards=guards.replace('~/.claude/skills/gstack/bin/gstack-config','/tmp/gstack-config');
  if(kind==='or-config')guards=guards.replace('] && {','] || {');
  if(kind==='and-cli')guards=guards.replace('2>&1 || {','2>&1 && {');
@@ -258,9 +263,9 @@ test.each(['assignment-only','set-config','other-config','foreign-reader','or-co
  if(kind==='inside-body')input.command=input.command.replace(guards+'\n','').replace('_OUTSIDE_EXIT=0','_OUTSIDE_EXIT=0\n'+guards);
  if(kind==='before-cd')input.command=guards+'\ncd '+f.dir+'\n'+f.options.commands.outside.replace("'<prepared-prompt-file>'","'"+f.file+"'");
  if(kind==='changed-harness')input.command=input.command.replace('exit 78','exit 0');
- if(kind==='changed-timeout')input.command=input.command.replace('_gstack_codex_timeout_wrapper 600','_gstack_codex_timeout_wrapper 1');
- if(kind==='changed-sandbox')input.command=input.command.replace('-s read-only','-s danger-full-access');
- if(kind==='changed-prompt')input.command=input.command.replace('codex exec "$_OUTSIDE_PROMPT"','codex exec "Different plan"');
+ if(kind==='changed-timeout')input.command=input.command.replace('high 540 codex','high 1 codex');
+ if(kind==='changed-sandbox')input.command=input.command.replace('-s "${_CODEX_SANDBOX_MODE:?}"','-s danger-full-access');
+ if(kind==='changed-prompt')input.command=input.command.replace('codex exec - ','codex exec "Different plan" ');
  if(kind==='skipped-validator')input.command=input.command.replace(/^bun .*outside-review-result.*\n/m,'');
  if(kind==='suffix')input.command+='\ntrue';
  expect(f.read().codexVoiceFired,kind).toBe(false);
@@ -286,7 +291,9 @@ test.each(['disabled','missing-cli','missing-ack','failed-ack','foreign-ack','ch
 
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
 function capturedGuardFixture(attempt:typeof captured.sourceBoundB176.attempts[number]){
- const f=fixture(attempt.plan),old=attempt.snapshot;
+ const f=fixture(attempt.plan),old=attempt.snapshot,{probe,outside}=captured.sourceBoundB176.commandContract;
+ // Judge each capture against the delivered blocks it executed, not today's render.
+ f.options.commands={probe,outside};
  // Authenticate the original public payload before adapting only fixture paths
  // and the native prompt's path-derived byte count/hash to real owned artifacts.
  expect(hash(attempt.plan)).toBe(old.sha256);

@@ -1,13 +1,17 @@
 /**
  * Session state management for multi-turn design iteration.
- * Session files are JSON in /tmp, keyed by PID + timestamp.
+ * Session files are JSON in the OS temp directory, keyed by PID + timestamp.
  */
 
 import fs from "fs";
+import os from "os";
 import path from "path";
+import type { ProviderName } from "./auth";
 
 export interface DesignSession {
   id: string;
+  /** The provider that made the images; absent in sessions written before Gemini support, meaning openai. */
+  provider?: ProviderName;
   lastResponseId: string;
   originalBrief: string;
   feedbackHistory: string[];
@@ -27,7 +31,7 @@ export function createSessionId(): string {
  * Get the file path for a session.
  */
 export function sessionPath(sessionId: string): string {
-  return path.join("/tmp", `design-session-${sessionId}.json`);
+  return path.join(os.tmpdir(), `design-session-${sessionId}.json`);
 }
 
 /**
@@ -37,14 +41,16 @@ export function createSession(
   responseId: string,
   brief: string,
   outputPath: string,
+  provider: ProviderName = "openai",
 ): DesignSession {
   const id = createSessionId();
   const session: DesignSession = {
     id,
+    provider,
     lastResponseId: responseId,
     originalBrief: brief,
     feedbackHistory: [],
-    outputPaths: [outputPath],
+    outputPaths: [path.resolve(outputPath)],
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
@@ -72,7 +78,7 @@ export function updateSession(
 ): void {
   session.lastResponseId = responseId;
   session.feedbackHistory.push(feedback);
-  session.outputPaths.push(outputPath);
+  session.outputPaths.push(path.resolve(outputPath));
   session.updatedAt = new Date().toISOString();
 
   fs.writeFileSync(sessionPath(session.id), JSON.stringify(session, null, 2));

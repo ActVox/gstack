@@ -15,6 +15,8 @@ import { selectTests, detectBaseBranch, getChangedFiles, E2E_TOUCHFILES, E2E_TIE
 import { WorktreeManager } from '../../lib/worktree';
 import type { HarvestResult } from '../../lib/worktree';
 import { preflightAnthropicApi } from './anthropic-preflight';
+import { isHermeticEnabled } from './hermetic-env';
+import { hostSkipReason, resolveEvalHost } from './e2e-hosts';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -130,6 +132,17 @@ if (evalsEnabled && process.env.EVALS_TIER) {
     selectedTests = selectedTests.filter(t => tierTests.includes(t));
   }
   process.stderr.write(`EVALS_TIER=${tier}: ${selectedTests.length} tests\n\n`);
+}
+
+// EVALS_HOST=codex: Claude-only cases are skipped with their reason, never run
+// (and never failed); the report deselects them (test/helpers/e2e-hosts.ts).
+if (evalsEnabled && resolveEvalHost() !== 'claude') {
+  const host = resolveEvalHost();
+  const candidates = selectedTests ?? Object.keys(E2E_TIERS);
+  const skipped = candidates.filter(id => hostSkipReason(id, host));
+  selectedTests = candidates.filter(id => !hostSkipReason(id, host));
+  process.stderr.write(`EVALS_HOST=${host}: ${selectedTests.length} tests; ${skipped.length} Claude-only skipped (${skipped.join(', ') || 'none'})\n\n`);
+  (await import('./codex-host-runner')).prepareCodexHostRuntime();
 }
 
 export const describeE2E = evalsEnabled ? describe : describe.skip;
@@ -260,6 +273,9 @@ export function recordE2E(
     ...(!passed && isPreTurnInfraFailure(result) ? { failure_class: 'infra' as const } : {}),
     duration_ms: result.duration,
     cost_usd: result.costEstimate.estimatedCost,
+    ...(result.costKnown === false ? { cost_known: false } : {}),
+    ...(result.testName && result.testName !== name && result.testName in E2E_TIERS ? { cost_case_id: result.testName } : {}),
+    ...(result.tokenUsage ? { token_usage: result.tokenUsage } : {}),
     transcript: result.transcript,
     output: result.output?.slice(0, 2000),
     turns_used: result.costEstimate.turnsUsed,
@@ -342,7 +358,7 @@ export async function finalizeEvalCollector(evalCollector: EvalCollector | null)
 // NOTE: since gstack-skill-start honors GSTACK_HOME (EOV7), hermetic children read the
 // temp GSTACK_HOME that hermetic-env.ts seeds (the canonical marker list lives there);
 // this operator-HOME seeding only serves EVALS_HERMETIC=0 debug runs.
-if (evalsEnabled) {
+if (evalsEnabled && !isHermeticEnabled()) {
   const gstackDir = path.join(os.homedir(), '.gstack');
   fs.mkdirSync(gstackDir, { recursive: true });
   // Marker list kept at parity with hermetic-env.ts's child-GSTACK_HOME seed

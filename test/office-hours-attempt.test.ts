@@ -176,6 +176,7 @@ describe('Office Hours deadlines', () => {
       const started = Date.now();
       const { records } = await runFixture({
         budgetMs: 5,
+        recordGraceMs: 200,
         run: async abortSignal => {
           signal = abortSignal;
           if (stage === 'runner') await pending;
@@ -183,6 +184,7 @@ describe('Office Hours deadlines', () => {
         },
         validate: async () => { validations++; await pending; },
       });
+      expect(Date.now() - started).toBeGreaterThanOrEqual(200);
       expect(Date.now() - started).toBeLessThan(OFFICE_HOURS_BUN_GRACE_MS);
       expect(signal?.aborted).toBe(true);
       expect(records).toHaveLength(1);
@@ -318,7 +320,8 @@ describe('Office Hours real session runner with fake processes', () => {
         expect(captured.output).toBe('captured output');
         const diagnostic = JSON.parse(fs.readFileSync(path.join(dir, '.gstack/test-transcripts/drain-failure.json'), 'utf8'));
         expect(diagnostic.stderr).toContain('fixture auth failure');
-        expect(running(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')))).toBe(false);
+        const child = fs.readFileSync(path.join(dir, 'child.pid'), 'utf8').trim();
+        expect(running(Number(child)), `held-pipe child after the runner returned (group ${fs.readFileSync(path.join(dir, 'parent.pid'), 'utf8').trim()}): ${spawnSync('ps', ['-o', 'pid=,ppid=,pgid=,stat=,etime=', '-p', child], { encoding: 'utf8', timeout: 5_000 }).stdout.trim() || 'gone now'}`).toBe(false);
       });
     }, 10_000);
   }
@@ -457,6 +460,7 @@ await import(join(root, 'test/skill-e2e-office-hours-brain-writeback.test.ts'));
         EVALS: mode === 'disabled' ? '' : '1', EVALS_ALL: '', EVALS_TIER: 'periodic',
         EVALS_SELECTION_JSON: JSON.stringify({ selected: mode === 'unselected' ? [] : null, reason: 'free fixture' }),
         EVALS_PREFLIGHT_OK: '1', GSTACK_EVAL_DIR: evalDir, GSTACK_CLAUDE_CLI_VERSION: 'free fixture',
+        GSTACK_HOME: path.join(dir, 'state'),
       },
       stdout: 'pipe', stderr: 'pipe',
     });
@@ -595,8 +599,6 @@ describe('session runner native CLI max-turns exit semantics', () => {
 const FORMAT_CASES = [
   ['skill-e2e-plan-format.test.ts', 'plan-ceo-review-format-mode'],
   ['skill-e2e-plan-format.test.ts', 'plan-ceo-review-format-approach'],
-  ['skill-e2e-plan-format.test.ts', 'plan-eng-review-format-coverage'],
-  ['skill-e2e-plan-format.test.ts', 'plan-eng-review-format-kind'],
   ['skill-e2e-plan-prosons.test.ts', 'plan-review-prosons-format'],
   ['skill-e2e-plan-prosons.test.ts', 'plan-review-prosons-hardstop-neg'],
   ['skill-e2e-plan-prosons.test.ts', 'plan-review-prosons-neutral-neg'],
@@ -609,13 +611,14 @@ async function runFormatLifecycle(file: string, id: string, scenario: string) {
   const facts = path.join(dir, 'events.jsonl');
   const script = path.join(dir, 'format.test.ts');
   fs.writeFileSync(script, `
-import { mock, spyOn } from 'bun:test';
+import { jest, mock, spyOn } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 const root = ${JSON.stringify(ROOT)}, selected = ${JSON.stringify(id)}, scenario = ${JSON.stringify(scenario)};
 const event = value => fs.appendFileSync(${JSON.stringify(facts)}, JSON.stringify(value) + '\\n');
 let attempt = 0;
 let currentSignal;
+const elapse = async ms => { jest.advanceTimersByTime(ms); };
 mock.module(path.join(root, 'test/helpers/eval-budgets.ts'), () => ({ CAPTURE_MS: 300, CAPTURE_LONG_MS: 600 }));
 mock.module(path.join(root, 'test/helpers/session-runner.ts'), () => ({
   SESSION_DRAIN_GRACE_MS: 50,
@@ -625,7 +628,7 @@ mock.module(path.join(root, 'test/helpers/session-runner.ts'), () => ({
     event({ kind: 'start', id, timeout: opts.timeout, maxTurns: opts.maxTurns, model: opts.model, cwd: opts.workingDirectory });
     opts.signal?.addEventListener('abort', () => event({ kind: 'abort', id }), { once: true });
     const timeout = scenario === 'both-timeout' || (scenario === 'recover' && id === 1);
-    await new Promise(resolve => setTimeout(resolve, timeout ? opts.timeout + 50 : scenario === 'late-judge' || scenario === 'near-success' ? 220 : 20));
+    await elapse(timeout ? opts.timeout + 50 : scenario === 'late-judge' || scenario === 'near-success' ? 220 : 20);
     event({ kind: 'ready', id, fixtureExists: fs.existsSync(opts.workingDirectory) });
     if (!timeout) {
       const kind = selected.endsWith('-mode') || selected.endsWith('-kind');
@@ -646,7 +649,7 @@ mock.module(path.join(root, 'test/helpers/session-runner.ts'), () => ({
 const fakeJudgeRequest = async (body, options) => {
   event({ kind: 'judge-start', id: attempt, sameSignal: options?.signal === currentSignal, model: body.model });
   const id = attempt;
-  await new Promise(resolve => setTimeout(resolve, scenario === 'late-judge' ? 130 : 10));
+  await elapse(scenario === 'late-judge' ? 130 : 10);
   event({ kind: 'judge-ready', id, aborted: options?.signal?.aborted ?? false });
   return { stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify({ reason_substance: scenario === 'bad-score' ? 3 : 5, reasoning: 'fixture specific tradeoff' }) }] };
 };
@@ -663,6 +666,7 @@ spyOn(EvalCollector.prototype, 'finalize').mockImplementation(function() {
   event({ kind: 'finalized' });
   return finalize.call(this);
 });
+jest.useFakeTimers();
 await import(path.join(root, 'test', ${JSON.stringify(file)}));
 `);
   try {
@@ -671,7 +675,7 @@ await import(path.join(root, 'test', ${JSON.stringify(file)}));
       env: {
         ...process.env, EVALS: '1', EVALS_ALL: '', EVALS_TIER: 'periodic', EVALS_PREFLIGHT_OK: '1',
         EVALS_SELECTION_JSON: JSON.stringify({ selected: [id], reason: 'free format lifecycle' }),
-        GSTACK_EVAL_DIR: evalDir, GSTACK_CLAUDE_CLI_VERSION: 'free fixture',
+        GSTACK_EVAL_DIR: evalDir, GSTACK_CLAUDE_CLI_VERSION: 'free fixture', GSTACK_HOME: path.join(dir, 'state'),
         ANTHROPIC_API_KEY: 'free-fixture', ANTHROPIC_AUTH_TOKEN: '', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1',
       },
     });
@@ -693,7 +697,7 @@ describe('Plan format actual capture and judge lifecycle', () => {
         const starts = events.filter(event => event.kind === 'start');
         expect(starts.map(({ timeout, maxTurns, model }) => ({ timeout, maxTurns, model })))
           .toEqual([1, 2].map(() => ({ timeout: 300, maxTurns: 10,
-            model: file.includes('plan-prosons') ? 'claude-opus-4-7' : resolveEvalModel('capture') })));
+            model: resolveEvalModel('capture') })));
         expect(events.filter(event => event.kind === 'ready').map(event => event.fixtureExists)).toEqual([true, true]);
         expect(entries).toHaveLength(2);
         expect(entries.map(entry => entry.attempt)).toEqual([1, 2]);

@@ -63,6 +63,8 @@ const POLARITY: Record<string, 'fail-closed' | 'fail-open'> = {
   // fail-open: user-facing operations that must not die over an audit-log
   // hiccup; they warn on stderr and proceed.
   'design-openai': 'fail-open',
+  // #990: the same design commands on Gemini when no OpenAI key is set.
+  'design-gemini': 'fail-open',
   'update-check': 'fail-open',
   'security-dashboard': 'fail-open',
   'community-dashboard': 'fail-open',
@@ -82,6 +84,9 @@ const MODULE_SINKS = [
   // their writeReceipt calls fails CI, not just the tree-sweep scanner.
   'lib/code-intelligence/gbrain-adapter.ts',
   'lib/code-intelligence/sourcebot-adapter.ts',
+  // Multi-agent wave B3: the api outside-voice runner POSTs a review prompt
+  // (plan text, sensitive-class) to OpenAI or Anthropic; sink 'outside-voice-api'.
+  'lib/outside-voice-api.ts',
   // Unconditional: context-bill ships in the same tree as this tripwire. A
   // missing file must fail loudly (a rename/move that drops its receipt wiring
   // is exactly what this pins), not silently soften the assertion.
@@ -91,10 +96,21 @@ const MODULE_SINKS = [
   'lib/gbrain-supabase-provision.ts',
   // consent-gated engine download (install verb): receipt before the fetch, fail-closed
   'bin/gstack-design-detect.ts',
+  // Multi-agent wave E3: contributor-mode asks GitHub for the PR author's
+  // repository permission (`gh api .../collaborators/<user>/permission`); the
+  // author login and repo slug leave the machine, sink 'contributor-mode'.
+  'lib/contributor-mode.ts',
+  // GSTA-156: gstack-pregate clear --run reads the repository's own Actions runs
+  // through gh and fetches a missing run head from origin by sha; sink 'run-evidence'.
+  'lib/run-evidence.ts',
   // The Memorable bridge hook: gstack-owned code that hands each prompt to a
   // vendor CLI. hosts/ has no curl/fetch for the scanner to see, so the
   // receipt wiring is pinned here explicitly.
   'hosts/claude/hooks/memorable-user-prompt-hook.ts',
+  // GSTA-156 P1: the sealed guard lists and fetches the destination's own
+  // refs/pull/<n>/head for squashes on its base, to skip commits it already
+  // holds; PR numbers leave the machine, sink 'sealed-guard' (fail-open).
+  'lib/sealed-guard.ts',
 ];
 
 /** Shell sinks: must source the shared lib; every network op receipted. */
@@ -110,7 +126,7 @@ const SHELL_SINKS = [
   'bin/gstack-session-update',
 ];
 
-/** design files that talk to api.openai.com — all must use receiptedFetch. */
+/** design files that talk to an image provider (OpenAI or Gemini) — all must use receiptedFetch. */
 const DESIGN_SINKS = [
   'design/src/generate.ts',
   'design/src/variants.ts',
@@ -131,10 +147,22 @@ const SCANNER_EXEMPT: Record<string, string> = {
     'every git clone is inside an echoed instruction string (install docs); the script executes no network ops',
   'bin/gstack-gbrain-install':
     'user-invoked installer: bodyless HEAD reachability probe to github.com + clone of the public gbrain repo (user-directed install; no gstack state leaves the machine)',
+  'bin/gstack-capy-install':
+    'user-invoked installer that runs before any gstack checkout exists (so the egress lib is not yet available): clone of the public gstack repo and a download of the pinned Bun release archive from GitHub, SHA-256 verified before anything is installed; no gstack state leaves the machine',
+  'bin/gstack-node-runtime.sh':
+    'sourced only by bin/gstack-capy-install (same pre-checkout installer context): downloads the project-pinned Node release archive and its SHASUMS256.txt from nodejs.org, SHA-256 checked before anything is installed; bodyless GETs, no gstack state leaves the machine',
+  'bin/gstack-doctor-check.sh':
+    'git fetch appears only in the revision row\'s fix string (the command the user runs to move the checkout)',
   'bin/gstack-next-version':
     'fetches the user\'s own repo\'s base branch for version-claim freshness — a user-repo dev-workflow op, not gstack-state egress',
   'bin/gstack-version-bump':
     'git fetch appears only in an error-message string',
+  'bin/gstack-worktree-audit':
+    'read-only audit: best-effort fetch of the user\'s own repo\'s base branch so the MERGED column is current (skipped with --no-fetch) — a user-repo dev-workflow op like gstack-next-version\'s, not gstack-state egress',
+  'lib/default-base.ts':
+    'read-only `git ls-remote --symref <remote> HEAD` of the user\'s own repo (5 s timeout, prompts off) to learn its live default branch, run only when the cached origin/HEAD names the checked-out branch (GST-774) — a user-repo dev-workflow op like gstack-next-version\'s, not gstack-state egress',
+  'bin/gstack-state-matrix':
+    'git fetch appears only in an error-message string (the fix the user runs when origin/<base> has no merge base)',
   'bin/gstack-redact-prepush':
     'git push mentions are hook documentation strings (bypass instructions)',
   'browse/src/security-classifier.ts':
@@ -149,6 +177,8 @@ const SCANNER_EXEMPT: Record<string, string> = {
     'served-page JS talking to its own loopback server (same-origin relative fetch)',
   'design/src/compare.ts':
     'served-page JS talking to its own loopback server (relative ./api fetch)',
+  'crew/scripts/gate-cost-replay.ts':
+    'developer-invoked read-only measurement (GSTA-49 T0): git fetch of gstack\'s own origin by SHA (old PR heads and tested merge commits) so past PR gates can be replayed; a download only, no gstack or user state leaves the machine',
   'scripts/ubicloud':
     'developer-invoked test infrastructure: Ubicloud API calls (VM create/show/destroy) with the developer\'s own token, the checkout streamed over SSH to that developer\'s own ephemeral VM, and toolchain downloads run on the VM; no installed-gstack user state is sent',
   // Skill prose templates: these render agent-executed instructions (the
@@ -352,6 +382,7 @@ describe('egress receipt wiring tripwire', () => {
     expect(open.sort()).toEqual([
       'community-dashboard',
       'context-bill --exact',
+      'design-gemini',
       'design-openai',
       'git-class user ops (artifacts-init, brain-restore, session-update)',
       'security-dashboard',
@@ -394,7 +425,7 @@ describe('egress receipt wiring tripwire', () => {
   });
 
   test('NEW-SINK SCANNER: every outbound network op in the tree is wired or reasoned-exempt', () => {
-    const SWEEP = ['bin', 'lib', 'scripts', 'design/src', 'browse/src', 'hosts'];
+    const SWEEP = ['bin', 'lib', 'scripts', 'crew/bin', 'crew/lib', 'crew/scripts', 'design/src', 'browse/src', 'hosts'];
     const offenders: string[] = [];
     for (const dirRel of SWEEP) {
       const dir = path.join(ROOT, dirRel);

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
-import { resolvePaidShardBudget, retriesForFiles, planPaidShards, parseRunManifest, verifySliceResults, runPaidShard, buildRunManifest, paidShardWallUpperBoundMs, collectPaidTestFiles, selectPaidTestFiles, isOverlayTestFile, DEFAULT_SHARD_TIMEOUT_MS, DEFAULT_JOBS, parseCliOptions, expandCaseShards, expandTrialShards, shardFile, sliceExecutionOrder, sliceSupervisedWallMs } from '../scripts/test-paid-shards';
+import { resolvePaidShardBudget, retriesForFiles, planPaidShards, parseRunManifest, verifySliceResults, runPaidShard, buildRunManifest, paidShardWallUpperBoundMs, collectPaidTestFiles, selectPaidTestFiles, isOverlayTestFile, DEFAULT_SHARD_TIMEOUT_MS, DEFAULT_JOBS, parseCliOptions, expandCaseShards, expandTrialShards, shardFile, sliceExecutionOrder, sliceSupervisedWallMs, resolvePaidShardTimeoutMs } from '../scripts/test-paid-shards';
 import { FINDING_RETRY_BUDGETS, ALL_TIERS, SHARD_RESERVE_MS } from './helpers/eval-budgets';
+import { PERIODIC_CI_EXCLUDE } from './helpers/periodic-exclude-data';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -122,24 +123,26 @@ test('live periodic census fits the declared CI wall including setup', () => {
   const m = livePlan();
   expect(planStep.run).not.toContain('--autoplan-slice');
   expect(job.strategy.matrix.slice).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_slices) }}');
-  expect(job['timeout-minutes']).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_timeout_minutes) }}');
+  expect(job['timeout-minutes']).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_slice_timeouts)[matrix.slice] }}');
   expect(workers).toBe(2);
   expect(planned.jobs).toBe(workers);
-  const walls = Array.from({ length: m.sliceCount }, (_, index) => sliceSupervisedWallMs(sliceExecutionOrder(
-    m.entries.filter(e => e.status === 'planned' && e.slice === index + 1)).map(e => e.file), workers));
-  expect(Math.max(...walls) + 20 * 60_000).toBeLessThanOrEqual(m.plan!.ciTimeoutMinutes * 60_000);
+  // W2c/ENG-2: every slice's own ceiling covers its longest shard wall plus setup.
+  const sliceFiles = Array.from({ length: m.sliceCount }, (_, index) => sliceExecutionOrder(
+    m.entries.filter(e => e.status === 'planned' && e.slice === index + 1)).map(e => e.file));
+  sliceFiles.forEach((files, index) => expect(Math.max(...files.map(file => resolvePaidShardTimeoutMs([file]))) + 20 * 60_000)
+    .toBeLessThanOrEqual(m.plan!.sliceCiTimeoutMinutes![index]! * 60_000));
   expect(m.plan!.ciTimeoutMinutes).toBeLessThanOrEqual(360);
   expect(m.sliceCount).toBeLessThanOrEqual(job.strategy['max-parallel']);
   const plannedFiles = new Set(m.entries.filter(e => e.status === 'planned').map(e => shardFile(e.file)));
   expect(plannedFiles).toEqual(new Set(selectPaidTestFiles(collectPaidTestFiles(), 'periodic').selected));
   const overlays = m.entries.filter(e => e.status === 'planned' && e.slice === m.sliceCount);
-  expect(overlays).toHaveLength(4);
+  expect(overlays).toHaveLength(5);
   expect(overlays.every(e => isOverlayTestFile(e.file))).toBe(true);
 });
 
 test('registered allocation is deterministic and preserves every discovered file', () => {
   const files = collectPaidTestFiles();
-  expect(files).toHaveLength(106);
+  expect(files).toHaveLength(108); // - skill-e2e-investigate-owned-completion, -owned-termination and codex-e2e-sol-scope (/investigate retired, GST-1717); - skill-e2e-plan-eng-plan-mode, -plan-eng-finding-floor and -plan-eng-artifact-full (standalone /plan-eng-review retired, GST-1698); - skill-llm-eval (last standalone judges removed, GST-1403); + skill-e2e-autoplan-ceo-only (GST-537); + skill-e2e-planning-wave (GSTA-228); + skill-e2e-model-panel (GSTA-173); + skill-e2e-write-skill (GSTA-133); + skill-e2e-ship-frozen-scope (frozen review scope, GSTA-113 PR 2); + skill-e2e-failure-routing (#3157/#3158); + skill-e2e-dx-error-contract (#3226); + skill-e2e-gate-integrity (HONEST_WORK_GATE_INTEGRITY W8); + skill-e2e-autoplan-schema-canary, -guard-pty and -long-session (Oct 7 wave, CEO-13, ENG-18, CEO-15); + skill-e2e-ship-measure-seeded-flake (v1.91.32.0); W5a: 15 carve wrappers became one case-sharded file; + codex-e2e-multiblock-live and skill-e2e-design-model-smoke (v1.91.30.0);
   expect(files).toContain('test/skill-e2e-ship-skip.test.ts');
   const m = livePlan(files);
   expect(livePlan([...files].reverse())).toEqual(m);
@@ -173,28 +176,15 @@ test('single-slice manifest retains all registered files with one allocation', (
   for (const m of manifests) expect(m.entries.filter(e => e.status === 'planned').every(e => e.slice === 1)).toBe(true);
   for (const budget of FINDING_RETRY_BUDGETS) {
     const entries = manifests.flatMap(m => m.entries.filter(e => e.file === budget.file && e.status === 'planned'));
+    if (PERIODIC_CI_EXCLUDE[budget.file]) { expect(entries, budget.file).toHaveLength(0); continue; }
     expect(entries, budget.file).toHaveLength(1);
     expect(entries[0]!.budget).toEqual(resolvePaidShardBudget([budget.file]));
   }
 });
 
-test('current detach supervision covers the live-census floor', () => {
-  const floorFor = (tier: 'gate' | 'periodic') => {
-    // Case-sharded files contribute one shard per case and isolated cases one
-    // shard per trial, exactly as the runner plans.
-    const files = expandTrialShards(expandCaseShards(selectPaidTestFiles(collectPaidTestFiles(), tier).selected, tier), tier).keys;
-    const excess = files.reduce((n, file) => n + Math.max(0, resolvePaidShardBudget([file]).timeoutMs - DEFAULT_SHARD_TIMEOUT_MS), 0);
-    return Math.ceil((Math.ceil(files.length / DEFAULT_JOBS) * DEFAULT_SHARD_TIMEOUT_MS + excess) / 1000 * 1.05);
-  };
-  const pkg = JSON.parse(fs.readFileSync(path.join(import.meta.dir, '../package.json'), 'utf8'));
-  const periodicTimeout = Number(pkg.scripts['eval:bg:periodic'].match(/--timeout\s+(\d+)/)[1]);
-  const gateTimeout = Number(pkg.scripts['eval:bg:gate'].match(/--timeout\s+(\d+)/)[1]);
-  expect(floorFor('gate')).toBe(21_725);
-  expect(gateTimeout).toBe(49_320);
-  expect(gateTimeout).toBeGreaterThanOrEqual(floorFor('gate'));
-  expect(floorFor('periodic')).toBe(33_821);
-  expect(periodicTimeout).toBeGreaterThanOrEqual(floorFor('periodic'));
-});
+// The local detach cap is ceil(1.5 x planned serial / jobs) + 20 min, at most 4 h
+// (scripts/eval-bg.ts); test/eval-detach-timeout-floor.test.ts pins it against the
+// live census. The worst-case-floor contract this file used to pin is withdrawn (W5d).
 
 for (const jobs of [1, 2, 3]) test(`FIFO bound covers partial durations with ${jobs} workers`, () => {
   const long = FINDING_RETRY_BUDGETS[0]!.file;

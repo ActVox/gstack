@@ -1,7 +1,8 @@
 import { toShellPath, type TemplateContext } from './types';
-import { outsideVoiceRuntime } from './outside-voice';
 import * as path from 'path';
 import { getHostConfig } from '../../hosts';
+import { runtimeRootPrelude } from './runtime-root';
+import { RETIRED_SKILLS } from '../discover-skills';
 
 /** Claude's scoped hook enforces the parent publication boundary during /autoplan. */
 export function generateAutoplanPublicationHook(ctx: TemplateContext, args?: string[]): string {
@@ -33,6 +34,28 @@ printf '%s\\n' ${shellWord(unavailable)}`;
 }
 
 /**
+ * {{CEO_MODE_HANDOFF_HOOK}}: /plan-ceo-review's PostToolUse hook that shows the
+ * Step 0E mode handoff line to the user as a system message (Claude only), so
+ * the line is visible even when the model paraphrases it in chat.
+ */
+export function generateCeoModeHandoffHook(ctx: TemplateContext, args?: string[]): string {
+  if (ctx.skillName !== 'plan-ceo-review' || args?.length) {
+    throw new Error('CEO_MODE_HANDOFF_HOOK is only valid in plan-ceo-review without arguments');
+  }
+  if (ctx.host !== 'claude') return '';
+  const shellWord = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  const script = `S="${toShellPath(ctx.paths.skillRoot)}/plan-ceo-review/bin/mode-handoff-hook"
+if [ -f "$S" ]; then exec bash "$S"; fi
+exit 0`;
+  return `hooks:
+  PostToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          command: ${JSON.stringify(`bash -c ${shellWord(script)}`)}`;
+}
+
+/**
  * {{INVOKE_SKILL:skill-name}} — emits prose instructing Claude to read
  * another skill's SKILL.md and follow it, skipping preamble sections.
  *
@@ -55,10 +78,9 @@ export function generateInvokeSkill(ctx: TemplateContext, args?: string[]): stri
   const DEFAULT_SKIPS = [
     'Preamble (run first)',
     'AskUserQuestion Format',
-    'Completeness Principle — Boil the Ocean',
+    'Shared preamble (load first)',
     'Search Before Building',
     'Contributor Mode',
-    'Completion Status Protocol',
     'Telemetry (run last)',
     'Step 0: Detect platform and base branch',
     'Review Readiness Dashboard',
@@ -103,6 +125,10 @@ export function generateAutoplanReviewFile(ctx: TemplateContext, args?: string[]
   if (ctx.host === 'claude') return `\`${ctx.paths.skillRoot}/${skill}/SKILL.md\``;
 
   const host = getHostConfig(ctx.host);
+  if (RETIRED_SKILLS.includes(skill)) {
+    const own = `gstack-autoplan/${skill}.md`;
+    return `the file \`${skill}.md\` in the installed \`/autoplan\` SKILL.md directory (local: \`${path.posix.dirname(host.localSkillRoot)}/${own}\`; global: \`~/${path.posix.dirname(host.globalRoot)}/${own}\`${ctx.host === 'codex' ? ', or the corresponding skills directory under CODEX_HOME when configured' : ''})`;
+  }
   const file = `gstack-${skill}/SKILL.md`;
   const local = `${path.posix.dirname(host.localSkillRoot)}/${file}`;
   const global = `~/${path.posix.dirname(host.globalRoot)}/${file}`;
@@ -116,7 +142,7 @@ export function generateAutoplanReviewFile(ctx: TemplateContext, args?: string[]
 /** Resolve once to a literal path; later phase commands run in fresh shells. */
 export function generateAutoplanSnapshotTool(ctx: TemplateContext): string {
   return `\`\`\`bash
-${outsideVoiceRuntime(ctx)}
-bun -e 'console.log(require("fs").realpathSync(process.argv[1]))' "${toShellPath(ctx.paths.binDir)}/gstack-autoplan-snapshot.ts"
+${runtimeRootPrelude(ctx)}
+bun --no-env-file --config=/dev/null -e 'console.log(require("fs").realpathSync(process.argv[1]))' "${toShellPath(ctx.paths.binDir)}/gstack-autoplan-snapshot.ts"
 \`\`\``;
 }

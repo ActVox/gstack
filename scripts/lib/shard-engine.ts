@@ -15,6 +15,7 @@ import { StringDecoder } from 'node:string_decoder';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { FIXTURE_MARKER } from '../../lib/fixture-marker';
 
 const ROOT = path.resolve(import.meta.dir, '..', '..');
 // Strict Bun-test output classification works around a Bun test runner bug
@@ -568,6 +569,9 @@ export async function runShardChild(options: RunShardChildOptions): Promise<Shar
  * a group-SIGKILLed shard never runs its own cleanup, so the lane removes
  * `stateDir` afterwards (the cleanup backstop). `realpath` resolves a
  * symlinked tmpdir (macOS /var -> /private/var) for lanes that compare paths.
+ * `stateDir` carries the test fixture marker (GST-1695): /ship's fetch sweep
+ * skips it, and test-setup.ts keeps the shard's TMPDIR instead of nesting its
+ * own root, so a case that compares its temp paths with `tmp` still matches.
  */
 export function createShardSandbox(
   prefix: string,
@@ -576,14 +580,24 @@ export function createShardSandbox(
 ): { stateDir: string; tmp: string; env: NodeJS.ProcessEnv } {
   const created = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   const stateDir = options.realpath ? fs.realpathSync(created) : created;
+  fs.writeFileSync(path.join(stateDir, FIXTURE_MARKER), `gstack test shard sandbox (${prefix})\n`);
   const tmp = path.join(stateDir, 'tmp');
   fs.mkdirSync(tmp);
   const env: NodeJS.ProcessEnv = {
     ...baseEnv, TMPDIR: tmp, TEMP: tmp, TMP: tmp,
     CHROMIUM_PROFILE: path.join(stateDir, 'chromium-profile'),
   };
+  for (const name of CAPY_LAUNCH_MARKERS) delete env[name];
   return { stateDir, tmp, env };
 }
+
+/**
+ * The Capy installer's `GSTACK_LAUNCH` markers. A lane started from a shell
+ * that sourced the launch file would hand them to every product-under-test
+ * child a shard spawns, so fixtures would see an unattended Capy session they
+ * never set up (GSTA-99); each fixture sets its own session kind.
+ */
+export const CAPY_LAUNCH_MARKERS = ['GSTACK_SESSION_KIND', 'GSTACK_CAPY', 'GSTACK_EPHEMERAL', 'GSTACK_INSTALL_VERDICT'] as const;
 
 /**
  * Asynchronous best-effort backstop removal: a SIGKILLed shard can leave a
@@ -593,6 +607,22 @@ export function createShardSandbox(
 export async function removeShardSandbox(stateDir: string): Promise<void> {
   try { await fs.promises.rm(stateDir, { recursive: true, force: true }); }
   catch { /* a locked file must not turn a real verdict into an exception */ }
+}
+
+/** Run once per file, alone: readers `jobs` at a time, then exclusive files one by one. Stops on termination. */
+export async function forEachFileAlone(
+  readers: string[], exclusive: string[], jobs: number, run: (file: string, index: number) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  const worker = async (files: string[], offset: number) => {
+    while (cursor < files.length && !isTerminationRequested()) {
+      const index = cursor++;
+      await run(files[index], offset + index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, jobs) }, () => worker(readers, 0)));
+  cursor = 0;
+  await worker(exclusive, readers.length);
 }
 
 let shardLogSequence = 0;
@@ -697,17 +727,30 @@ export function strictShardStatus(input: {
     ? 'passed' : 'failed';
 }
 
+/** Usage text for `--help`: the lane's own text, else its declared flags. */
+export function cliUsage(handlers: Record<string, unknown>, usage?: string, script = process.argv[1] ?? 'runner'): string {
+  return usage ?? [`Usage: bun run ${path.relative(process.cwd(), script) || script} [flags]`, '', 'Flags:',
+    ...Object.keys(handlers).sort().map(flag => `  ${flag}`), '', 'See docs/TESTING_INTERNALS.md for what each flag does.'].join('\n');
+}
+
 /**
  * Shared flag loop. Each lane declares its flags; a handler that takes a
  * value calls `next()` (the following argv entry, or undefined) and owns its
  * own validation message. Any undeclared flag is `Unknown argument: <flag>`.
+ * `--help` / `-h` (unless a lane declares them) print the usage and exit 0
+ * before any work starts, so asking for help never runs a suite.
  */
 export function parseCliFlags(
   argv: string[],
   handlers: Record<string, (next: () => string | undefined) => void>,
+  usage?: string,
 ): void {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+    if ((arg === '--help' || arg === '-h') && !Object.hasOwn(handlers, arg)) {
+      process.stdout.write(`${cliUsage(handlers, usage)}\n`);
+      process.exit(0);
+    }
     const handler = Object.hasOwn(handlers, arg) ? handlers[arg] : undefined;
     if (!handler) throw new Error(`Unknown argument: ${arg}`);
     handler(() => argv[++index]);

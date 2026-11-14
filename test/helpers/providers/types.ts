@@ -40,6 +40,8 @@ export interface TokenUsage {
   output: number;
   /** Cached input tokens (Anthropic/OpenAI support). Undefined if provider doesn't report. */
   cached?: number;
+  /** Prompt-cache write tokens (Claude CLI `cache_creation_input_tokens`). Not priced by estimateCostUsd. */
+  cacheWrite?: number;
 }
 
 export type RunError =
@@ -48,6 +50,14 @@ export type RunError =
   | 'rate_limit' // Provider rate-limited us; backoff exceeded.
   | 'binary_missing' // CLI not found on PATH.
   | 'unknown';   // Catch-all with reason populated.
+
+export interface ToolTimelineEntry {
+  atMs: number;
+  /** Set when the call's tool_result arrived; absent for a call still running when the stream ended. */
+  endMs?: number;
+  tool: string;
+  agent: 'main' | 'subagent';
+}
 
 export interface RunResult {
   /** Provider's textual output for the prompt. */
@@ -58,8 +68,12 @@ export interface RunResult {
   durationMs: number;
   /** Count of tool/function calls made during the run (0 if unsupported). */
   toolCalls: number;
+  /** Tool calls in start order: name, start and end offsets from run start, and thread; no inputs or outputs. Unset if unsupported. */
+  toolTimeline?: ToolTimelineEntry[];
   /** Actual model ID the provider reports using (may be a variant of the family). */
   modelUsed: string;
+  /** Every model the CLI billed during the run (Claude CLI `modelUsage` keys). Unset if unreported. */
+  modelsBilled?: string[];
   /** If the run failed, error code + human reason. output/tokens may be partial. */
   error?: { code: RunError; reason: string };
 }

@@ -353,7 +353,8 @@ function findBindsFile(calls: ReturnType<typeof commands>, file: string, cwd: st
   });
 }
 
-function inspectsFile(source: string, file: string, returnedPath: boolean, expected: StartContext): boolean {
+function inspectsFile(source: string, file: string, text: string, expected: StartContext): boolean {
+  const returnedPath = containsPath(text, file);
   const paths = sourcePaths(file);
   const environment = new Map([['GSTACK_HOME', expected.state], ['SLUG', expected.slug]]);
   const calls = withDirectories(commands(source), paths.normalize(expected.repo), paths, environment);
@@ -377,6 +378,20 @@ function inspectsFile(source: string, file: string, returnedPath: boolean, expec
       const quoted = /^\$\(([\s\S]*)\)$/.exec(operand);
       if (quoted && findOutput(commands(quoted[1]))
         && (returnedPath || findBindsFile(commands(quoted[1]), file, call.cwd, call.variables))) return true;
+    }
+  }
+  for (let i = 0; i < calls.length; i++) {
+    const call = calls[i];
+    // A loop over literal paths counts only when its output names this file.
+    const listed = call.words[0] === 'for' && /^[A-Za-z_]\w*$/.test(call.words[1]) && call.words[2] === 'in'
+      && call.words.length > 3 && call.words.slice(3).every(word => /^[\w./-]+$/.test(word))
+      ? call.words.slice(3).find(word => literalPath(word, call.cwd, paths) === file) : undefined;
+    if (!listed || !containsPath(text, listed)) continue;
+    for (const next of calls.slice(i + 1)) {
+      if (next.words[0] === 'done') break;
+      const words = next.words[0] === 'do' ? next.words.slice(1) : next.words;
+      if (rebinds(words, call.words[1])) break;
+      if (reader(words, `$${call.words[1]}`) || reader(words, `\${${call.words[1]}}`)) return true;
     }
   }
   if (!returnedPath) return false;
@@ -423,9 +438,9 @@ function inspectsFile(source: string, file: string, returnedPath: boolean, expec
 }
 
 /** Inspect native public tool blocks only; narration and instruction contents are not evidence. */
-function nativeToolPairs(events: unknown[]) {
+function nativeToolPairs(events: unknown[], includeErrors = false) {
   const pending = new Map<string, { tool: string; input: any; at: number }>();
-  const pairs: { tool: string; input: any; at: number; returnedAt: number; text: string }[] = [];
+  const pairs: { tool: string; input: any; at: number; returnedAt: number; text: string; error: boolean }[] = [];
   let position = 0;
   for (const event of events as any[]) {
     for (const block of Array.isArray(event?.message?.content) ? event.message.content : []) {
@@ -435,11 +450,11 @@ function nativeToolPairs(events: unknown[]) {
       } else if (event.type === 'user' && block.type === 'tool_result') {
         const call = pending.get(block.tool_use_id);
         pending.delete(block.tool_use_id);
-        if (!call || block.is_error === true) continue;
+        if (!call || block.is_error === true && !includeErrors) continue;
         const text = typeof block.content === 'string' ? block.content
           : Array.isArray(block.content) ? block.content.filter((part: any) => part.type === 'text'
             && typeof part.text === 'string').map((part: any) => part.text).join('\n') : '';
-        pairs.push({ ...call, returnedAt: position, text });
+        pairs.push({ ...call, returnedAt: position, text, error: block.is_error === true });
       }
     }
   }
@@ -452,6 +467,8 @@ interface CheckerContext extends StartContext {
   finding: any;
   reusable: boolean;
   coveredPaths: string[];
+  /** Exact evidence sources: an errored Bash read counts only when its output holds the whole source. */
+  sources?: Record<string, string>;
 }
 
 export function hasTrustedSharedLibsCheck(events: unknown[], expected: CheckerContext): boolean {
@@ -482,8 +499,11 @@ export function hasTrustedSharedLibsCheck(events: unknown[], expected: CheckerCo
     }).map(call => ({ ...call, last: call === calls.at(-1),
       words: call.words.map(word => expandVariables(word, call.variables) ?? word) }));
   };
-  const pairs = nativeToolPairs(events);
-  const bash = pairs.filter(pair => pair.tool === 'Bash' && typeof pair.input?.command === 'string');
+  // Run 40617200857: a later `echo ===` failed in the same call, so the result that
+  // returned the whole first file was marked is_error. Such a read counts only in a
+  // multi-command call whose output holds the exact source. Start, check and finish stay strict.
+  const pairs = nativeToolPairs(events, true);
+  const bash = pairs.filter(pair => !pair.error && pair.tool === 'Bash' && typeof pair.input?.command === 'string');
   for (const start of bash) {
     const direct = invocations(start.input.command).some(call => call.last && call.words.length === 3
       && call.words[1] === '--start' && call.words[2] === 'review');
@@ -531,10 +551,13 @@ export function hasTrustedSharedLibsCheck(events: unknown[], expected: CheckerCo
       const reads = pairs.filter(pair => pair.at > start.returnedAt && pair.returnedAt < check.at && pair.text.trim());
       if (!expected.finding.evidence_paths.every((relative: string) => {
         const file = paths.join(expected.repo, relative);
-        return reads.some(read => read.tool === 'Read' && typeof read.input?.file_path === 'string'
+        const source = expected.sources?.[relative]?.replace(/\n$/, '');
+        return reads.some(read => read.tool === 'Read' && !read.error && typeof read.input?.file_path === 'string'
           && literalPath(read.input.file_path, expected.repo, paths) === file
           || read.tool === 'Bash' && typeof read.input?.command === 'string'
-          && inspectsFile(read.input.command, file, containsPath(read.text, file), expected));
+          && inspectsFile(read.input.command, file, read.text, expected)
+          && (!read.error || !!source && commands(read.input.command).length > 1
+            && read.text.replace(/^ *\d+\t/gm, '').includes(source)));
       })) continue;
       if (bash.some(finish => finish.at > check.returnedAt && invocations(finish.input.command).some(call =>
         call.words.length === 4 && call.words[2] === '--finish' && call.words[3] === token))) return true;
@@ -573,7 +596,7 @@ export function hasTrustedReviewStartRead(events: unknown[], expected: StartCont
         // Discovery may return the path only in stdout; bind its cat invocation
         // to that discovery instead of accepting unrelated reader/find words.
         const shellRead = read.tool === 'Bash' && (sameCall ? sameCallStartRead(command, file, expected, token)
-          : inspectsFile(command, file, containsPath(read.text, file), expected));
+          : inspectsFile(command, file, read.text, expected));
         if (!directRead && !shellRead) continue;
         for (const line of read.text.split('\n')) {
           // Native Read can prefix the single-line JSON file with a line number.

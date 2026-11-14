@@ -9,23 +9,54 @@
 #   GSTACK_INSTALL_DIR — override gstack install directory
 #   GSTACK_SKILLS_DIR  — override target skills directory
 set -euo pipefail
+GSTACK_BUN_CONFIG=/dev/null; case "${OSTYPE:-}" in msys*|cygwin*) if command -v cygpath >/dev/null 2>&1; then GSTACK_BUN_CONFIG=NUL; fi ;; esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GSTACK_CONFIG="${SCRIPT_DIR}/gstack-config"
 
-# Detect install dir
+. "$SCRIPT_DIR/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $SCRIPT_DIR/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
+gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
+
+# Install root: an explicit override, else the install this script belongs to
+# (it sits in a skills directory), else the Claude installs the registry
+# recorded for this checkout. Never the global install first: relink from a
+# vendored copy touches only that copy (docs/ADDING_A_HOST.md, ownership rules).
 INSTALL_DIR="${GSTACK_INSTALL_DIR:-}"
 if [ -z "$INSTALL_DIR" ]; then
-  if [ -d "$HOME/.claude/skills/gstack" ]; then
-    INSTALL_DIR="$HOME/.claude/skills/gstack"
-  elif [ -d "${SCRIPT_DIR}/.." ] && [ -f "${SCRIPT_DIR}/../setup" ]; then
-    INSTALL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+  _SELF_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+  _SELF_REAL="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+  if [ -f "$_SELF_ROOT/setup" ] && [ "$(basename "$(dirname "$_SELF_ROOT")")" = skills ]; then
+    INSTALL_DIR="$_SELF_ROOT"
+  else
+    _REG_TARGETS=""
+    if [ -f "$SCRIPT_DIR/gstack-install-registry.sh" ]; then
+      . "$SCRIPT_DIR/gstack-install-registry.sh"
+      _REG_TARGETS="$(gstack_install_registry_rows | awk -F '\t' -v s="$_SELF_REAL" '$1 == "claude" && $6 == s { print $5 "\t" $4 }')"
+    fi
+    _REG_COUNT="$(printf '%s' "$_REG_TARGETS" | grep -c . || true)"
+    if [ "$_REG_COUNT" -gt 1 ]; then
+      _RELINK_FAILED=0
+      while IFS='	' read -r _reg_root _reg_dest; do
+        echo "Relinking $_reg_dest (install root $_reg_root):"
+        GSTACK_INSTALL_DIR="$_reg_root" GSTACK_SKILLS_DIR="$_reg_dest" "$0" "$@" || { echo "  relink failed for $_reg_dest" >&2; _RELINK_FAILED=1; }
+      done <<EOF
+$_REG_TARGETS
+EOF
+      exit "$_RELINK_FAILED"
+    elif [ "$_REG_COUNT" -eq 1 ]; then
+      IFS='	' read -r INSTALL_DIR _reg_dest <<EOF
+$_REG_TARGETS
+EOF
+      GSTACK_SKILLS_DIR="${GSTACK_SKILLS_DIR:-$_reg_dest}"
+    elif [ "$(cd "$HOME/.claude/skills/gstack" 2>/dev/null && pwd -P)" = "$_SELF_REAL" ]; then
+      INSTALL_DIR="$HOME/.claude/skills/gstack"
+    fi
   fi
 fi
 
 if [ -z "$INSTALL_DIR" ] || [ ! -d "$INSTALL_DIR" ]; then
-  echo "Error: gstack install directory not found." >&2
-  echo "Run: cd ~/.claude/skills/gstack && ./setup" >&2
+  echo "Error: no Claude install of this gstack checkout ($SCRIPT_DIR/..) was found." >&2
+  echo "Run its setup to install it: cd \"$(cd "$SCRIPT_DIR/.." && pwd)\" && ./setup" >&2
   exit 1
 fi
 
@@ -35,14 +66,30 @@ SKILLS_DIR="${GSTACK_SKILLS_DIR:-$(dirname "$INSTALL_DIR")}"
 
 # Read prefix setting
 PREFIX=$("$GSTACK_CONFIG" get skill_prefix 2>/dev/null || echo "false")
+# disabled_skills (#1206): no entry for a disabled skill; its files stay.
+DISABLED=" "
+if [ -f "$SCRIPT_DIR/gstack-install-registry.sh" ]; then
+  . "$SCRIPT_DIR/gstack-install-registry.sh"
+  DISABLED="$(gstack_disabled_normalize "$("$GSTACK_CONFIG" get disabled_skills 2>/dev/null || true)")"
+fi
+# Retired skills, and the crew skills off a Capy machine
+# (GSTACK_UNREGISTERED_SKILLS), lose their entry the same way; only the user's
+# DISABLED list is reported and passed to the router.
+OFF="$DISABLED"
+[ -z "${GSTACK_UNREGISTERED_SKILLS:-}" ] || OFF="$(gstack_disabled_normalize "$GSTACK_UNREGISTERED_SKILLS $DISABLED")"
+DISABLED_COUNT=0
 
 # #2569: rendered :user variants (brain-aware blocks) live in an UNTRACKED
 # out-dir instead of the tracked install checkout. When a render exists for a
 # skill, relink serves it — otherwise a config change would silently flip
 # every skill back to the canonical (blockless) source.
-. "$SCRIPT_DIR/gstack-state-root.sh" 2>/dev/null || { echo "$0: cannot resolve the gstack state root: $SCRIPT_DIR/gstack-state-root.sh is missing. fix: reinstall with ./setup or /gstack-upgrade (docs/state-root.md)" >&2; exit 1; }
-gstack_state_root_select; GSTACK_STATE_ROOT="$_gstack_sr_root"
-RENDER_DIR="${GSTACK_USER_RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}"
+RENDER_DIR="${GSTACK_USER_RENDER_DIR:-}"
+# An install outside the default root serves the per-install render setup
+# recorded for it in the registry (render contract, #1882).
+if [ -z "$RENDER_DIR" ] && command -v gstack_install_render_for >/dev/null 2>&1; then
+  RENDER_DIR="$(gstack_install_render_for claude "$SKILLS_DIR")"
+fi
+RENDER_DIR="${RENDER_DIR:-$GSTACK_STATE_ROOT/render/claude}"
 
 # ─── Ownership gate ───────────────────────────────────────────────────────────
 # relink runs on every ./setup and used to `rm -rf` any same-name entry with a
@@ -209,23 +256,29 @@ _cleanup_skill_entry() {
     _report_foreign "$entry"
     return 0
   fi
+  if [ -n "$skill" ]; then
+    src="$INSTALL_DIR/$skill/SKILL.md"; [ -f "$RENDER_DIR/$skill/SKILL.md" ] && src="$RENDER_DIR/$skill/SKILL.md"
+  fi
   if [ -L "$entry" ]; then
     rm -f "$entry"
   elif [ -d "$entry" ]; then
     # Whole-directory removal needs proof that nothing of the user's is inside:
-    # the marker (we created the dir) or a directory holding nothing but links.
-    if [ -f "$entry/.gstack-owned" ] || { [ -L "$entry/SKILL.md" ] && _dir_only_links "$entry"; }; then
+    # the marker (we created the dir) while the skill's source still exists, or
+    # a directory holding nothing but links. A retired skill's marked entry
+    # takes the path below, so a real SKILL.md is backed up and the user's
+    # files stay.
+    if { [ -f "$entry/.gstack-owned" ] && { [ -z "$skill" ] || [ -f "$src" ]; }; } || { [ -L "$entry/SKILL.md" ] && _dir_only_links "$entry"; }; then
       rm -rf "$entry"
     else
       # Otherwise only what is ours goes: the SKILL.md, the marker, and our
       # runtime-asset links. The user's files stay, and so does the directory
       # if it is not empty afterwards. A real SKILL.md that differs from our
-      # source (raw, or with its name: rewritten to the entry name) is a
-      # customized file: moved to the backup root, never deleted.
+      # source (raw, or with its name: rewritten to the entry name), or one
+      # whose source is gone (a retired skill), is treated as customized:
+      # moved to the backup root, never deleted.
       if [ -f "$entry/SKILL.md" ] && [ ! -L "$entry/SKILL.md" ] && [ -n "$skill" ]; then
-        src="$INSTALL_DIR/$skill/SKILL.md"; [ -f "$RENDER_DIR/$skill/SKILL.md" ] && src="$RENDER_DIR/$skill/SKILL.md"
-        if [ -f "$src" ] && ! cmp -s "$entry/SKILL.md" "$src" \
-           && ! sed "1,/^---\$/ s/^name:[[:space:]].*/name: ${entry##*/}/" "$src" | cmp -s - "$entry/SKILL.md"; then
+        if [ ! -f "$src" ] || { ! cmp -s "$entry/SKILL.md" "$src" \
+           && ! sed "1,/^---\$/ s/^name:[[:space:]].*/name: ${entry##*/}/" "$src" | cmp -s - "$entry/SKILL.md"; }; then
           if ! _backup_skill_md "$entry/SKILL.md" "${entry##*/}"; then
             echo "  kept ${entry##*/}/SKILL.md: could not back up the customized file — left untouched" >&2
             return 0
@@ -256,6 +309,47 @@ _dir_only_links() {
     _target_is_ours "$dest" || return 1
   done
   return 0
+}
+
+# _serve_rendered_assets SKILL TARGET — F5 (#2706): when the gbrain render has
+# a counterpart of a runtime asset setup linked from the checkout (sections/,
+# ...), serve the rendered file instead, per file (render dirs carry only the
+# generated *.md). An asset whose render counterpart is gone goes back to the
+# checkout. Only entries that are our links, or directories of nothing but our
+# links, are touched; anything else is the user's and stays.
+_serve_rendered_assets() {
+  local skill="$1" target="$2" asset name t child
+  for asset in "$INSTALL_DIR/$skill"/*; do
+    [ -e "$asset" ] || continue
+    name="${asset##*/}"
+    case "$name" in SKILL.md|node_modules|dist|test|*.tmpl) continue ;; esac
+    t="$target/$name"
+    if [ -L "$t" ]; then
+      _target_is_ours "$(_link_target_abs "$t")" || continue
+    elif [ -d "$t" ]; then
+      _dir_only_links "$t" || continue
+    else
+      continue
+    fi
+    if [ -d "$asset" ] && [ -d "$RENDER_DIR/$skill/$name" ]; then
+      rm -rf "$t"
+      mkdir -p "$t"
+      for child in "$asset"/*; do
+        [ -e "$child" ] || continue
+        if [ -f "$RENDER_DIR/$skill/$name/${child##*/}" ]; then
+          ln -snf "$RENDER_DIR/$skill/$name/${child##*/}" "$t/${child##*/}"
+        else
+          ln -snf "$child" "$t/${child##*/}"
+        fi
+      done
+    elif [ -f "$asset" ] && [ -f "$RENDER_DIR/$skill/$name" ]; then
+      rm -rf "$t"
+      ln -snf "$RENDER_DIR/$skill/$name" "$t"
+    elif [ -d "$t" ] && [ ! -L "$t" ] || [ "$(_link_target_abs "$t")" != "$asset" ]; then
+      rm -rf "$t"
+      ln -snf "$asset" "$t"
+    fi
+  done
 }
 
 _link_root_skill_alias() {
@@ -289,7 +383,7 @@ _link_root_skill_alias() {
 
 _link_root_skill_alias
 
-# Discover skills (directories with SKILL.md, excluding meta dirs)
+# Discover skills: every top-level directory with a SKILL.md
 SKILL_COUNT=0
 for skill_dir in "$INSTALL_DIR"/*/; do
   [ -d "$skill_dir" ] || continue
@@ -299,9 +393,16 @@ for skill_dir in "$INSTALL_DIR"/*/; do
   # rewritten-copy alias for those.
   [ -L "${skill_dir%/}" ] && continue
   skill=$(basename "$skill_dir")
-  # Skip non-skill directories
-  case "$skill" in bin|browse|design|docs|extension|lib|node_modules|scripts|test|.git|.github) continue ;; esac
+  # A directory is a skill iff it carries a SKILL.md (#2263): a name list
+  # dropped the real browse skill. Support dirs have no SKILL.md.
   [ -f "$skill_dir/SKILL.md" ] || continue
+  case "$OFF" in
+    *" ${skill#gstack-} "*)
+      _cleanup_skill_entry "$SKILLS_DIR/$skill" "$skill"
+      case "$skill" in gstack-*) ;; *) _cleanup_skill_entry "$SKILLS_DIR/gstack-$skill" "$skill" ;; esac
+      case "$DISABLED" in *" ${skill#gstack-} "*) DISABLED_COUNT=$((DISABLED_COUNT + 1)) ;; esac
+      continue ;;
+  esac
 
   if [ "$PREFIX" = "true" ]; then
     # Don't double-prefix directories already named gstack-*
@@ -351,6 +452,7 @@ for skill_dir in "$INSTALL_DIR"/*/; do
     fi
   fi
   ln -snf "$skill_md_src" "$target/SKILL.md"
+  _serve_rendered_assets "$skill" "$target"
   # Provenance marker on every platform (path-independent proof; on Windows
   # without Developer Mode `ln -snf` degrades to a copy and this is the only
   # proof), but only for a directory we created or already owned.
@@ -359,6 +461,12 @@ for skill_dir in "$INSTALL_DIR"/*/; do
   fi
   SKILL_COUNT=$((SKILL_COUNT + 1))
 done
+# A retired skill whose source is gone (investigate, GST-1717) never reaches
+# the loop above, so its old gstack-owned entries go here, plain and prefixed.
+for skill in ${GSTACK_RETIRED_SKILLS:-}; do
+  _cleanup_skill_entry "$SKILLS_DIR/$skill" "$skill"
+  _cleanup_skill_entry "$SKILLS_DIR/gstack-$skill" "$skill"
+done
 
 # Patch SKILL.md name: fields to match prefix setting. When a gbrain render
 # is active the loop above links SKILL.md from RENDER_DIR — the file the host
@@ -366,6 +474,35 @@ done
 # for every brain-aware skill (#2738). gstack-patch-names takes an arbitrary
 # root, skips already-prefixed names (idempotent), and the render dir is
 # user-owned and untracked, so patching it never dirties a checkout.
+# C8 (#3018): Claude reads the router straight from the install root, so with
+# disabled_skills set it is re-rendered in place without their routing rules
+# (in place, like gstack-patch-names). Clearing the list restores the committed
+# bytes. Only a generated router is rewritten, and only from a checkout that
+# carries the generator; a failed render keeps the current router.
+# plan_mode_preamble=off (#3168) renders it without the plan-mode preamble the
+# same way, and turning it back on restores the committed bytes.
+_ROUTER="$INSTALL_DIR/SKILL.md"
+_GEN_SRC="$(cd "$SCRIPT_DIR/.." && pwd)"
+_PLAN_MODE_ARG=""
+[ "$("$GSTACK_CONFIG" get plan_mode_preamble 2>/dev/null || true)" != off ] || _PLAN_MODE_ARG="--plan-mode=off"
+if { [ "$DISABLED" != " " ] || grep -q '^Disabled on this install' "$_ROUTER" 2>/dev/null \
+    || [ -n "$_PLAN_MODE_ARG" ] \
+    || { grep -q 'PLAN MODE EXCEPTION' "$_ROUTER" 2>/dev/null && ! grep -q '^## Plan Mode Safe Operations' "$_ROUTER" 2>/dev/null; }; } \
+  && grep -q '<!-- AUTO-GENERATED from' "$_ROUTER" 2>/dev/null && [ -f "$_GEN_SRC/scripts/gen-skill-docs.ts" ]; then
+  _ROUTER_TMP="$(mktemp -d "${TMPDIR:-/tmp}/gstack-router.XXXXXX")" || _ROUTER_TMP=""
+  _DISABLED_CSV="$(printf '%s' "$DISABLED" | xargs | tr ' ' ',')"
+  if [ -n "$_ROUTER_TMP" ] && command -v bun >/dev/null 2>&1 \
+    && (cd "$_GEN_SRC" && bun --no-env-file --config="${GSTACK_BUN_CONFIG:-/dev/null}" run scripts/gen-skill-docs.ts --host claude --out-dir "$_ROUTER_TMP" ${_DISABLED_CSV:+"--disabled-skills=$_DISABLED_CSV"} ${_PLAN_MODE_ARG:+"$_PLAN_MODE_ARG"} >/dev/null 2>&1) \
+    && [ -s "$_ROUTER_TMP/SKILL.md" ] && cp "$_ROUTER_TMP/SKILL.md" "$_ROUTER.tmp.$$" && mv "$_ROUTER.tmp.$$" "$_ROUTER"; then
+    _link_root_skill_alias
+    [ -n "$_DISABLED_CSV" ] && echo "Router: disabled skills left out of $_ROUTER"
+  else
+    rm -f "$_ROUTER.tmp.$$"
+    echo "gstack-relink: could not re-render the router for disabled_skills or plan_mode_preamble (bun missing or generation failed); $_ROUTER is unchanged. Fix: install Bun, then run $0" >&2
+  fi
+  [ -z "$_ROUTER_TMP" ] || rm -rf "$_ROUTER_TMP"
+fi
+
 "$INSTALL_DIR/bin/gstack-patch-names" "$INSTALL_DIR" "$PREFIX"
 [ -d "$RENDER_DIR" ] && "$INSTALL_DIR/bin/gstack-patch-names" "$RENDER_DIR" "$PREFIX"
 
@@ -373,6 +510,9 @@ if [ "$PREFIX" = "true" ]; then
   echo "Relinked $SKILL_COUNT skills as gstack-*"
 else
   echo "Relinked $SKILL_COUNT skills as flat names"
+fi
+if [ "$DISABLED_COUNT" -gt 0 ]; then
+  echo "Disabled (gstack-config disabled_skills, not registered):$DISABLED"
 fi
 if [ ${#BACKED_UP[@]} -gt 0 ]; then
   echo "Moved ${#BACKED_UP[@]} pre-existing SKILL.md file(s) to $BACKUP_ROOT before linking gstack's: ${BACKED_UP[*]}"

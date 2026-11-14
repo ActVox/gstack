@@ -38,6 +38,7 @@ import { spawnSync } from "child_process";
 
 import {
   localEngineStatus,
+  localEngineStatusDetail,
   cacheFilePath,
   probeTimeoutMs,
   probeGbrainBin,
@@ -63,7 +64,7 @@ interface FakeEnv {
  */
 function makeEnv(opts: {
   withGbrain?: boolean;
-  gbrainBehavior?: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal";
+  gbrainBehavior?: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal" | "dns-failure";
   withConfig?: boolean;
   /** #2051: config carries gbrain's remote_mcp thin-client marker. */
   thinClientConfig?: boolean;
@@ -117,7 +118,7 @@ function makeEnv(opts: {
 }
 
 function makeFakeGbrainScript(
-  behavior: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal",
+  behavior: "ok" | "broken-db" | "broken-config" | "engine-locked" | "engine-locked-v43" | "throws" | "slow" | "slow-version" | "thin-refusal" | "dns-failure",
 ): string {
   // "slow-version": gbrain IS installed but even `--version` blows the
   // (test-lowered) budget — the #2716 bun-shim-on-a-loaded-POSIX-box shape.
@@ -154,6 +155,8 @@ exit 0
           ? 'echo "gbrain sources: connect timed out (default 10000ms; pass --timeout=Ns to override)." >&2'
         : behavior === "engine-locked-v43"
           ? "echo \"GBrains local database is already open through gbrain serve (MCP, PID 12345). This brain uses PGLite, so a separate CLI process cannot open it at the same time. Stop gbrain serve, then retry this CLI command.\" >&2"
+        : behavior === "dns-failure"
+          ? 'echo "Cannot connect to database: getaddrinfo ENOTFOUND db.example.com. Fix: Check your connection URL in ~/.gbrain/config.json" >&2'
         : behavior === "throws"
           ? 'echo "unexpected gbrain failure" >&2'
           : behavior === "thin-refusal"
@@ -252,6 +255,30 @@ describe("lib/gbrain-local-status — status classification", () => {
     env = makeEnv({ withGbrain: true, gbrainBehavior: "ok", withConfig: false });
     restoreEnv = applyEnv(env);
     expect(localEngineStatus({ noCache: true })).toBe("missing-config");
+  });
+
+  it("classifies a DNS failure as db-unreachable with the host, never broken-db (A2, #2884)", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "dns-failure" });
+    writeFileSync(env.configPath, JSON.stringify({ database_url: ["postgresql://u", "secret@db.example.com:5432/brain"].join(":") }));
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("db-unreachable");
+    const detail = localEngineStatusDetail() ?? "";
+    expect(detail).toContain("ENOTFOUND db.example.com");
+    expect(detail).toContain("your gbrain config is unchanged");
+    expect(detail).not.toContain("secret");
+    // A cached classification keeps the reason.
+    expect(localEngineStatus()).toBe("db-unreachable");
+    expect(localEngineStatusDetail()).toBe(detail);
+  });
+
+  it("gstack-gbrain-detect --is-ok treats db-unreachable as usable, like timeout (A2)", () => {
+    env = makeEnv({ withGbrain: true, gbrainBehavior: "dns-failure", withConfig: true });
+    const r = spawnSync(process.execPath, [join(import.meta.dir, "..", "bin", "gstack-gbrain-detect"), "--is-ok"], {
+      env: { HOME: env.home, PATH: `${env.bindir}:/usr/bin:/bin`, GSTACK_HOME: env.gstackHome, GSTACK_DETECT_NO_CACHE: "1" },
+      encoding: "utf-8",
+      timeout: 20_000,
+    });
+    expect(r.status).toBe(0);
   });
 
   it("returns 'broken-db' when sources list emits 'Cannot connect to database'", () => {
@@ -731,6 +758,50 @@ describe("lib/gbrain-local-status — bearer-token thin-client (#2520)", () => {
     });
     restoreEnv = applyEnv(env);
     expect(localEngineStatus({ noCache: true })).toBe("engine-locked");
+  });
+
+  // #3539: a loopback `gbrain serve --http` over this machine's own engine is
+  // a local registration. Before, the transport-only copy of the rule called
+  // it remote, so detect printed gbrain_mcp_mode local-stdio next to
+  // gbrain_local_status thin-client for the same entry.
+  it("keeps the local engine's own status for a loopback http gbrain MCP over a local Postgres (#3539)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked-v43",
+      withConfig: true,
+      claudeJson: { mcpServers: { gbrain: { type: "http", url: "http://127.0.0.1:3131/mcp" } } },
+    });
+    restoreEnv = applyEnv(env);
+    writeFileSync(env.configPath, JSON.stringify({ engine: "postgres", database_url: "postgres://fake" }));
+    expect(localEngineStatus({ noCache: true })).toBe("broken-db");
+  });
+
+  it("still reclassifies a locked local PGLite as 'thin-client' behind a loopback http entry (Path 4 split-engine, #3539)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked-v43",
+      withConfig: true,
+      claudeJson: { mcpServers: { gbrain: { type: "http", url: "http://127.0.0.1:3131/mcp" } } },
+    });
+    restoreEnv = applyEnv(env);
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
+  });
+
+  it("still reclassifies as 'thin-client' when the loopback entry's config carries remote_mcp (#3539 guard)", () => {
+    env = makeEnv({
+      withGbrain: true,
+      gbrainBehavior: "engine-locked",
+      withConfig: true,
+      claudeJson: { mcpServers: { gbrain: { type: "http", url: "http://127.0.0.1:3131/mcp" } } },
+    });
+    restoreEnv = applyEnv(env);
+    writeFileSync(
+      env.configPath,
+      JSON.stringify({ engine: "pglite", remote_mcp: { mcp_url: "http://127.0.0.1:3131/mcp" } }),
+    );
+    // Config marker short-circuits to thin-client before the probe; the
+    // loopback entry must not turn that into a local registration.
+    expect(localEngineStatus({ noCache: true })).toBe("thin-client");
   });
 
   it("still returns 'missing-config' when no gbrain MCP registration exists (discriminator)", () => {

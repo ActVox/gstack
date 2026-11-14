@@ -10,7 +10,7 @@ import { describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { runPlanSkillObservation, runPlanSkillCounting, runPlanSkillFloorCheck } from './claude-pty-runner';
+import { readEngTestPlans, runPlanSkillObservation, runPlanSkillCounting, runPlanSkillFloorCheck } from './claude-pty-runner';
 import { createFakePtyDriver, type FakeFrame, type FakeSessionContext } from './pty/fake-session';
 import { FORCING_FLOOR_DEVEX } from '../fixtures/forcing-finding-seeds';
 
@@ -81,6 +81,50 @@ describe('runPlanSkillObservation through the fake driver', () => {
   test('plan-ready: the native confirmation ends the observation', async () => {
     const { obs } = await observe([{ onInput: '/plan-eng-review\r', screen: PERMISSION }, { afterMs: 4000, screen: PLAN_READY }]);
     expect(obs.outcome).toBe('plan_ready');
+  });
+});
+
+describe('runPlanSkillObservation idle turn end (captured CI screens)', () => {
+  const captures = JSON.parse(fs.readFileSync(new URL('../fixtures/pty-idle-turn-end.json', import.meta.url), 'utf8'));
+  const observe = (frames: FakeFrame[], opts: { timeoutMs: number; requireProseEvidence?: boolean }) => withConfigDir(async () => {
+    const fake = createFakePtyDriver({ frames: [{ screen: IDLE }, ...frames] });
+    return runPlanSkillObservation({ skillName: 'plan-eng-review', inPlanMode: false, model: 'fake-model', driver: fake.driver,
+      ...(opts.requireProseEvidence ? { extraArgs: ['--disallowedTools', 'AskUserQuestion'], requireProseEvidence: true } : {}), timeoutMs: opts.timeoutMs });
+  });
+  const slash = (screen: string): FakeFrame => ({ onInput: '/plan-eng-review\r', screen });
+
+  test('the 988e985 idle turn end stops promptly as a failure that names it', async () => {
+    const obs = await observe([slash(captures.scopePendingIdle.visible)], { timeoutMs: 300_000, requireProseEvidence: true });
+    expect(obs.outcome).toBe('timeout');
+    expect(obs.elapsedMs).toBeLessThan(30_000);
+    expect(obs.summary).toContain('the CLI turn ended at an idle prompt (✻Cooked for 24s · done 12:46 AM) with no question, plan or write');
+    expect(obs.summary).toContain('instead of waiting out the 300000ms budget');
+    expect(obs.scopeGateQuestionObserved).toBe(false);
+  });
+
+  test('a provider error panel is named in the failure', async () => {
+    const obs = await observe([slash(captures.apiErrorIdle.visible)], { timeoutMs: 300_000, requireProseEvidence: true });
+    expect(obs.outcome).toBe('timeout');
+    expect(obs.elapsedMs).toBeLessThan(30_000);
+    expect(obs.summary).toContain('after its public error panel: ●API Error: Connection lost mid-response.');
+  });
+
+  test('negative control: a visible prose menu before the idle prompt is still asked', async () => {
+    const obs = await observe([slash(captures.menuThenIdle.visible)], { timeoutMs: 300_000, requireProseEvidence: true });
+    expect(obs.outcome).toBe('asked');
+    expect(obs.scopeGateQuestionObserved).toBe(true);
+  });
+
+  test('negative controls: thinking, a screen that changes before settling, and an unconsulted judge keep the deadline', async () => {
+    const scope: string = captures.scopePendingIdle.visible;
+    const thinking = await observe([slash(scope.slice(0, scope.indexOf('●Scope')))], { timeoutMs: 40_000, requireProseEvidence: true });
+    expect(thinking).toMatchObject({ outcome: 'timeout', summary: 'no terminal outcome within 40000ms', elapsedMs: 40_000 });
+    const resumed = await observe([slash(scope), { afterMs: 6_000, screen: '✶ Thinking… (30s · thinking)' }], { timeoutMs: 40_000, requireProseEvidence: true });
+    expect(resumed).toMatchObject({ outcome: 'timeout', summary: 'no terminal outcome within 40000ms', elapsedMs: 40_000 });
+    // Without requireProseEvidence the judge could still credit 'asked'; it
+    // first runs after 60s, so a shorter budget never stops early.
+    const judgeLive = await observe([slash(scope)], { timeoutMs: 50_000 });
+    expect(judgeLive).toMatchObject({ outcome: 'timeout', summary: 'no terminal outcome within 50000ms', elapsedMs: 50_000 });
   });
 });
 
@@ -165,6 +209,42 @@ describe('runPlanSkillFloorCheck through the fake driver', () => {
     expect(obs.summary).toBe('no qualifying finding question within 30000ms');
   });
 
+  test('the 40851840940 provider error at an idle plan-mode prompt ends the floor check with its panel', async () => {
+    const plan: string = JSON.parse(fs.readFileSync(new URL('../fixtures/pty-idle-turn-end.json', import.meta.url), 'utf8')).planModeApiErrorIdle.visible;
+    const { obs } = await floor([{ onInput: '/plan-devex-review PLAN.md\r', screen: plan, effect: delivered }]);
+    expect(obs.outcome).toBe('api_error');
+    expect(obs.auqObserved).toBe(false);
+    expect(obs.elapsedMs).toBeLessThan(30_000);
+    expect(obs.summary).toBe('the CLI turn ended at an idle prompt (✻Brewed for 1m 13s · done 9:51 AM) after its public error panel: ' +
+      '●API Error: Connection lost mid-response. The response above may be incomplete.');
+    const running = plan.replace('⏸planmodeon (shift+tabtocycle)·←foragents', '⏸planmodeon (shift+tabtocycle)·esctointerrupt·←foragents');
+    const live = await floor([{ onInput: '/plan-devex-review PLAN.md\r', screen: running, effect: delivered }]);
+    expect(live.obs).toMatchObject({ outcome: 'timeout', summary: 'no qualifying finding question within 30000ms' });
+  });
+
+  test.skipIf(process.platform === 'win32')('a prose finding question earlier in the idle turn is assessed before the provider error panel ends the check, even when its transcript line lands after the screen goes idle', async () => {
+    const plan: string = JSON.parse(fs.readFileSync(new URL('../fixtures/pty-idle-turn-end.json', import.meta.url), 'utf8')).planModeApiErrorIdle.visible;
+    const prose = 'Which TTHW target should this journey be measured against?\nA) Champion (< 2 min)\nB) Competitive (2-5 min)';
+    const screen = plan.replace('●API Error:', `${prose.replace(/\n/g, '\r\n')}\r\n●API Error:`);
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'floor-judge-stub-'));
+    const stub = path.join(stubDir, 'claude');
+    fs.writeFileSync(stub, '#!/bin/sh\ncat >/dev/null\necho \'{"kind":"finding","seedId":"seed-1","questionId":"prose-1","optionId":"prose-1","reason":"the stub judge credits the staged prose question"}\'\n', { mode: 0o755 });
+    const saved = process.env.BROWSE_TERMINAL_BINARY;
+    process.env.BROWSE_TERMINAL_BINARY = stub;
+    try {
+      const asked = (ctx: FakeSessionContext) => journal(ctx, floorSession(ctx), 'assistant', [{ type: 'text', text: prose }]);
+      const sameTick = await floor([{ onInput: '/plan-devex-review PLAN.md\r', screen, effect: ctx => { delivered(ctx); asked(ctx); } }]);
+      const lateLine = await floor([{ onInput: '/plan-devex-review PLAN.md\r', screen, effect: delivered }, { afterMs: 4000, screen, effect: asked }]);
+      for (const { obs } of [sameTick, lateLine]) {
+        expect(obs).toMatchObject({ outcome: 'auq_observed', auqObserved: true });
+        expect(obs.summary).toContain('Current prose question addresses the owned seeded finding');
+      }
+    } finally {
+      if (saved === undefined) delete process.env.BROWSE_TERMINAL_BINARY; else process.env.BROWSE_TERMINAL_BINARY = saved;
+      fs.rmSync(stubDir, { recursive: true, force: true });
+    }
+  });
+
   test('permission prompt: an unowned permission is neither granted nor counted', async () => {
     const { obs, fake } = await floor([
       { onInput: '/plan-devex-review PLAN.md\r', screen: PERMISSION, effect: delivered },
@@ -182,5 +262,23 @@ describe('runPlanSkillFloorCheck through the fake driver', () => {
     ]);
     expect(obs.outcome).toBe('plan_ready');
     expect(obs.summary).toBe('agent reached plan_ready without a qualifying finding question');
+  });
+});
+
+describe('readEngTestPlans', () => {
+  test('returns only /plan-eng-review QA test plans under projects/<slug>/ of the owned state root', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'eng-test-plans-'));
+    try {
+      expect(readEngTestPlans(root)).toEqual([]);
+      expect(readEngTestPlans(undefined)).toEqual([]);
+      fs.mkdirSync(path.join(root, 'projects', 'fixture-slug'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'projects', 'fixture-slug', 'runner-main-eng-review-test-plan-20261004-010203.md'), '# Test Plan\nDashboard');
+      fs.writeFileSync(path.join(root, 'projects', 'fixture-slug', 'runner-main-ship-test-plan-20261004-010203.md'), '# Ship plan');
+      fs.writeFileSync(path.join(root, 'projects', 'fixture-slug', 'tasks-eng-review-20261004-010203.jsonl'), '{}');
+      fs.writeFileSync(path.join(root, 'eng-review-test-plan-outside-projects.md'), 'stray');
+      expect(readEngTestPlans(root)).toEqual([{ file: path.join('projects', 'fixture-slug', 'runner-main-eng-review-test-plan-20261004-010203.md'), content: '# Test Plan\nDashboard' }]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

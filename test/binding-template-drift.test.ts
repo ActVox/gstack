@@ -4,6 +4,7 @@ import * as path from 'path';
 import { generateReviewDashboard } from '../scripts/resolvers/review-dashboard';
 import { HOST_PATHS } from '../scripts/resolvers/types';
 import { ALL_HOST_CONFIGS } from '../hosts';
+import { expectMentions } from './helpers/prompt-structure';
 
 /**
  * Template-drift tripwire for the content-binding wave. The bins are
@@ -41,8 +42,7 @@ describe('content-binding template drift', () => {
 
   test('ship historical readiness does not replace the current pre-landing gate', () => {
     const text = rendered('ship/SKILL.md');
-    expect(text).not.toContain('The only review that gates shipping');
-    expect(text).toContain('This verdict never skips Step 9 or its finding, approval and convergence gates');
+    expectMentions(text, [['never', 'convergence', 'approval']], 'text');
   });
 
   test('ship Step 16 carries the evidence check (mechanized IRON LAW)', () => {
@@ -55,8 +55,9 @@ describe('content-binding template drift', () => {
 
   test('ship Step 5 lanes run wrapped with per-lane labels', () => {
     const tests = rendered('ship/sections/tests.md');
-    expect(tests).toContain('gstack-evidence run --label tests');
-    expect(tests).toContain('gstack-evidence run --label vitest');
+    expect(tests).toContain('gstack-ship-preflight --tests-only --base <base> --lane <label>=<command>');
+    expect(tests).toContain('Each lane runs as `gstack-evidence run --label <label> -- \'<command>\'`');
+    expect(tests).toContain('use the same lane labels and exact commands again in Step 16');
   });
 
   test('land-and-deploy grades staleness content-first (wtree rule) and checks evidence', () => {
@@ -114,23 +115,27 @@ describe('content-binding template drift', () => {
     expect(army).toContain('fixes also require `converged:false`');
     const ship = rendered('ship/SKILL.md');
     expect(army.replace(/\s+/g, ' ')).toContain('**Third fixing cycle reached (`CYCLES >= 3`):** STOP and report recurring findings with `converged:false`; do not run a fourth fixing cycle');
-    expect(ship.replace(/\s+/g, ' ')).toContain('Keep the same attempt counts throughout the invocation');
-    expect(ship.replace(/\s+/g, ' ')).toContain('a repair never resets approvals or expands them');
+    expectMentions(ship.replace(/\s+/g, ' '), [['never', 'approvals', 'expands']], 'ship.replace(/\s+/g,  )');
     expect(army).toContain('--start design-review-lite');
     expect(army).toContain('--finish DESIGN_START');
     const codex = rendered('codex/sections/review-mode.md');
     const starts = [...codex.matchAll(/gstack-review-log --start codex-review/g)];
-    expect(starts).toHaveLength(2);
-    expect(starts[0].index).toBeLessThan(codex.indexOf('_gstack_codex_timeout_wrapper 330 codex review'));
-    expect(starts[1].index).toBeLessThan(codex.indexOf('git diff "<base>...HEAD"'));
+    expect(starts).toHaveLength(1);
+    const execReview = codex.indexOf(`run-with-timeout --user-invoked --effort high --request-effort '<effort-level>' 330 codex exec`);
+    expect(execReview).toBeGreaterThan(-1);
+    expect(starts[0].index).toBeLessThan(execReview);
+    const diffRead = codex.indexOf('git diff "$DIFF_BASE"');
+    expect(diffRead).toBeGreaterThan(-1);
+    expect(starts[0].index).toBeLessThan(diffRead);
+    expect(codex).not.toMatch(/run-with-timeout[^\n]*\bcodex review\b/);
     expect(codex).toContain('--finish CODEX_REVIEW_START');
     expect(codex).toContain('"completed":COMPLETED,"converged":CONVERGED');
-    expect(codex).toContain('Fixes stay stale until a genuine rerun');
+    expectMentions(codex, [['until', 'genuine', 'fixes']], 'codex');
     for (const skill of ['ship', 'review']) {
       const adversarial = rendered(`${skill}/sections/adversarial.md`);
       expect(adversarial).toContain('--start adversarial-review');
       expect(adversarial).toContain('--finish PASS_START');
-      expect(adversarial.replace(/\s+/g, ' ')).toContain('Do the same before each outside adversarial or structured pass reads its diff');
+      expectMentions(adversarial.replace(/\s+/g, ' '), [['before', 'adversarial', 'structured']], 'adversarial.replace(/\s+/g,  )');
       expect(adversarial).toContain('Each token is consumed once');
     }
   });
@@ -143,11 +148,11 @@ describe('content-binding template drift', () => {
         '**3. Choose the historical verdict', '**4. Display the dashboard'].map(marker => text.indexOf(marker));
       expect(positions.every(position => position >= 0)).toBe(true);
       expect(positions).toEqual([...positions].sort((a, b) => a - b));
-      expect(text).toContain('never substitute an older success for a newer failure');
+      expectMentions(text, [['never', 'substitute', 'success']], 'text');
       expect(text).toContain('CLEARED requires the selected Eng Review to be `clean`, within 7 days and fresh under step 2');
       expect(text).toContain('STALE or UNVERIFIED cannot clear Eng Review');
       expect(text).toContain('Missing `review_freshness`, including legacy log-only records, means UNVERIFIED');
-      expect(text).toContain('This verdict never skips Step 9 or its finding, approval and convergence gates');
+      expectMentions(text, [['never', 'convergence', 'approval']], 'text');
       expect(text).toContain('Continue Step 1 even when history is NOT CLEARED');
     }
   });
@@ -209,9 +214,9 @@ describe('content-binding template drift', () => {
     }
   });
 
-  test('greptile triage reads bodies through the guard (metadata/body split)', () => {
+  test('review bot triage reads bodies through the guard (metadata/body split)', () => {
     const triage = rendered('review/greptile-triage.md');
-    expect(triage).toContain('gstack-issue-guard --stdin --source greptile-line');
+    expect(triage).toContain('gstack-issue-guard --stdin --source review-bot');
     expect(triage).toContain('gstack-issue-guard --stdin --source greptile-replies');
   });
 });

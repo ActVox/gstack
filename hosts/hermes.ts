@@ -1,8 +1,21 @@
-import { defineHost, CROSS_MODEL_RESOLVERS } from './define-host';
+import { defineHost, CROSS_MODEL_RESOLVERS, preambleToolGlossary } from './define-host';
 
 const hermes = defineHost({
   name: 'hermes',
   displayName: 'Hermes',
+  tier: 'experimental',
+  capabilities: { toolExecution: true, questions: 'native', planMode: false, delegation: true, browser: true, safetyHooks: 'advisory' },
+
+  // Hermes indexes skills by frontmatter name, first match wins (#2825). Its
+  // skills index shows 57 chars of a description and "..." (agent/skill_utils.py
+  // SKILL_PROMPT_DESC_LIMIT = 60), so each description leads with when to use it.
+  frontmatter: {
+    mode: 'allowlist',
+    keepFields: ['name', 'description'],
+    descriptionLimit: null,
+    descriptionLead: 57,
+    nameMatchesDirectory: true,
+  },
 
   extraPathRewrites: [
     { from: 'CLAUDE.md', to: 'AGENTS.md' },
@@ -13,12 +26,17 @@ const hermes = defineHost({
     'use the Read tool': 'use the read_file tool',
     'use the Edit tool': 'use the patch tool',
     'use the Agent tool': 'use delegate_task',
+    "Claude Code's Agent tool": 'delegate_task',
+    'the Agent tool': 'delegate_task',
+    'Agent tool': 'delegate_task',
     'use the Grep tool': 'search for',
     'use the Glob tool': 'find files matching',
     'the Bash tool': 'the terminal tool',
     'the Read tool': 'the read_file tool',
     'the Write tool': 'the patch tool',
     'the Edit tool': 'the patch tool',
+    // #2015: Hermes asks through clarify.
+    ...preambleToolGlossary('**Hermes tool names:** `AskUserQuestion` means your `clarify` tool (one question per call, options as choices); there is no `mcp__*__AskUserQuestion` variant.'),
   },
 
   suppressedResolvers: [
@@ -28,11 +46,11 @@ const hermes = defineHost({
     // If Hermes has GBrain as a mod, brain features activate automatically.
   ],
 
-  // No full install arm — users can hand-copy the instruction-only digest
-  // (setup's explainer arm prints this path; never auto-copied).
+  // ./setup --host hermes (and setup run inside Hermes) registers every skill
+  // through gstack-harness into $HERMES_HOME/skills/gstack (one category).
   install: {
     linkingStrategy: 'symlink-generated',
-    instructionTier: { rulesFile: 'agents-digest/gstack-AGENTS.md' },
+    registration: 'harness',
   },
 
   coAuthorTrailer: 'Co-Authored-By: Hermes Agent <agent@nousresearch.com>',

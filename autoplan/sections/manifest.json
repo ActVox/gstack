@@ -39,6 +39,18 @@
       "file": "tasks-aggregator.md",
       "title": "Phase 4: Implementation Tasks aggregator (builds $AGGREGATED_TASKS for the gate)",
       "trigger": "presenting the Final Approval Gate (Phase 4) \u2014 the aggregator computes $AGGREGATED_TASKS that the gate message substitutes"
+    },
+    {
+      "id": "unattended",
+      "file": "unattended.md",
+      "title": "Unattended profile: parent-driven next/submit loop, gate answers, export, terminal line",
+      "trigger": "the preamble echoed `SESSION_KIND: unattended` (read before Phase 1 and at the Phase 4 gate)"
+    },
+    {
+      "id": "ceo-only",
+      "file": "ceo-only.md",
+      "title": "CEO-only run: zero questions, CEO phase only, review report, no gate",
+      "trigger": "the invocation names `--ceo-only` (read before any preamble instruction block)"
     }
   ]
 }

@@ -62,6 +62,13 @@ describe("HIGH credential patterns", () => {
     ],
     ["google.oauth_client_secret", 'client_secret: "GOCSPX-' + "Ab3xQ9zLmNp2RtVw7YkD1sHf" + '"'],
     ["telegram.bot_token", "TELEGRAM_TOKEN=8326208591:AA" + "HdqRy9Lm2ZpXvKb4NcQw8TuEr6YoP1sVg"],
+    ["aws.access_key", "temporary key ASIA" + "ZQ3XN7P2LM4RT8WV"],
+    ["github.user_to_server", "ghu_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"],
+    ["github.refresh", "ghr_" + "a1B2c3D4e5F6g7H8i9J0".repeat(3) + "k1L2m3N4o5P6q7R8"],
+    ["openrouter.key", "OPENROUTER sk-or-v1-" + "9f8e7d6c5b4a39281706f5e4d3c2b1a0".repeat(2)],
+    ["stripe.restricted", "rk_live_" + "a1B2c3D4e5F6g7H8i9J0k1L2"],
+    ["supabase.secret", "sb_secret_" + "tR4i6cyMIrYTE3s6OyHGHw_ppx2p6WK"],
+    ["supabase.pat", "sbp_" + "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c"],
   ];
   for (const [id, text] of cases) {
     test(`flags ${id}`, () => {
@@ -234,6 +241,192 @@ describe("MEDIUM demoted credential-shaped patterns (TENSION-1)", () => {
     expect(ids(`authToken: ${v}`)).toContain("env.kv"); // (iv) credential camel
     expect(ids(`clientSecret: ${v}`)).toContain("env.kv"); // (iv) credential camel
   });
+  // #3208: a catalog entry whose whole name is a data-model word plus `_key`
+  // and whose value is a lowercase identifier names a field, not a credential.
+  // Either side alone is not enough: an entropic value, a longer name or a
+  // credential name still fires, in every config format.
+  test("env.kv skips schema field identifiers only when name and value both say so (#3208)", () => {
+    const v = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ";
+    expect(ids('{\n  "input_key": "expected_media_rate_bits_per_second_ingress",\n  "unit": "bps"\n}')).not.toContain("env.kv");
+    for (const line of ["input_key: expected_media_rate_bits_per_second_ingress", '"output_key": "bits.per.second.egress"', "cache-key: user-profile-v2", "sort_key = created_at_desc"])
+      expect(ids(line)).not.toContain("env.kv");
+    for (const line of [
+      `input_key: ${v}`, `INPUT_KEY=${v}`, `input_key: expectedMediaRateBitsPerSecond`, "input_key: abcdefghijkmnop",
+      `cosmosdb_primary_key=${v}`, `cosmosdb_primary_key: ${v}`, `{\n  "cosmosdb_primary_key": "${v}"\n}`, `cosmosdb_primary_key = "${v}"`,
+      `primary_key: ${v}`, `api_cache_key: ${v}`, "api_key: expected_media_rate_bits_per_second_ingress", "cosmosdb_primary_key: expected_media_rate_bits_per_second",
+    ])
+      expect(ids(line)).toContain("env.kv");
+  });
+  // #3048 — in a TS/JSX file an unquoted value after `:` is a type or an
+  // expression, and a JSX brace of names is an expression. Decided by file
+  // context: the same shapes in .env/YAML (or with no path) are literals.
+  test("env.kv skips TS/JSX source syntax by file context, never by value shape (#3048)", () => {
+    const kv = (text: string, sourcePath?: string) =>
+      scan(text, { repoVisibility: "private", ...(sourcePath ? { sourcePath } : {}) }).findings.some((f) => f.id === "env.kv");
+    const v = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ";
+    const signature = "export async function issueServerCoachItem(\n  db: Pool,\n  session: SessionState,\n  item: IssuedCoachItem,\n): Promise<void> {}";
+    for (const [code, file] of [
+      [signature, "src/coach.ts"],
+      ["interface Props {\n  session: SessionState;\n}", "src/props.ts"],
+      ["key={turn.requestId + turn.role + index}", "src/Turn.tsx"],
+      ["apiKey={settings.apiKey}", "src/Settings.jsx"],
+    ] as const) expect({ code, kv: kv(code, file) }).toEqual({ code, kv: false });
+    for (const [literal, file] of [
+      ["API_KEY=VelvetRiverOrbitSunset;", ".env"],
+      ["password: {RiverStoneAmberCedar}", "config/app.yml"],
+      [signature, undefined],
+      ["  session: SessionState,", "deploy/values.yaml"],
+      [`session: "${v}",`, "src/a.ts"], [`key={${v}}`, "src/A.tsx"], [`API_KEY={${v}}`, "src/A.tsx"],
+      [`key={settings.apiKey + "${v}"}`, "src/A.tsx"], [`key="${v}"`, "src/A.tsx"], [`api_key: ${v}`, ".env"],
+    ] as const) expect({ literal, file, kv: kv(literal, file) }).toEqual({ literal, file, kv: true });
+    const jwt = ["eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkwIn0", "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"].join(".");
+    expect(scan(`token: ${jwt},`, { repoVisibility: "private", sourcePath: "src/auth.ts" }).findings.map((f) => f.id)).toContain("jwt");
+  });
+  // #3630 (#3605, #3418, #3419) — the #3048 rule, extended: Dart and Python have
+  // no unquoted string literal either, so a bare name chain after `:` is a name;
+  // a JSX brace may join names with ?? || && as well as +. Each widening keeps a
+  // negative control that still fires.
+  test("env.kv skips Dart/Python source names and JSX logical joins, never a literal (#3630)", () => {
+    const kv = (text: string, sourcePath?: string) =>
+      scan(text, { repoVisibility: "private", ...(sourcePath ? { sourcePath } : {}) }).findings.some((f) => f.id === "env.kv");
+    const v = "8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ";
+    const vIdent = "Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJx";
+    for (const [code, file] of [
+      ["def fetch_days(\n    *,\n    session: HttpSession,\n    start: int,\n) -> None:\n    pass", "app.py"],
+      ["      password: pydantic.SecretStr", "app/models.py"],
+      ["      password: pydantic.SecretStr", "app/models.pyi"],
+      ['      "password": request.password,', "app/api/handlers.py"],
+      ['      "api_key": settings.api_key,', "app/api/handlers.py"],
+      ["      'password': request.password,", "backend/lib/src/handlers/onboarding_handlers.dart"],
+      ["              password: request.password,", "backend/lib/src/handlers/pfs_handlers.dart"],
+      ["const doc = '''usage''';\n  password: request.password,", "backend/lib/src/config.dart"],
+      ["key={workout.id ?? index}", "src/SessionList.jsx"],
+      ["key={item.uuid || item.slug}", "src/List.tsx"],
+      ["key={row.ready && row.id}", "src/Grid.tsx"],
+      // A trailing comment is not part of the expression.
+      ["  password: req.body.password // don't log it (see docs", "src/a.ts"], ["    password: pydantic.SecretStr  # the user's password, or", "app/models.py"],
+      ["    'password': request.password // don't log", "lib/a.dart"],
+      // A quote inside a comment opens nothing.
+      ["# it's a session\ndef f(\n    session: HttpSession,\n): pass", "app.py"], ["/* it's a session */\n  password: request.password,", "lib/a.dart"],
+      // A literal in the next pair on the line belongs to that pair.
+      ['    "session": request.session, "mode": "readwrite-primary",', "app.py"],
+      // Quotes that close before the name leave it code.
+      ["    login('it\\'s', password: request.password);", "lib/a.dart"], ['    "user": "a", "password": request.password,', "app.py"],
+      // The triple-quote guard is Dart/Python only: a stray ''' in a TS string leaves #3048 as it was.
+      ["const s = \"'''\";\n  session: SessionState,", "src/a.ts"],
+      // #4209: a plain assignment of a dotted name reads an attribute; the keyword form below still fires.
+      ["      password = request.password", "app/api/handlers.py"],
+    ] as const) expect({ code, file, kv: kv(code, file) }).toEqual({ code, file, kv: false });
+    for (const [literal, file] of [
+      ["    session: HttpSession,", "deploy/values.yaml"],
+      ["    session: HttpSession,", undefined],
+      [`    session: "${v}",`, "app.py"],
+      [`      "password": "${v}",`, "app/api/handlers.py"],
+      [`  password = "${v}"`, "app/config.py"],
+      ["      password=request.password,", "app/api/handlers.py"],
+      [`CONFIG = """\npassword: ${vIdent}\n"""`, "tests/conftest.py"],
+      [`      'password': '${v}',`, "backend/lib/src/handlers/onboarding_handlers.dart"],
+      [`  password: "${v}",`, "backend/lib/src/config.dart"],
+      [`  password = "${v}";`, "backend/lib/src/config.dart"],
+      [`  password: ${v},`, "backend/lib/src/config.dart"],
+      [`const fixture = '''\npassword: ${vIdent}\n''';`, "test/fixtures.dart"],
+      [`key={settings.apiKey ?? "${v}"}`, "src/A.tsx"],
+      [`key={${v} || index}`, "src/A.tsx"],
+      ["key={workout.id ?? index}", ".env"],
+      // An annotation with a literal default is still a literal.
+      [`    api_token: AuthToken = "${v}"`, "app.py"], [`    api_token: AuthToken="${v}"`, "app.py"],
+      [`  apiToken: AuthToken = "${v}";`, "src/a.ts"], [`  apiToken: AuthToken = '${v}',`, "lib/a.dart"],
+      // An escaped delimiter does not close the block.
+      [`CONFIG = """\n\\"""\npassword: ${vIdent}\n"""`, "tests/conftest.py"],
+      // A delimiter in a comment or a one-line string opens nothing, so the block after it is still a block.
+      [`# don't use """ here\nCONFIG = """\npassword: ${vIdent}\n"""`, "tests/conftest.py"],
+      [`DELIM = '"""'\nCONFIG = """\npassword: ${vIdent}\n"""`, "tests/conftest.py"],
+      [`// no ''' here\nconst fixture = '''\npassword: ${vIdent}\n''';`, "test/fixtures.dart"],
+      [`/* ''' */\nconst fixture = '''\npassword: ${vIdent}\n''';`, "test/fixtures.dart"],
+      [`/* outer /* ''' */ still a comment ''' */\nconst fixture = '''\npassword: ${vIdent}\n''';`, "test/fixtures.dart"],
+      [`const dir = r'''C:\\dir\\''';\nconst fixture = '''\npassword: ${vIdent}\n''';`, "test/fixtures.dart"],
+      // An expression that continues on the next line may carry a literal there.
+      [`    api_token: AuthToken = (\n        "${v}"\n    )`, "app.py"],
+      // A literal fallback after a name is still a literal.
+      [`      "password": settings.db_pass or "${v}",`, "app.py"], [`      'password': request.password ?? '${v}',`, "lib/a.dart"],
+      // A one-line string continued by a backslash spans lines.
+      [`CFG = "db: \\\npassword: ${vIdent} \\\n"`, "app.py"],
+      // A key and value inside one quoted string are text, not a dict entry.
+      [`    'password: ${vIdent} more',`, "lib/a.dart"], [`    "password: ${vIdent} more",`, "app.py"],
+    ] as const) expect({ literal, file, kv: kv(literal, file) }).toEqual({ literal, file, kv: true });
+  });
+  // Value: protects=an interpolated expression inside a Python f-string or Dart string is skipped whole, so a quote inside it never ends the outer string; fails_when=a """/''' delimiter in a nested string closes the block early and a password: line inside it reads as code;
+  //   why_new=GST-738 (outside voice); seam=none; no_claim=Python before 3.12, where the nested quote is a syntax error
+  test("env.kv: a quote inside an f-string or Dart interpolation does not end the string (GST-738)", () => {
+    const kv = (text: string, sourcePath: string) => scan(text, { repoVisibility: "private", sourcePath, processEnv: {} }).findings.some((f) => f.id === "env.kv");
+    const v = "Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJx";
+    for (const [literal, file] of [
+      [`CONFIG = f'''\n{"'''"}\npassword: ${v}\n'''\n`, "app.py"],
+      [`CONFIG = rf"""\n{x.replace('"""', "")}\npassword: ${v}\n"""\n`, "app.py"],
+      [`CONFIG = f'''\n{f"{'\'\'\''}"}\npassword: ${v}\n'''\n`, "app.py"],
+      [`const s = '''\${"'''"}\npassword: ${v}\n''';\n`, "lib/a.dart"],
+      [`const s = """\${m["k"] ?? '"""'}\npassword: ${v}\n""";\n`, "lib/a.dart"],
+      // A comment inside an interpolation holds no delimiter, and a Dart block comment is text.
+      [`CONFIG = f"""\n{1 # } """\n}\npassword: ${v}\n"""\n`, "app.py"],
+      [`const s = '''\${x // '''\n}\npassword: ${v}\n''';\n`, "lib/a.dart"],
+      [`void main() {}\n/*\npassword: ${v}\n*/\n`, "lib/a.dart"],
+      // A format spec is text: its # or quote opens nothing.
+      [`render({\n    "id": f"{n:#x}",\n}, """\npassword: ${v}\n""")\n`, "app.py"],
+      [`render({\n    "id": f"{n:'>10}",\n}, """\npassword: ${v}\n""")\n`, "app.py"],
+      [`render({\n    "id": f"{n!r:{w}}",\n}, """\npassword: ${v}\n""")\n`, "app.py"],
+      // A # comment in a single-quoted f-string's multi-line field holds no delimiter either.
+      [`msg = f"{\n  1 # }" """\n}"\nCONFIG = """\npassword: ${v}\n"""\n`, "app.py"],
+      // In an f-string a backslash does not escape the brace after it.
+      [`CONFIG = f"""\\{"""\npassword: ${v}\n"""}"""\n`, "app.py"],
+      // Nesting past the depth cap runs to the end of the text instead of overflowing the stack.
+      ["const s = '" + "${'".repeat(20000) + `\npassword: ${v}\n`, "lib/a.dart"],
+      ["x = f'" + "{a:".repeat(100000) + `\npassword: ${v}\n`, "app.py"],
+    ] as const) expect({ literal, kv: kv(literal, file) }).toEqual({ literal, kv: true });
+    for (const [code, file] of [
+      ["msg = f'{a}:{b}'\ndef f(\n    session: HttpSession,\n): pass\n", "app.py"],
+      ["msg = f'''{{literal brace'''\ndef f(\n    session: HttpSession,\n): pass\n", "app.py"],
+      ["msg = f'{x:>{width}}'\ndef f(\n    session: HttpSession,\n): pass\n", "app.py"],
+      ["msg = f\"{when:%b %d '%y} {d[':']} {a[1:2]} {a!=b}\"\nrows = {\n    \"password\": session.password,\n}\n", "app.py"],
+      // Code inside a multi-line interpolation is code, not string text.
+      ["msg = f\"{\n {\n  'password': request.password,\n }\n}\"\n", "app.py"],
+      ["final s = \"${login(\n  password: request.password,\n)}\";\n", "lib/a.dart"],
+      ["if'a' in s: pass\ndef f(\n    session: HttpSession,\n): pass\n", "app.py"],
+      ["final s = 'hi ${user.name} and $id';\n  login(password: request.password);\n", "lib/a.dart"],
+      ["final s = r'${raw}';\n  login(password: request.password);\n", "lib/a.dart"],
+    ] as const) expect({ code, kv: kv(code, file) }).toEqual({ code, kv: false });
+  });
+  test("env.kv's source-syntax check stays linear on a match-dense file (#3630)", () => {
+    for (const file of ["app.py", "src/a.ts"]) {
+      const text = "def f(\n" + "    session: HttpSession,\n".repeat(12_000) + "): pass\n";
+      const t0 = performance.now();
+      const found = scan(text, { repoVisibility: "private", sourcePath: file }).findings.filter((f) => f.id === "env.kv").length;
+      expect({ file, found, fast: performance.now() - t0 < 3_000 }).toEqual({ file, found: 0, fast: true });
+    }
+  });
+  // #2912 — a line that READS a secret from the environment holds no secret;
+  // it must not fire (and so must not be masked or withhold a /cso source file).
+  test("env.kv skips exact environment reads (#2912)", () => {
+    for (const line of [
+      'api_key=os.environ["AGENTOPS_API_KEY"]',
+      '        api_key=os.environ["AGENTOPS_API_KEY"]',
+      "LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')",
+      'token = os.environ.get("GH_TOKEN")',
+      "API_KEY=process.env.OPENAI_API_KEY",
+      "SECRET_KEY=getenv(\"APP_SECRET_KEY\")",
+    ]) {
+      expect(ids(line)).not.toContain("env.kv");
+      expect(redactFindingSpans(`x=1\n${line}\n`, {})).toBe(`x=1\n${line}\n`);
+    }
+  });
+  test("env.kv still fires on real high-entropy keys beside or instead of an env read (#2912 negative controls)", () => {
+    const v = "Zq8vR2mN5tYb7Lc3Wd9K";
+    expect(ids(`SECRET_KEY = os.getenv('DJANGO_SECRET', '${v}')`)).toContain("env.kv");
+    expect(ids(`API_KEY=process.env.OPENAI_API_KEY||"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ["X"]+"${v}"`)).toContain("env.kv");
+    expect(ids(`API_KEY=os.environ_${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY=getenv${v}`)).toContain("env.kv");
+    expect(ids(`API_KEY="${v}"`)).toContain("env.kv");
+  });
   test("env.kv stays MEDIUM (calibration: generic net, not a blocker)", () => {
     const f = scan("api_key=8Fk2pQ9vXz4wL7mN3rT6yB1cD5eG0hJ", { repoVisibility: "private" })
       .findings.find((x) => x.id === "env.kv");
@@ -275,6 +468,20 @@ describe("#1946 pattern negatives (placeholders never fire)", () => {
     expect(ids("dop_v1_short")).not.toContain("digitalocean.token");
     // pem header WITHOUT the GCP JSON shape stays pem.private_key only.
     expect(ids("-----BEGIN PRIVATE KEY-----")).not.toContain("gcp.service_account");
+  });
+});
+
+describe("OpenRouter, GitHub ghu_/ghr_, Stripe restricted, Supabase and AWS temporary key negatives", () => {
+  test("near-miss shapes never fire", () => {
+    expect(ids("sk-or-v1-" + "9f8e7d6c5b4a39281706f5e4d3c2b1a0")).not.toContain("openrouter.key");
+    expect(ids("ghu_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R")).not.toContain("github.user_to_server");
+    expect(ids("ghr_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R")).not.toContain("github.refresh");
+    expect(ids("rk_test_" + "a1B2c3D4e5F6g7H8i9J0k1L2")).not.toContain("stripe.restricted");
+    expect(ids("sb_publishable_" + "tR4i6cyMIrYTE3s6OyHGHw_ppx2p6WK")).not.toContain("supabase.secret");
+    expect(ids("sb_secret_key")).not.toContain("supabase.secret");
+    expect(ids("sbp_" + "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6")).not.toContain("supabase.pat");
+    expect(ids("sbp_" + "Zf8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c")).not.toContain("supabase.pat");
+    expect(ids("ASIA" + "ZQ3XN7P2LM4RT8W")).not.toContain("aws.access_key");
   });
 });
 
@@ -564,6 +771,12 @@ describe("redactFindingSpans — machine-egress masking (#1947)", () => {
     expect(out).toBe("auth <REDACTED-github.pat> rejected");
   });
 
+  test("a 76-character GitHub refresh token is masked whole", () => {
+    const token = "ghr_" + "a1B2c3D4e5F6g7H8i9J0".repeat(3) + "k1L2m3N4o5P6q7R8";
+    const out = redactFindingSpans(`auth ${token} rejected`, { repoVisibility: "private" });
+    expect(out).toBe("auth <REDACTED-github.refresh> rejected");
+  });
+
   test("multiple findings are all replaced (right-to-left splice keeps offsets valid)", () => {
     const pat = "ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz";
     const aws = "AKIA1234567890ABCDEF";
@@ -641,5 +854,24 @@ describe("taxonomy integrity", () => {
     for (const p of PATTERNS) {
       if (p.autoRedactable) expect(p.redactToken).toBeTruthy();
     }
+  });
+});
+
+describe("#3048: gstack-redact --from-file passes the file's path as scan context", () => {
+  test("the same line is source syntax in a .ts file and a literal in YAML", () => {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const os = require("node:os") as typeof import("node:os");
+    const path = require("node:path") as typeof import("node:path");
+    const { spawnSync } = require("node:child_process") as typeof import("node:child_process");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "redact-from-file-"));
+    try {
+      const kv = (name: string) => {
+        fs.writeFileSync(path.join(dir, name), "  session: SessionState,\n");
+        const r = spawnSync("bun", [path.join(import.meta.dir, "..", "bin", "gstack-redact"), "--from-file", path.join(dir, name), "--json"], { encoding: "utf8", timeout: 30_000 });
+        return (JSON.parse(r.stdout).findings as Array<{ id: string }>).some((f) => f.id === "env.kv");
+      };
+      expect(kv("coach.ts")).toBe(false);
+      expect(kv("values.yaml")).toBe(true);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

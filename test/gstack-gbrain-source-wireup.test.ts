@@ -345,6 +345,16 @@ describe('gstack-gbrain-source-wireup — wireup mode', () => {
     expect(r.status).toBe(0);
   });
 
+  test('--strict with no .git: exits 2 and names the current init command (#1675)', () => {
+    fs.mkdirSync(tmpHome, { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, '.gstack-brain-remote.txt'), 'git@github.com:user/gstack-brain-bob.git\n');
+    makeFakeGbrain({});
+    const r = run(['--strict']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('run /setup-gbrain Step 7 (gstack-artifacts-init) first');
+    expect(r.stderr).not.toContain('brain-init');
+  });
+
   test('source-id from --source-id flag overrides everything', () => {
     setupGstackRepo('git@github.com:user/gstack-brain-different.git');
     makeFakeGbrain({});
@@ -563,5 +573,219 @@ describe('gstack-gbrain-source-wireup — defensive paths', () => {
     expect(r.status).toBe(0);
     expect(fs.existsSync(path.join(worktreeDir, '.git'))).toBe(true); // real worktree
     expect(fs.existsSync(path.join(worktreeDir, 'unrelated.txt'))).toBe(false); // stray gone
+  });
+});
+
+// B8 (#2369): the wireup reads `gbrain sources list --json` with bun, so a
+// machine without jq (git-bash on Windows, minimal Linux) still wires up.
+describe('gstack-gbrain-source-wireup without jq (B8)', () => {
+  function pathWithoutJq(): string {
+    const dir = path.join(tmpHome, 'no-jq-bin');
+    fs.mkdirSync(dir, { recursive: true });
+    for (const base of ['/usr/bin', '/bin', '/usr/sbin', '/sbin']) {
+      if (!fs.existsSync(base)) continue;
+      for (const name of fs.readdirSync(base)) {
+        if (name === 'jq' || fs.existsSync(path.join(dir, name))) continue;
+        try { fs.symlinkSync(path.join(base, name), path.join(dir, name)); } catch {}
+      }
+    }
+    return `${fakeBinDir}:${dir}:${BUN_ONLY_DIR}`;
+  }
+
+  test('detects an already-registered source and re-runs cleanly with no jq on PATH', () => {
+    setupGstackRepo('git@github.com:user/gstack-brain-user.git');
+    makeFakeGbrain({});
+    const PATH = pathWithoutJq();
+    expect(spawnSync('sh', ['-c', 'command -v jq'], { env: { PATH }, timeout: 10_000 }).status).not.toBe(0);
+    const first = run([], { env: { PATH, GSTACK_BRAIN_NO_SYNC: '1' } });
+    expect(first.stderr).not.toContain('jq required');
+    expect(first.status).toBe(0);
+    const second = run([], { env: { PATH, GSTACK_BRAIN_NO_SYNC: '1' } });
+    expect(second.status).toBe(0);
+    expect(readState().sources).toHaveLength(1);
+  });
+});
+
+
+// #4325: the lock and every database call must follow GBRAIN_HOME the way
+// gbrain's configDir() does. Two homes hold different database_urls; the
+// GBRAIN_HOME one is the brain gbrain itself would use.
+describe('gstack-gbrain-source-wireup — GBRAIN_HOME (#4325)', () => {
+  const DEFAULT_URL = 'postgresql://postgres:postgres@localhost:5432/default_brain';
+  const NAMED_URL = 'postgresql://postgres:postgres@localhost:5433/named_brain';
+  let gbrainHome: string;
+
+  function writeConfig(dir: string, config: Record<string, unknown>) {
+    fs.mkdirSync(path.join(dir, '.gbrain'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.gbrain', 'config.json'), JSON.stringify(config));
+  }
+
+  function databaseCalls(): string[] {
+    return gbrainCalls().filter((c) => c.includes('sources add') || /^gbrain sync --source/.test(c));
+  }
+
+  beforeEach(() => {
+    gbrainHome = path.join(tmpHome, 'named-home');
+    writeConfig(tmpHome, { engine: 'postgres', database_url: DEFAULT_URL });
+    writeConfig(gbrainHome, { engine: 'postgres', database_url: NAMED_URL });
+    setupGstackRepo('git@github.com:user/gstack-brain-user.git');
+    makeFakeGbrain({});
+  });
+
+  test('GBRAIN_HOME set: sources add and sync carry the GBRAIN_HOME brain, never the default one', () => {
+    const r = run([], { env: { GBRAIN_DATABASE_URL: '', DATABASE_URL: '', GBRAIN_HOME: gbrainHome } });
+    expect(r.status).toBe(0);
+    const calls = databaseCalls();
+    expect(calls.length).toBe(2);
+    for (const c of calls) {
+      expect(c).toContain(`[GBRAIN_DATABASE_URL=${NAMED_URL}]`);
+      expect(c).not.toContain(DEFAULT_URL);
+    }
+  });
+
+  test('negative control: GBRAIN_HOME unset still locks the default brain', () => {
+    const r = run([], { env: { GBRAIN_DATABASE_URL: '', DATABASE_URL: '' } });
+    expect(r.status).toBe(0);
+    const calls = databaseCalls();
+    expect(calls.length).toBe(2);
+    for (const c of calls) expect(c).toContain(`[GBRAIN_DATABASE_URL=${DEFAULT_URL}]`);
+  });
+
+  test('GBRAIN_HOME with surrounding whitespace resolves as gbrain trims it', () => {
+    const r = run([], {
+      env: { GSTACK_BRAIN_NO_SYNC: '1', GBRAIN_DATABASE_URL: '', DATABASE_URL: '', GBRAIN_HOME: `  ${gbrainHome} ` },
+    });
+    expect(r.status).toBe(0);
+    expect(databaseCalls()[0]).toContain(`[GBRAIN_DATABASE_URL=${NAMED_URL}]`);
+  });
+
+  test('GBRAIN_HOME config without a database_url exports nothing, so gbrain picks its own brain', () => {
+    writeConfig(gbrainHome, { engine: 'pglite' });
+    const r = run([], {
+      env: { GSTACK_BRAIN_NO_SYNC: '1', GBRAIN_DATABASE_URL: '', DATABASE_URL: '', GBRAIN_HOME: gbrainHome },
+    });
+    expect(r.status).toBe(0);
+    const calls = databaseCalls();
+    expect(calls.length).toBe(1);
+    expect(calls[0]).not.toContain('GBRAIN_DATABASE_URL=');
+  });
+
+  test('a relative GBRAIN_HOME (gbrain refuses it) never falls back to the default brain', () => {
+    const r = run([], {
+      env: { GSTACK_BRAIN_NO_SYNC: '1', GBRAIN_DATABASE_URL: '', DATABASE_URL: '', GBRAIN_HOME: 'relative/home' },
+    });
+    expect(r.stderr).toContain('GBRAIN_HOME');
+    for (const c of gbrainCalls()) expect(c).not.toContain(DEFAULT_URL);
+  });
+
+  test('the ZeroEntropy advisory reads the GBRAIN_HOME config', () => {
+    writeConfig(gbrainHome, { engine: 'postgres', database_url: NAMED_URL, embedding: { recipe: 'zeroentropyai' } });
+    const r = run([], {
+      env: { GSTACK_BRAIN_NO_SYNC: '1', GBRAIN_DATABASE_URL: '', DATABASE_URL: '', GBRAIN_HOME: gbrainHome },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('ZeroEntropy');
+  });
+});
+
+// #4325 audit: --check-target tells an operator whether an earlier wireup run
+// with GBRAIN_HOME set could have written to the default brain. Read-only, and
+// it never prints a database URL or any part of one.
+describe('gstack-gbrain-source-wireup --check-target (#4325)', () => {
+  const DEFAULT_URL = 'postgresql://postgres:postgres@localhost:5432/default_brain';
+  const NAMED_URL = 'postgresql://postgres:postgres@localhost:5433/named_brain';
+  let gbrainHome: string;
+
+  function writeConfig(dir: string, config: Record<string, unknown>) {
+    fs.mkdirSync(path.join(dir, '.gbrain'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.gbrain', 'config.json'), JSON.stringify(config));
+  }
+
+  function check(env: Record<string, string>) {
+    const r = run(['--check-target'], { env: { GBRAIN_DATABASE_URL: '', DATABASE_URL: '', ...env } });
+    const out = r.stdout + r.stderr;
+    for (const secret of [DEFAULT_URL, NAMED_URL, 'postgres:postgres', 'localhost', ':5432', ':5433', 'default_brain', 'named_brain', 'postgresql://']) {
+      expect(out).not.toContain(secret);
+    }
+    expect(gbrainCalls()).toEqual([]);
+    return r;
+  }
+
+  beforeEach(() => {
+    gbrainHome = path.join(tmpHome, 'named-home');
+    writeConfig(tmpHome, { engine: 'postgres', database_url: DEFAULT_URL });
+    writeConfig(gbrainHome, { engine: 'postgres', database_url: NAMED_URL });
+    makeFakeGbrain({});
+  });
+
+  test('two brains with different URLs under GBRAIN_HOME → MISMATCH', () => {
+    const r = check({ GBRAIN_HOME: gbrainHome });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/^TARGET: MISMATCH /m);
+    expect(r.stdout).toMatch(/^URL_ENV: GBRAIN_DATABASE_URL unset, DATABASE_URL unset /m);
+  });
+
+  test('GBRAIN_HOME unset → MATCH', () => {
+    const r = check({});
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/^TARGET: MATCH /m);
+  });
+
+  test('same URL in both configs → MATCH', () => {
+    writeConfig(gbrainHome, { engine: 'postgres', database_url: DEFAULT_URL });
+    expect(check({ GBRAIN_HOME: gbrainHome }).stdout).toMatch(/^TARGET: MATCH /m);
+  });
+
+  test('default config without a database_url → MATCH (the old rule locked nothing)', () => {
+    writeConfig(tmpHome, { engine: 'pglite' });
+    expect(check({ GBRAIN_HOME: gbrainHome }).stdout).toMatch(/^TARGET: MATCH /m);
+  });
+
+  test('GBRAIN_HOME has no config but the default brain has a URL → MISMATCH', () => {
+    fs.rmSync(path.join(gbrainHome, '.gbrain'), { recursive: true, force: true });
+    expect(check({ GBRAIN_HOME: gbrainHome }).stdout).toMatch(/^TARGET: MISMATCH /m);
+  });
+
+  test('writes nothing: configs unchanged, no gstack state, no worktree', () => {
+    const configs = [tmpHome, gbrainHome].map((d) => path.join(d, '.gbrain', 'config.json'));
+    const before = configs.map((p) => fs.readFileSync(p, 'utf-8'));
+    check({ GBRAIN_HOME: gbrainHome });
+    expect(configs.map((p) => fs.readFileSync(p, 'utf-8'))).toEqual(before);
+    for (const dir of [tmpHome, gbrainHome]) expect(fs.readdirSync(path.join(dir, '.gbrain'))).toEqual(['config.json']);
+    expect(fs.existsSync(gstackHome)).toBe(false);
+    expect(fs.existsSync(worktreeDir)).toBe(false);
+  });
+});
+
+// The shared helper itself (#4325): every gstack shell read of gbrain's config
+// resolves through bin/gstack-gbrain-home.sh, which follows gbrain's configDir().
+describe('bin/gstack-gbrain-home.sh (#4325)', () => {
+  const HELPER = path.join(ROOT, 'bin/gstack-gbrain-home.sh');
+
+  function configPath(gbrainHome?: string) {
+    const env: Record<string, string> = { PATH: HERMETIC_PATH, HOME: '/home/fixture' };
+    if (gbrainHome !== undefined) env.GBRAIN_HOME = gbrainHome;
+    const r = spawnSync('bash', ['-c', '. "$1" && gstack_gbrain_config_path', 'helper', HELPER], {
+      env,
+      encoding: 'utf8',
+      timeout: 10_000,
+    });
+    return { status: r.status, out: r.stdout };
+  }
+
+  test('unset or blank GBRAIN_HOME means ~/.gbrain', () => {
+    for (const home of [undefined, '', '   ']) {
+      expect(configPath(home)).toEqual({ status: 0, out: '/home/fixture/.gbrain/config.json\n' });
+    }
+  });
+
+  test('GBRAIN_HOME is trimmed and is the parent of .gbrain', () => {
+    expect(configPath('  /srv/brain/ ')).toEqual({ status: 0, out: '/srv/brain/.gbrain/config.json\n' });
+  });
+
+  test('a GBRAIN_HOME gbrain refuses prints nothing and fails, with no ~/.gbrain fallback', () => {
+    for (const home of ['relative/home', '/srv/../brain', '/srv/brain/..']) {
+      expect(configPath(home)).toEqual({ status: 1, out: '' });
+    }
   });
 });

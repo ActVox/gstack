@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -9,12 +9,32 @@ import { childEnvironment, executable, git as readGitMetadata, runProcess } from
 const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))fs.rmSync(root,{recursive:true,force:true});});
 
+const fixtureGit=(repo:string,home:string)=>(...args:string[])=>{const result=spawnSync('/usr/bin/git',['-C',repo,...args],{encoding:'utf8',env:{HOME:home,PATH:'/usr/bin:/bin'},timeout:30_000});if(result.error||result.status!==0)throw new Error(`fixture git ${args.join(' ')} failed (status ${result.status}, signal ${result.signal}): ${result.error?.message??result.stderr}`);return result.stdout;};
+// Each fixture builds its own repository from Git; nothing is copied from a shared
+// template (Free Tests 40288142343 shard 17: fs.cpSync of the template threw inside
+// its directory walk once and passed on the serial retry). Auto-maintenance is off
+// because `git commit` otherwise starts a detached `git maintenance run --auto` that
+// creates and deletes .git/objects/maintenance.lock after the commit returns, under
+// the tests' own .git reads and the afterEach rmSync (docs/TESTING_INTERNALS.md,
+// Free-suite flake rules); fixtureGit's replacement env never sees the shard backstop.
+function seedRepo(repo:string,home:string){
+  const git=fixtureGit(repo,home);fs.mkdirSync(repo);
+  git('init','-q');git('config','user.email','fixture@example.test');git('config','user.name','Fixture');
+  git('config','maintenance.auto','false');git('config','gc.auto','0');
+  fs.writeFileSync(path.join(repo,'tracked.ts'),'export const tracked = true\n');git('add','tracked.ts');git('commit','-qm','base');
+  return git;
+}
+// The first /usr/bin/git spawns on a cold macOS runner can eat a test's whole 5 s budget before the code under test runs; pay them once here.
+// Every test below skips on Windows, which has no /usr/bin/git, so the warm-up does too.
+beforeAll(()=>{
+  if(process.platform==='win32')return;
+  const warm=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cso-git-hardening-warm-')));
+  try{seedRepo(path.join(warm,'repo'),warm);}finally{fs.rmSync(warm,{recursive:true,force:true});}
+},{timeout:30_000});
+
 function fixture(){
   const root=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cso-git-hardening-'))),repo=path.join(root,'repo'),runDir=path.join(root,'state','run');
-  roots.push(root);fs.mkdirSync(repo);fs.mkdirSync(runDir,{recursive:true,mode:0o700});
-  const git=(...args:string[])=>{const result=spawnSync('/usr/bin/git',['-C',repo,...args],{encoding:'utf8',env:{HOME:root,PATH:'/usr/bin:/bin'},timeout:30_000});if(result.status)throw new Error(result.stderr);return result.stdout;};
-  git('init','-q');git('config','user.email','fixture@example.test');git('config','user.name','Fixture');
-  fs.writeFileSync(path.join(repo,'tracked.ts'),'export const tracked = true\n');git('add','tracked.ts');git('commit','-qm','base');
+  roots.push(root);const git=seedRepo(repo,root);fs.mkdirSync(runDir,{recursive:true,mode:0o700});
   return{root,repo,runDir,git};
 }
 
@@ -61,13 +81,14 @@ describe('CSO Git metadata hardening',()=>{
     if(fs.existsSync(path.join(repo,'TRACKED.ts')))return;
     fs.mkdirSync(empty);fs.writeFileSync(excludes,'untracked-security.ts\n');
     fs.writeFileSync(path.join(repo,'untracked-security.ts'),'export const vulnerable = true\n');
-    fs.writeFileSync(path.join(repo,'TRACKED.ts'),'export const caseVariant = true\n');
+    const caseSensitive=!fs.existsSync(path.join(repo,'TRACKED.ts'));
+    if(caseSensitive)fs.writeFileSync(path.join(repo,'TRACKED.ts'),'export const caseVariant = true\n');
     git('config','core.worktree',empty);git('config','core.excludesFile',excludes);git('config','core.ignoreCase','true');git('config','core.precomposeUnicode','true');
 
     const manifest=await capture(repo,runDir,'HEAD');
 
     expect(manifest.entries.map(entry=>entry.path)).toContain('untracked-security.ts');
-    expect(manifest.entries.map(entry=>entry.path)).toContain('TRACKED.ts');
+    if(caseSensitive)expect(manifest.entries.map(entry=>entry.path)).toContain('TRACKED.ts');
     expect(fs.readFileSync(path.join(runDir,'snapshot','untracked-security.ts'),'utf8')).toContain('vulnerable');
     expect(manifest.changedPaths).toContain('untracked-security.ts');
   });
@@ -83,6 +104,20 @@ describe('CSO Git metadata hardening',()=>{
     expect(manifest.deletedPaths).toEqual([{path:'tracked.ts',pathId:expect.stringMatching(/^[a-f0-9]{32}$/)}]);
     expect(history).toContain('Subject: base');
     expect(history).not.toContain('replacement-history');
+  });
+
+  test.skipIf(process.platform==='win32')('retained history withholds diffs of credential files the snapshot excludes',async()=>{
+    const {repo,runDir,git}=fixture();
+    fs.writeFileSync(path.join(repo,'.env'),'UPSTREAM_TOKEN=planted-history-value\n');fs.writeFileSync(path.join(repo,'tracked.ts'),'export const tracked = false\n');
+    git('add','.env','tracked.ts');git('commit','-qm','configure upstream');
+
+    await capture(repo,runDir);
+    const history=fs.readFileSync(path.join(runDir,'history.txt'),'utf8');
+
+    expect(history).not.toContain('planted-history-value');
+    expect(history).toContain('diff withheld: .env (credential or execution configuration)');
+    expect(history).toContain('+export const tracked = false');
+    expect(history).toContain('Subject: configure upstream');
   });
 
   test.skipIf(process.platform==='win32')('rejects repository config includes before Git can consume them',async()=>{

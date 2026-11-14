@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ALL_HOST_CONFIGS } from '../hosts';
 import { ALL_MODEL_NAMES } from '../scripts/models';
+import { RETIRED_SKILLS } from '../scripts/discover-skills';
 import { HOST_PATHS, type TemplateContext } from '../scripts/resolvers/types';
 import { outsideVoiceFor, outsideVoiceCommand } from '../scripts/resolvers/outside-voice';
 import { RESOLVERS } from '../scripts/resolvers';
@@ -81,7 +82,7 @@ describe('generated automatic review coverage', () => {
   for (const skill of skills) {
     test(`Codex /${skill} invokes Claude Code, including lazy sections`, () => {
       const host = ALL_HOST_CONFIGS.find(h => h.name === 'codex')!;
-      const text = readUnion(skillDir(host, skill));
+      const text = RETIRED_SKILLS.includes(skill) ? readFileSync(join(skillDir(host, 'autoplan'), `${skill}.md`), 'utf8') : readUnion(skillDir(host, skill));
       expect(text).toContain('gstack-claude-code');
       // Prose about the CLI is permitted; executable codex review commands are not.
       expect(shellLines(text).filter(line => /\bcodex\s+(?:exec|review)\b/.test(line))).toEqual([]);
@@ -121,8 +122,8 @@ test('automatic workflow templates delegate reviewer commands to shared resolver
   for (const skill of skills) {
     for (const file of templateFiles(join(ROOT, skill))) {
       for (const line of shellLines(readFileSync(file, 'utf8'))) {
-        // /spec's --execute worker implements the filed spec; it is not a reviewer.
-        if (file === join(ROOT, 'spec', 'sections', 'gate-and-file.md.tmpl') && line.trim() === 'cat "$ARCHIVE_PATH" | (cd "$SPAWN_PATH" && claude -p 2>&1) &') continue;
+        // /spec's --execute worker implements the filed spec (archive + coordinator contract on stdin); it is not a reviewer.
+        if (file === join(ROOT, 'spec', 'sections', 'gate-and-file.md.tmpl') && line.trim() === '{ cat "$ARCHIVE_PATH"; printf \'\\n\\n%s\\n\' "$CONTRACT"; } | (cd "$SPAWN_PATH" && GSTACK_SESSION_KIND=spawned claude -p 2>&1) &') continue;
         if (/\bcodex\s+(?:exec|review)\b|\bclaude\s+(?:-p|--print)\b|\bgstack-claude-code\s+--/.test(line)) {
           violations.push(`${file.slice(ROOT.length + 1)}: ${line.trim()}`);
         }

@@ -4,7 +4,7 @@ export function generateContextHealth(ctx?: TemplateContext): string {
   if (ctx?.explainLevel === 'terse') return '';
   return `## Context Health (soft directive)
 
-During long-running skill sessions, periodically write a brief \`[PROGRESS]\` summary: done, next, surprises.
+During long-running skill sessions, when you finish a phase or change direction, tell the user in a sentence or two what is done, what is next, and anything surprising.
 
 If you are looping on the same diagnostic, same file, or failed fix variants, STOP and reassess. Consider escalation or /context-save. Progress summaries must NEVER mutate git state.`;
 }
@@ -18,6 +18,6 @@ If you are looping on the same diagnostic, same file, or failed fix variants, ST
 //
 // Skills by tier:
 //   T1: browse, setup-cookies, benchmark
-//   T2: investigate, cso, retro, doc-release, setup-deploy, canary, checkpoint, health
+//   T2: cso, retro, doc-release, setup-deploy, canary, checkpoint, health
 //   T3: autoplan, codex, design-consult, office-hours, ceo/design/eng-review
 //   T4: ship, review, qa, qa-only, design-review, land-deploy

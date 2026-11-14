@@ -36,7 +36,7 @@ import {
   type OverlayFixture,
 } from '../test/fixtures/overlay-nudges';
 import { firstAssistantMessageToolCount } from './helpers/overlay-measurement';
-import { CLAUDE_FRONTIER_EVAL_MODEL } from '../lib/eval-model';
+import { CLAUDE_CAPTURE_EVAL_MODEL } from '../lib/eval-model';
 
 // ---------------------------------------------------------------------------
 // Stub SDK event builders
@@ -47,7 +47,7 @@ function uuid(): string {
   return `00000000-0000-0000-0000-${String(++uuidCounter).padStart(12, '0')}`;
 }
 
-function systemInit(model = CLAUDE_FRONTIER_EVAL_MODEL, version = '2.1.117'): SDKMessage {
+function systemInit(model = CLAUDE_CAPTURE_EVAL_MODEL, version = '2.1.117'): SDKMessage {
   return {
     type: 'system',
     subtype: 'init',
@@ -213,7 +213,7 @@ function makeStubProvider(config: StubConfig): QueryProvider {
 }
 
 const BASE_OPTS = {
-  systemPrompt: '',
+  systemPrompt: { type: 'sdk-default', reason: 'stub queryProvider: no model reads the prompt' } as const,
   userPrompt: 'test prompt',
   workingDirectory: '/tmp/test-dir',
   maxRetries: 3,
@@ -261,7 +261,7 @@ describe('runAgentSdkTest — happy path', () => {
     expect(result.turnsUsed).toBe(2);
     expect(result.costUsd).toBe(0.05);
     expect(result.sdkClaudeCodeVersion).toBe('2.1.117');
-    expect(result.model).toBe(CLAUDE_FRONTIER_EVAL_MODEL);
+    expect(result.model).toBe(CLAUDE_CAPTURE_EVAL_MODEL);
     expect(result.firstResponseMs).toBeGreaterThanOrEqual(0);
   });
 
@@ -416,7 +416,7 @@ describe('runAgentSdkTest — options propagation', () => {
       calls: [],
     };
     await runAgentSdkTest({
-      systemPrompt: 'you are a test overlay',
+      systemPrompt: { type: 'custom', text: 'you are a test overlay', reason: 'checks that custom text reaches query()' },
       userPrompt: 'go',
       workingDirectory: '/tmp/spec-dir',
       model: 'claude-opus-4-7',
@@ -451,7 +451,7 @@ describe('runAgentSdkTest — options propagation', () => {
     expect(opts.pathToClaudeCodeExecutable).toBe('/fake/path/claude');
   });
 
-  test('empty systemPrompt means no systemPrompt option passed', async () => {
+  test('an sdk-default systemPrompt passes no systemPrompt option', async () => {
     freshSem();
     const stub: StubConfig = {
       streams: [[systemInit(), assistantTurn([{ type: 'text', text: 'ok' }]), resultSuccess()]],
@@ -461,7 +461,6 @@ describe('runAgentSdkTest — options propagation', () => {
       ...BASE_OPTS,
       queryProvider: makeStubProvider(stub),
     });
-    // systemPrompt is undefined when empty string passed (so SDK uses no override)
     expect(stub.calls[0]!.options!.systemPrompt).toBeUndefined();
   });
 });
@@ -845,7 +844,7 @@ describe('toSkillTestResult', () => {
     expect(s.output).toBe('hi');
     expect(s.costEstimate.estimatedCost).toBe(0.02);
     expect(s.costEstimate.turnsUsed).toBe(1);
-    expect(s.model).toBe(CLAUDE_FRONTIER_EVAL_MODEL);
+    expect(s.model).toBe(CLAUDE_CAPTURE_EVAL_MODEL);
     expect(s.firstResponseMs).toBeNumber();
     expect(s.maxInterTurnMs).toBeNumber();
     expect(s.transcript).toBeArray();

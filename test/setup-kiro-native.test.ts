@@ -17,10 +17,11 @@ const fn = (name: string) => {
 const blockStart = setup.indexOf('# 6. Install for Kiro CLI');
 const block = setup.slice(blockStart, setup.indexOf('# 6b.', blockStart));
 const helpers = [
-  '_link_or_copy', '_sidecar_root_user_owned', '_claude_entry_is_ours',
+  '_link_or_copy', '_link_runtime_dists', '_copy_runtime_skill_refs', '_sidecar_root_user_owned', '_claude_entry_is_ours',
   '_claude_entry_owned_strongly', '_gstack_link_target_abs', '_gstack_target_is_ours',
   '_gstack_generated_header', '_backup_skill_md', '_prune_stale_generated',
   '_skill_source_exists', '_owned_for_windows_refresh', '_cleanup_weak_dir',
+  '_copy_skill_md', '_skill_copy_hash', '_skill_copy_unmodified', '_preserve_skill_copy_edits', '_record_skill_copies',
 ].map(fn).join('\n');
 
 describe.skipIf(process.platform === 'win32')('native Kiro setup installation', () => {
@@ -38,6 +39,7 @@ describe.skipIf(process.platform === 'win32')('native Kiro setup installation', 
           if (name !== 'gstack') put(path.join(root, name.replace(/^gstack-/, ''), 'SKILL.md.tmpl'), `name: ${name}`);
         }
         put(path.join(generated, 'gstack-autoplan/sections/ceo.md'), `${banner}\nKiro native phase`);
+        put(path.join(generated, 'gstack-autoplan/plan-eng-review.md'), `${banner}\nKiro Phase 3 methodology`);
         put(path.join(installed, 'gstack-autoplan/SKILL.md'), skill('gstack-autoplan', 'old Codex output'));
         put(path.join(installed, 'gstack-autoplan/sections/ceo.md'), `${banner}\nold Codex phase`);
         put(path.join(installed, 'gstack-autoplan/sections/notes.md'), 'user notes');
@@ -47,9 +49,11 @@ describe.skipIf(process.platform === 'win32')('native Kiro setup installation', 
         const log = path.join(tmp, 'bun.log');
         const result = runBashScript([
           'set -e', helpers, 'log() { :; }', '_browser_hint() { :; }',
+          '_setup_arm_begin() { :; }', '_setup_arm_publish() { :; }', '_setup_row() { :; }',
           'bun_cmd() { printf "%s\\n" "$*" >> "$BUN_LOG"; }',
           'INSTALL_KIRO=1', `IS_WINDOWS=${windowsCopy}`, 'BROWSE_BIN=unused',
           '_BACKED_UP_SKILL_MDS=()', '_SKILL_BACKUP_ROOT="$HOME/backups"',
+          'GSTACK_STATE_ROOT="$HOME/.gstack"', '_SKILL_COPIES_FILE="$GSTACK_STATE_ROOT/skill-copies.tsv"',
           'KIRO_SKILLS="$HOME/.kiro/skills"', block,
         ].join('\n'), {
           env: { ...process.env, HOME: home, SOURCE_GSTACK_DIR: root, BUN_LOG: log }, timeout: 30_000,
@@ -65,6 +69,7 @@ describe.skipIf(process.platform === 'win32')('native Kiro setup installation', 
         expect(fs.readFileSync(path.join(installed, 'gstack/office-hours/SKILL.md'), 'utf8')).toContain('kiro native');
         expect(fs.readFileSync(path.join(installed, 'gstack-autoplan/sections/ceo.md'), 'utf8')).toContain('Kiro native phase');
         expect(fs.readFileSync(path.join(installed, 'gstack-autoplan/sections/notes.md'), 'utf8')).toBe('user notes');
+        expect(fs.readFileSync(path.join(installed, 'gstack-autoplan/plan-eng-review.md'), 'utf8')).toContain('Kiro Phase 3 methodology');
         expect(fs.readFileSync(path.join(installed, 'gstack-review/SKILL.md'), 'utf8')).toBe('a foreign review skill');
         expect(fs.existsSync(path.join(installed, 'gstack/bin/tool'))).toBe(true);
         expect(fs.existsSync(path.join(installed, 'gstack/lib/helper.ts'))).toBe(true);

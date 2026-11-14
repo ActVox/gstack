@@ -13,7 +13,7 @@ import { startTestServer } from './test-server';
 import { BrowserManager, type BrowserState } from '../src/browser-manager';
 import { handleWriteCommand as _handleWriteCommand } from '../src/write-commands';
 import { handleMetaCommand } from '../src/meta-commands';
-import { spawnXvfb, pickFreeDisplay, isOurXvfb, type XvfbHandle } from '../src/xvfb';
+import { spawnFreeXvfb, isOurXvfb, type XvfbHandle } from '../src/xvfb';
 
 // Per-FILE Chromium profile: this file launches an in-process persistent
 // context (BrowserManager.launch()), and sharing a profile dir with the
@@ -210,9 +210,7 @@ const HEADED_BROKEN_ON_DARWIN = process.platform === 'darwin';
 
 describe('handoff integration', () => {
   test.skipIf(process.platform !== 'linux')('restore failure after candidate assignment leaves the original manager and pages usable', async () => {
-    const displayNum = pickFreeDisplay();
-    expect(displayNum).not.toBeNull();
-    const display = await spawnXvfb(displayNum!);
+    const display = await spawnFreeXvfb();
     const originalDisplay = process.env.DISPLAY;
     process.env.DISPLAY = display.display;
     const hbm = new BrowserManager();
@@ -331,10 +329,12 @@ describe.skipIf(process.platform !== 'linux')('lazy owned display lifecycle', ()
   let root: string;
   let hbm: BrowserManager;
   const displays = () => {
-    const result = Bun.spawnSync(['ps', '--ppid', String(process.pid), '-o', 'comm='], {
+    // A terminated Xvfb can linger as a zombie until this process reaps it; it is no display.
+    const result = Bun.spawnSync(['ps', '--ppid', String(process.pid), '-o', 'stat=,comm='], {
       stdout: 'pipe', stderr: 'pipe', timeout: 2000,
     });
-    return result.stdout.toString().split('\n').filter(line => line.trim() === 'Xvfb').length;
+    return result.stdout.toString().split('\n').map(line => line.trim().split(/\s+/))
+      .filter(([stat, comm]) => comm === 'Xvfb' && !stat?.startsWith('Z')).length;
   };
 
   beforeEach(async () => {

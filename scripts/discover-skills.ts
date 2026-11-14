@@ -4,6 +4,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import type { HostConfig } from './host-config';
 
@@ -21,6 +22,34 @@ export function isSkillGeneratedForHost(
 ): boolean {
   return (!generation.includeSkills?.length || generation.includeSkills.includes(skillDir))
     && !generation.skipSkills?.includes(skillDir);
+}
+
+/**
+ * Retired skills: no host registers them, and setup removes an earlier
+ * install's gstack-owned entry. plan-eng-review's source stays as /autoplan's
+ * eng-phase methodology (GST-1698); external hosts get it beside
+ * gstack-autoplan/SKILL.md as <name>.md, since Codex and Copilot register every
+ * nested SKILL.md. investigate was cut after a no-gain eval and its source is
+ * gone (GST-1717). setup and gstack-relink read the same list from
+ * GSTACK_RETIRED_SKILLS in bin/gstack-install-registry.sh.
+ */
+export const RETIRED_SKILLS = ['plan-eng-review', 'investigate'];
+
+/**
+ * The gstack-on-Capy skills (crew/README.md): registered only on a Capy
+ * machine, and kept off every host elsewhere like a retired skill. Same list
+ * as GSTACK_CREW_SKILLS in bin/gstack-install-registry.sh, and the same Capy
+ * test as its gstack_on_capy.
+ */
+export const CREW_SKILLS = ['captain'];
+
+export function onCapyMachine(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): boolean {
+  return Boolean(env.CAPY_MACHINE_CONFIG) || fs.existsSync(path.join(home, '.capy'));
+}
+
+/** What no host registers on this machine: the retired skills, plus the crew skills off Capy. */
+export function unregisteredSkills(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string[] {
+  return onCapyMachine(env, home) ? RETIRED_SKILLS : [...RETIRED_SKILLS, ...CREW_SKILLS];
 }
 
 /** The generator and its coverage checks use the same include-minus-skip rule. */

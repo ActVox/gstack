@@ -1,7 +1,9 @@
 /**
  * redact-engine — pure scanning + auto-redaction over the shared taxonomy.
  *
- * No I/O. Deterministic. The CLI shim (`bin/gstack-redact`), the pre-push hook
+ * No I/O. Deterministic given its one ambient input: `scan()` reads the
+ * credential-named variables of `process.env` by value unless `processEnv` is
+ * passed (GSTA-104). The CLI shim (`bin/gstack-redact`), the pre-push hook
  * (`bin/gstack-redact-prepush`), and tests all import from here.
  *
  * Key behaviors (locked in /plan-eng-review + two Codex passes):
@@ -15,7 +17,7 @@
  *     finding (drives sterner AUQ wording in the skill) but never promotes a
  *     MEDIUM to HIGH. (TENSION-2-followup.)
  *   - Placeholder suppression is per-matched-span.
- *   - Tool-attributed fences (``` ```codex-review ``` / ``` ```greptile ```)
+ *   - Tool-attributed fences (``` ```codex-review ``` / ``` ```review-bot ``` / ``` ```greptile ```)
  *     degrade credential findings to a non-blocking WARN — UNLESS the span is a
  *     live-format credential the doc-example heuristic can't excuse. No nonce,
  *     no trust exemption (the marker scheme was dropped as theater).
@@ -24,6 +26,7 @@
 import {
   PATTERNS,
   PATTERNS_BY_ID,
+  clearStringSpanCache,
   isPlaceholderSpan,
   type RedactPattern,
   type Tier,
@@ -69,6 +72,23 @@ export interface ScanOptions {
   repoPublicEmails?: string[];
   /** Hard byte cap. Oversize input fails CLOSED. Default 1 MiB. */
   maxBytes?: number;
+  /**
+   * Path of the file the input came from, when known (the pre-push hook's
+   * `+++ b/` path, `--from-file`). Lets a pattern tell source syntax from a
+   * literal: in a TypeScript/JSX file `session: SessionState,` is a type.
+   */
+  sourcePath?: string;
+  /**
+   * The environment whose credential-named variables (a name whose last
+   * `_`-separated word is KEY, TOKEN, SECRET, PASSWORD, PASSWD, PASS, PAT or
+   * APIKEY, or that ends in _PWD, any case, carrying no PUBLIC word; see
+   * `credentialEnvValues`) are scanned for BY VALUE: wherever one of those
+   * values appears in the text it is an `env.value` HIGH finding, whatever its
+   * shape, so a value that reached the text (a dumped environment in a tool
+   * output, GSTA-96) never reaches a PR body, receipt, report or Drive file.
+   * Defaults to `process.env`; pass `{}` to scan without one.
+   */
+  processEnv?: Record<string, string | undefined>;
 }
 
 export interface ScanResult {
@@ -204,7 +224,7 @@ export function maskPreview(span: string): string {
 
 // ── Tool-attributed fence detection ───────────────────────────────────────────
 
-const TOOL_FENCE_INFO = /^```(codex-review|greptile|eval|codex|tool-output)\b/;
+const TOOL_FENCE_INFO = /^```(codex-review|review-bot|greptile|eval|codex|tool-output)\b/;
 
 /**
  * Returns a sorted list of [start, end) offset ranges (in normalized text) that
@@ -399,7 +419,7 @@ function scanInternal(input: string, opts: ScanOptions, spans?: Map<Finding, Ori
       if (allow.has(span)) continue;
 
       // Pattern-specific validators (Luhn, entropy, RFC1918, etc).
-      if (pat.validate && !pat.validate(span, m)) continue;
+      if (pat.validate && !pat.validate(span, m, opts)) continue;
 
       // Proximity requirement.
       if (
@@ -453,6 +473,47 @@ function scanInternal(input: string, opts: ScanOptions, spans?: Map<Finding, Ori
       }
     }
   }
+  clearStringSpanCache();
+
+  // Environment values, by exact value: a credential that is already in the
+  // process environment needs no shape to be recognized.
+  for (const { name, value: raw } of credentialEnvValues(opts.processEnv ?? process.env)) {
+    // The text was normalized before matching; the value takes the same form,
+    // and the allowlist and placeholder rules see both forms.
+    const value = normalizeOriginal(raw).normalized;
+    if (allow.has(raw) || allow.has(value) || value.length < MIN_ENV_VALUE_LENGTH || isPlaceholderSpan(value)) continue;
+    let from = 0;
+    let normOffset: number;
+    while ((normOffset = normalized.indexOf(value, from)) !== -1) {
+      from = normOffset + value.length;
+      const origOffset = map[Math.min(normOffset, map.length - 1)] ?? 0;
+      // Keyed on the span, not the offset alone: when one credential's value is
+      // a prefix of another's, both findings exist and their spans coalesce.
+      const key = `env.value:${origOffset}:${value.length}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      starts ??= lineStarts(input);
+      const { line, col } = lineColAt(starts, input, origOffset);
+      const finding: Finding = {
+        id: "env.value",
+        tier: "HIGH",
+        severity: "HIGH",
+        category: "secret",
+        description: `Value of the ${name} environment variable`,
+        line,
+        col,
+        // A live credential: the name already says what leaked; show no bytes.
+        preview: "********",
+        autoRedactable: false,
+        repoVisibility,
+      };
+      findings.push(finding);
+      if (spans) {
+        const end = spanEnds?.[normOffset + value.length - 1];
+        if (end !== undefined && end > origOffset) spans.set(finding, { start: origOffset, end });
+      }
+    }
+  }
 
   // Stable order: by line, then col, then id.
   findings.sort((a, b) => a.line - b.line || a.col - b.col || a.id.localeCompare(b.id));
@@ -461,6 +522,41 @@ function scanInternal(input: string, opts: ScanOptions, spans?: Map<Finding, Ori
   for (const f of findings) counts[f.severity] += 1;
 
   return { findings, counts, repoVisibility, oversize: false };
+}
+
+const CREDENTIAL_ENV_NAME = /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PAT|APIKEY)$|_PWD$/i;
+/** Framework-public keys (NEXT_PUBLIC_*_KEY, VITE_PUBLIC_*, *_PUBLIC_KEY) are committed on purpose. */
+const PUBLIC_ENV_NAME = /(^|_)PUBLIC(_|$)/i;
+/** gstack's own credential-named variables whose values are not secrets (bin/gstack-brain-lock.sh sets the lock token). */
+export const NON_SECRET_ENV_NAMES: ReadonlySet<string> = new Set(["GSTACK_BRAIN_LOCK_TOKEN"]);
+const MIN_ENV_VALUE_LENGTH = 8;
+
+/**
+ * The (name, value) pairs of `env` worth scanning for by value: credential-named
+ * variables (the last `_`-separated word is KEY, TOKEN, SECRET, PASSWORD, PASSWD,
+ * PASS, PAT or APIKEY, or the name ends in _PWD; names carrying a PUBLIC word and
+ * gstack's own non-secret tokens are exempt) whose trimmed value is long enough to
+ * be a credential and is not a placeholder. A short or placeholder value would
+ * match ordinary prose. There is no path exemption on purpose: a shape rule
+ * exempted base64 secrets that start with `/`, and an existence check let the
+ * scanned agent exempt a value by creating a path of that name; a path-valued
+ * SSL_KEY that must appear in a text goes through `allowlist` where a caller
+ * passes one (`gstack-redact`, the pre-push hook), else the variable is set
+ * empty for that one command. The value is
+ * trimmed, so a key read from a file with a trailing newline still matches its
+ * leaked form; it is matched against the normalized text in its own normalized
+ * form, so a value NFKC rewrites still finds its leaked bytes.
+ */
+export function credentialEnvValues(env: Record<string, string | undefined>): Array<{ name: string; value: string }> {
+  const out: Array<{ name: string; value: string }> = [];
+  for (const [name, raw] of Object.entries(env)) {
+    if (!CREDENTIAL_ENV_NAME.test(name) || PUBLIC_ENV_NAME.test(name) || NON_SECRET_ENV_NAMES.has(name)) continue;
+    const value = raw?.trim() ?? "";
+    if (value.length < MIN_ENV_VALUE_LENGTH) continue;
+    if (isPlaceholderSpan(value)) continue;
+    out.push({ name, value });
+  }
+  return out;
 }
 
 function withFlags(flags: string): string {
@@ -547,6 +643,76 @@ const MARKER_ONLY_PATTERN_IDS = new Set(["pem.private_key", "gcp.service_account
  * structure-preserving path.)
  */
 export function redactFindingSpans(input: string, opts: ScanOptions = {}): string | null {
+  const merged = mergedFindingSpans(input, opts);
+  return merged && spliceEdits(input, merged.map((m) => ({ start: m.start, end: m.end, text: marker(m.ids) })));
+}
+
+/** One replacement on the original text: [start, end) becomes `text`. */
+export interface RedactionEdit {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/**
+ * redactFindingSpans for a stream declared as JSON (a scanner report: one
+ * document, several top-level values, or NDJSON), keeping it parseable. A span
+ * inside a string keeps the in-string marker, widened to whole escape
+ * sequences; a span inside a number replaces that whole number token with the
+ * quoted marker, so `{"max_memory_bytes":1145427776}` stays valid JSON
+ * (#3185). A span that touches more than one token, a structural character,
+ * whitespace, a literal or a string's quotes returns null (withhold). A
+ * stream that does not tokenize as JSON gets the plain splice. Returns the
+ * edits (sorted, disjoint, on the original offsets) so a caller can map
+ * interleaved runs onto the result.
+ */
+export function redactJsonFindingSpans(input: string, opts: ScanOptions = {}): { body: string; edits: RedactionEdit[] } | null {
+  const merged = mergedFindingSpans(input, opts);
+  if (!merged) return null;
+  const tokens = jsonTokens(input);
+  const spans: Array<{ start: number; end: number; ids: string[]; quote: boolean }> = [];
+  for (const m of merged) {
+    if (!tokens) {
+      spans.push({ ...m, quote: false });
+      continue;
+    }
+    let lo = 0, hi = tokens.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (tokens[mid].end <= m.start) lo = mid + 1; else hi = mid;
+    }
+    const t = tokens[lo];
+    if (!t || t.start > m.start || t.end < m.end) return null;
+    let span: { start: number; end: number; quote: boolean };
+    if (t.kind === "number") span = { start: t.start, end: t.end, quote: true };
+    else if (t.kind === "string" && m.start > t.start && m.end < t.end) {
+      span = { start: m.start, end: m.end, quote: false };
+      for (const [s, e] of t.escapes) {
+        if (s < span.start && span.start < e) span.start = s;
+        if (s < span.end && span.end < e) span.end = e;
+      }
+    } else return null;
+    const last = spans[spans.length - 1];
+    if (last && span.start < last.end) {
+      last.end = Math.max(last.end, span.end);
+      for (const id of m.ids) if (!last.ids.includes(id)) last.ids.push(id);
+    } else spans.push({ ...span, ids: [...m.ids] });
+  }
+  const edits = spans.map((x) => ({ start: x.start, end: x.end, text: x.quote ? `"${marker(x.ids)}"` : marker(x.ids) }));
+  return { body: spliceEdits(input, edits), edits };
+}
+
+const marker = (ids: string[]) => `<REDACTED-${ids.join("+")}>`;
+
+function spliceEdits(input: string, edits: RedactionEdit[]): string {
+  // Right-to-left so earlier offsets remain valid after splicing.
+  let body = input;
+  for (let i = edits.length - 1; i >= 0; i--) body = body.slice(0, edits[i].start) + edits[i].text + body.slice(edits[i].end);
+  return body;
+}
+
+/** Every finding's span, coalesced; null when one cannot be located or is marker-only. */
+function mergedFindingSpans(input: string, opts: ScanOptions): Array<{ start: number; end: number; ids: string[] }> | null {
   const spans = new Map<Finding, OriginalSpan>();
   const { findings } = scanInternal(input, opts, spans);
   if (findings.some((f) => MARKER_ONLY_PATTERN_IDS.has(f.id))) return null;
@@ -567,14 +733,49 @@ export function redactFindingSpans(input: string, opts: ScanOptions = {}): strin
       merged.push({ start: t.start, end: t.end, ids: [t.f.id] });
     }
   }
+  return merged;
+}
 
-  // Right-to-left so earlier offsets remain valid after splicing.
-  let body = input;
-  for (let i = merged.length - 1; i >= 0; i--) {
-    const m = merged[i];
-    body = body.slice(0, m.start) + `<REDACTED-${m.ids.join("+")}>` + body.slice(m.end);
+type JsonToken = { kind: "string" | "number" | "other"; start: number; end: number; escapes: Array<[number, number]> };
+const JSON_NUMBER = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+const JSON_LITERAL = /true|false|null/y;
+
+/** Lexical JSON tokens of one or more top-level values (NDJSON included); null when the text is not JSON. */
+function jsonTokens(text: string): JsonToken[] | null {
+  const tokens: JsonToken[] = [];
+  for (let i = 0; i < text.length;) {
+    const c = text[i];
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") { i++; continue; }
+    if ("{}[]:,".includes(c)) { tokens.push({ kind: "other", start: i, end: i + 1, escapes: [] }); i++; continue; }
+    if (c === '"') {
+      const escapes: Array<[number, number]> = [];
+      let j = i + 1;
+      for (;;) {
+        if (j >= text.length) return null;
+        if (text[j] === '"') break;
+        if (text[j] === "\\") {
+          const end = j + (text[j + 1] === "u" ? 6 : 2);
+          if (end > text.length) return null;
+          escapes.push([j, end]);
+          j = end;
+        } else j++;
+      }
+      tokens.push({ kind: "string", start: i, end: j + 1, escapes });
+      i = j + 1;
+      continue;
+    }
+    let matched = false;
+    for (const [kind, pattern] of [["number", JSON_NUMBER], ["other", JSON_LITERAL]] as const) {
+      pattern.lastIndex = i;
+      if (!pattern.test(text)) continue;
+      tokens.push({ kind, start: i, end: pattern.lastIndex, escapes: [] });
+      i = pattern.lastIndex;
+      matched = true;
+      break;
+    }
+    if (!matched) return null;
   }
-  return body;
+  return tokens;
 }
 
 function inStructuralToken(body: string, start: number, end: number): boolean {

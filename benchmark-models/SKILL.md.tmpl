@@ -4,7 +4,8 @@ preamble-tier: 1
 version: 1.0.0
 description: |
   Cross-model benchmark for gstack skills. Runs the same prompt through Claude,
-  GPT (via Codex CLI), and Gemini side-by-side — compares latency, tokens, cost,
+  GPT (via Codex CLI), Gemini, and (through OpenRouter in Claude Code) particle-1
+  and DeepSeek V4.1 Flash side-by-side — compares latency, tokens, cost,
   and optionally quality via LLM judge. Answers "which model is actually best
   for this skill?" with data instead of vibes. Separate from /benchmark, which
   measures web page performance. Use when: "benchmark models", "compare models",
@@ -37,7 +38,7 @@ Different from `/benchmark` — that skill measures web page performance (Core W
 ## Step 0: Locate the binary
 
 ```bash
-BIN="$HOME/.claude/skills/gstack/bin/gstack-model-benchmark"
+BIN="{{RUNTIME_ROOT}}/bin/gstack-model-benchmark"
 [ -x "$BIN" ] || BIN=".claude/skills/gstack/bin/gstack-model-benchmark"
 [ -x "$BIN" ] || { echo "ERROR: gstack-model-benchmark not found. Run ./setup in the gstack install dir." >&2; exit 1; }
 echo "BIN: $BIN"
@@ -60,7 +61,9 @@ Use AskUserQuestion with the preamble format:
 
 If A: list top-level gstack skills that have SKILL.md files (from `find . -maxdepth 2 -name SKILL.md -not -path './.*'`), ask the user to pick one via a second AskUserQuestion. Use the picked SKILL.md path as the prompt file.
 
-If B: ask the user for the inline prompt. Use it verbatim via `--prompt "<text>"`.
+If B: ask the user for the inline prompt. It never goes into a shell command: create a prompt file and write the prompt into it verbatim, then use the printed path as the prompt file.
+
+{{FREE_TEXT_FILE:PROMPT_FILE=benchmark-prompt}}
 
 If C: ask for the path. Verify it exists. Use as positional argument.
 
@@ -69,12 +72,14 @@ If C: ask for the path. Verify it exists. Use as positional argument.
 ## Step 2: Choose providers
 
 ```bash
-"$BIN" --prompt "unused, dry-run" --models claude,gpt,gemini --dry-run
+"$BIN" --prompt "unused, dry-run" --models claude,gpt,gemini,particle,deepseek --dry-run
 ```
 
 Show the dry-run output. The "Adapter availability" section tells the user which providers will actually run (OK) vs skip (NOT READY — remediation hint included).
 
-If ALL three show NOT READY: stop with a clear message — benchmark can't run without at least one authed provider. Suggest `claude login`, `codex login`, or `gemini login` / `export GOOGLE_API_KEY`.
+If every provider shows NOT READY: stop with a clear message — benchmark can't run without at least one authed provider. Suggest `claude login`, `codex login`, `gemini login` / `export GOOGLE_API_KEY`, or `export OPENROUTER_API_KEY` for particle and deepseek (they run in Claude Code, so they also need the `claude` CLI).
+
+particle and deepseek send the prompt and the working directory's files the model reads to OpenRouter and the model vendor. They load no Claude Code settings files (so a key in a settings.json `env` block is never sent) and run with the user's environment minus Anthropic credentials. Say so before including them.
 
 If at least one is OK: AskUserQuestion:
 - **Simplify:** "Which models should we include? The dry-run above showed which are authed. Unauthed ones will be skipped cleanly — they won't abort the batch."
@@ -108,10 +113,12 @@ If judge is NOT available, skip this question and omit the `--judge` flag.
 Construct the command from Step 1, 2, 3 decisions:
 
 ```bash
-"$BIN" <prompt-spec> --models <picked-models> [--judge] --output table
+PROMPT_PATH="<prompt-path>"
+[ -s "$PROMPT_PATH" ] || { echo "ERROR: $PROMPT_PATH is missing or empty; the benchmark needs a prompt file." >&2; exit 1; }
+"$BIN" --models <picked-models> [--judge] --output table -- "$PROMPT_PATH"
 ```
 
-Where `<prompt-spec>` is either `--prompt "<text>"` (Step 1B), a file path (Step 1A or 1C), and `<picked-models>` is the comma-separated list from Step 2.
+`<prompt-path>` is the prompt file from Step 1 (the SKILL.md path, the printed prompt file, or the user's path) and `<picked-models>` is the comma-separated list from Step 2. Use a path only if it has no `'`, `"`, backtick, `$` or `\`; otherwise copy the file into a new Step 1B prompt file and use that.
 
 Stream the output as it arrives. This is slow — each provider runs the prompt fully. Expect 30s-5min depending on prompt complexity and whether `--judge` is on.
 

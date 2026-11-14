@@ -71,7 +71,14 @@ and current state. **If `state == "CLOSED"`: STOP**, the PR closed without mergi
 Only START makes the first attempt. Immediately before either merge command, repeat
 readback and Step 1's local HEAD/branch/cleanliness check. Retargeting or local changes
 invalidate readiness; `--match-head-commit` protects head, not destination.
+Each merge block re-runs the CI gate with Step 3.5's approvals (also for `--auto`,
+which waits on required checks only). A gate exit means no merge ran: **STOP** with
+its output. Only branch protection or a merge queue makes check-to-merge
+atomic.
 ```bash
+CI_GATE=$(~/.claude/skills/gstack/bin/gstack-ci-gate --repo "$REPO" --pr "$PR_NUMBER" --expect-head "$PR_HEAD" "${CI_OVERRIDE[@]}")
+echo "$CI_GATE"
+case "${CI_GATE%%$'\n'*}" in "VERDICT PASS $PR_HEAD"|"VERDICT NO_CHECKS $NO_CI_APPROVED_HEAD") ;; *) exit 1 ;; esac
 MERGE_ATTEMPT=auto
 MERGE_EXIT=0
 MERGE_ERROR=$(gh pr merge "$MERGE_FLAG" --auto --delete-branch "$PR_NUMBER" --repo "$REPO" --match-head-commit "$PR_HEAD" 2>&1) || MERGE_EXIT=$?
@@ -80,9 +87,11 @@ Return to readback, even on exit 0. Only DIRECT permits **one direct fallback**:
 readback has confirmed OPEN, no auto request and no queue entry, and the auto attempt
 returned one of the two documented rejection classes: auto-merge disabled, or PR
 already clean/unstable with nothing required pending. The latter does not mean
-auto-merge is disabled. Recheck required CI as in Step 2 before the fallback; failures
-or unknown check results stop, even if GitHub calls the PR mergeable.
+auto-merge is disabled.
 ```bash
+CI_GATE=$(~/.claude/skills/gstack/bin/gstack-ci-gate --repo "$REPO" --pr "$PR_NUMBER" --expect-head "$PR_HEAD" "${CI_OVERRIDE[@]}")
+echo "$CI_GATE"
+case "${CI_GATE%%$'\n'*}" in "VERDICT PASS $PR_HEAD"|"VERDICT NO_CHECKS $NO_CI_APPROVED_HEAD") ;; *) exit 1 ;; esac
 MERGE_ATTEMPT=direct
 MERGE_EXIT=0
 MERGE_ERROR=$(gh pr merge "$MERGE_FLAG" --delete-branch "$PR_NUMBER" --repo "$REPO" --match-head-commit "$PR_HEAD" 2>&1) || MERGE_EXIT=$?
@@ -107,7 +116,7 @@ Squash/rebase merge readback guard:
 git fetch "https://github.com/$REPO.git" "$BASE_BRANCH"
 git diff --quiet "$MERGE_SHA" FETCH_HEAD || git log --oneline --decorate -1 "$MERGE_SHA" FETCH_HEAD
 ```
-- If the worktree is clean and only needs to stop looking diverged after a squash merge, prefer a named local branch at the merge commit, for example `git switch -c "codex/post-merge-pr-$PR_NUMBER" "$MERGE_SHA"`. Avoid detached HEAD in Codex Desktop worktrees because git action workers often expect `git symbolic-ref --short HEAD` to return a branch. Do not force-push or reset a user's branch unless they explicitly ask.
+- If the worktree is clean and only needs to stop looking diverged after a squash merge, prefer a named local branch at the merge commit over a detached HEAD, for example `git switch -c "post-merge/pr-$PR_NUMBER" "$MERGE_SHA"` (use the host's branch prefix where it has one, such as `codex/` in Codex Desktop, whose git action workers expect `git symbolic-ref --short HEAD` to return a branch). Do not force-push or reset a user's branch unless they explicitly ask.
 
 Worktree cleanup — non-destructive, candidate-based:
 ```bash
@@ -123,24 +132,24 @@ Remote-branch reconciliation: `--delete-branch` may not have completed. Verify t
 branch outcome instead of claiming cleanup from a merge exit code:
 
 ```bash
-# NB: gh leaves .headRepository.nameWithOwner EMPTY (verified against gh
-# 2.83); compose owner/name from headRepositoryOwner.login + headRepository.name.
-gh pr view "$PR_NUMBER" --repo "$REPO" --json headRepositoryOwner,headRepository,headRefName \
-  --jq '"\(.headRepositoryOwner.login)/\(.headRepository.name)\t\(.headRefName)"'
-git ls-remote --heads "https://github.com/<head-repository>.git" "<head-branch>"
+# gh leaves .headRepository.nameWithOwner EMPTY (gh 2.83): compose owner/name
+# from headRepositoryOwner.login + headRepository.name.
+IFS=$'\t' read -r HEAD_REPO HEAD_BRANCH <<< "$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRepositoryOwner,headRepository,headRefName \
+  --jq '"\(.headRepositoryOwner.login)/\(.headRepository.name)\t\(.headRefName)"')"
+case "$HEAD_REPO" in ''|/*|*/) HEAD_BRANCH= ;; esac
+[ -n "$HEAD_BRANCH" ] && echo "HEAD: $HEAD_REPO $HEAD_BRANCH" && git ls-remote --heads "https://github.com/$HEAD_REPO.git" "refs/heads/$HEAD_BRANCH"
 ```
 
-Record the first field as `<head-repository>` (`owner/name`) and the second as
-`<head-branch>`, then substitute both into `git ls-remote`. The PR head repository is
-the authoritative branch location: for same-repository PRs it is the base repository;
-for fork PRs it is the fork. Do not substitute the checkout's `origin`. If the metadata
-lookup fails or either field is empty or contains a bare `/`, treat the branch state as
-unknown and do not run the deletion path.
+The names are PR data: keep them in these variables, never retyped. The PR head
+repository is the authoritative branch location: for same-repository PRs it is the
+base repository; for fork PRs it is the fork. Do not substitute the checkout's
+`origin`. No `HEAD:` line means the lookup failed: treat the branch state as unknown
+and do not run the deletion path.
 
 Three outcomes — never read a failed check as a clean branch:
 
 - **Exit 0, empty output** — the remote branch is already gone (GitHub's post-merge deletion or a concurrent actor got there). Tell the user: "The remote branch has already been cleaned up." This makes re-runs of the recovery idempotent.
-- **Exit 0, one ref line** — the branch survived: the failed merge command never reached its `--delete-branch` half. If `<head-repository>` is the BASE repository, OFFER deletion, confirm-first (matching the worktree-cleanup posture above): "The remote branch `<head-branch>` still exists in `<head-repository>` — the failed merge never ran its --delete-branch half. Delete it?" Only on confirmation: `git push "https://github.com/<head-repository>.git" --delete "<head-branch>"`. If `<head-repository>` is a FORK, do not offer deletion — the branch belongs to the contributor and the maintainer typically has no push rights there; report instead: "The branch lives on the contributor's fork `<head-repository>` — leaving it to them." If a local branch of the same name exists, offer `git branch -d "<head-branch>"` alongside (`-d`, never `-D` — a non-fast-forwarded local branch is the user's call).
+- **Exit 0, one ref line** — the branch survived: the failed merge command never reached its `--delete-branch` half. If `HEAD_REPO` equals `REPO`, OFFER deletion, confirm-first (matching the worktree-cleanup posture above): "The remote branch `<head-branch>` still exists in `<head-repository>` — the failed merge never ran its --delete-branch half. Delete it?" Only on confirmation, rerun the block's first three lines, then `git push "https://github.com/$HEAD_REPO.git" --delete "refs/heads/$HEAD_BRANCH"`. If `HEAD_REPO` is a FORK, do not offer deletion — the branch belongs to the contributor and the maintainer typically has no push rights there; report instead: "The branch lives on the contributor's fork `<head-repository>` — leaving it to them." If a local branch of the same name exists, offer `git branch -d "$HEAD_BRANCH"` alongside (`-d`, never `-D` — a non-fast-forwarded local branch is the user's call).
 - **Non-zero exit** — the check ITSELF failed (network, auth). Tell the user: "Couldn't verify remote branch state — leaving it alone." and skip the deletion offer entirely; a failed check is unknown state, not a clean branch.
 
 Record the actual path (`auto`, `direct`, `queue`, or `external` when already merged
@@ -153,7 +162,7 @@ merge queue is in use. Explain which is observed; an auto request alone does not
 prove a queue. A queue reruns CI against the proposed merge. Record `MERGE_PATH=queue`
 only when `mergeQueueEntry` was observed, otherwise `auto`.
 
-Set `WAITED=true`. Repeat the readback every 30 seconds, up to 30 minutes; report progress every 2 minutes.
+Set `WAITED=true`. Repeat the readback every 60 seconds, up to 30 minutes; report progress every 2 minutes.
 While OPEN with an active auto request **or** queue entry, keep waiting. Once waiting
 has begun, never dispatch START or DIRECT: OPEN with confirmed absence of **both**
 means removal/cancellation, so **STOP** and point to GitHub's checks/queue page.
@@ -194,14 +203,18 @@ Select the production route below, then complete Step 5a **before executing that
 route**. The docs-only no-deploy route can finish immediately; it needs no staging offer.
 
 1. Matching deploy run/platform release: monitor it in Step 6, even for docs-only
-   (it may be a docs site). A configured trigger whose run has not appeared remains
-   pending; poll for the matching revision within Step 6's deadline, not another run.
-2. Explicit `VERIFY_URL`: run Step 7 even for docs-only. Without deployment-revision
+   (it may be a docs site). A configured workflow or platform trigger whose run has not
+   appeared remains pending; poll for the matching revision within Step 6's deadline, not another run.
+2. Recorded command trigger (Deploy Configuration records a command as the deploy
+   trigger): nothing deploys until it runs. Tell the user production has not moved yet,
+   name the command, and ask them to run it, or run it yourself only with their explicit
+   approval. Then poll Step 6 status for `MERGE_SHA`; a zero exit is not revision proof.
+3. Explicit `VERIFY_URL`: run Step 7 even for docs-only. Without deployment-revision
    evidence, report site health separately from whether this change is live.
-3. `DOCS_ONLY=true`, no explicit URL, and no triggered/expected deployment: record
+4. `DOCS_ONLY=true`, no explicit URL, and no triggered/expected deployment: record
    SKIPPED (docs-only), then Step 9 with MERGED — NO DEPLOY NEEDED. Unknown deployment
    detection is not proof that nothing was triggered; use the question below instead.
-4. Otherwise use configured production URL/status checks in Steps 6-7. If neither
+5. Otherwise use configured production URL/status checks in Steps 6-7. If neither
    a usable URL nor deploy status exists, ask once. Also ask when Step 6 finishes
    without a production URL needed for canary:
    - **Re-ground:** "PR #NNN is merged. {Known deploy state}. I need a URL to check

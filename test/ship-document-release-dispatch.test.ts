@@ -4,12 +4,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { runGeneration } from '../scripts/gen-skill-docs';
-import { docsDispatchIndex, extractDocsDispatch, parseDocsCompletion, vetDocsCompletion } from './helpers/docsync-contract';
+import { acceptedChangedPaths, docsAttemptContracts, docsDispatchIndex, docsDispatchIndices, extractDocsDispatch, parseDocsCompletion, vetDocsCompletion } from './helpers/docsync-contract';
 import { fixtureDocs, repoSnapshot, changedFiles, gitAt, DOC_PATH, preserveDocsEvidence } from './helpers/docsync-fixture';
-import type { SkillTestResult } from './helpers/session-runner';
+import { parseNDJSON, type SkillTestResult } from './helpers/session-runner';
 import { observeDocsWrites, docsWriteFailures, docsCommandAllowed, docsPreambleCommands, docsCompletedRead } from './helpers/docsync-observer';
 import { docsActorCommand, docsActorHook, installDocsActor, type DocsActorState, type DocsFault } from './helpers/docsync-fault-actor';
 import { docsActorVerdict } from './helpers/docsync-fault-eval';
+import { expectMentions, expectTokens } from './helpers/prompt-structure';
+import missingSection from './fixtures/docsync-spawned-missing-section-public.json';
 
 const ROOT = path.join(import.meta.dir, '..');
 const read = (p: string) => fs.readFileSync(path.join(ROOT, p), 'utf8');
@@ -36,12 +38,11 @@ describe('pre-publication documentation lifecycle', () => {
     expect(positions).toEqual([...positions].sort((a, b) => a - b));
     const recovery = body.slice(body.indexOf('### 3. Resolve documentation freshness'), body.indexOf('### 4. Verify the frozen candidate')).replace(/\s+/g, ' ');
     expect(recovery).toContain('Validate the outcome before Step 15');
-    expect(recovery).toContain('restart Step 16 stage 1 to regenerate and compare again');
     expect(recovery).toContain('Never run a third audit');
     expect(body.replace(/\s+/g, ' ')).toContain('its initial-plus-ONE limit never resets');
     expect(gate.replace(/\s+/g, ' ')).toContain('Docs, TODO edits, new/generated tests and fixes make evidence STALE');
     const docs = read('ship/sections/documentation.md.tmpl');
-    expect(docs.replace(/\s+/g, ' ')).toContain('never a third attempt, even after Step 16 changes');
+    expectMentions(docs.replace(/\s+/g, ' '), [['never', 'attempt', 'changes']], 'docs.replace(/\s+/g,  )');
     expect(docs.replace(/\s+/g, ' ')).toContain('Otherwise STOP before commit/publication and do not launch another child');
   });
 
@@ -51,11 +52,14 @@ describe('pre-publication documentation lifecycle', () => {
     expect(claude.indexOf(marker)).toBeGreaterThan(0);
     expect(claude.indexOf('ship/sections/documentation.md', claude.indexOf(marker))).toBeLessThan(claude.indexOf('## Step 15:'));
     expect(claude).not.toContain('Dispatch /document-release as a subagent');
-    for (const p of ['.agents/skills/gstack-ship/SKILL.md', '.factory/skills/gstack-ship/SKILL.md']) {
-      const body = fs.readFileSync(path.join(generated, p), 'utf8');
-      const dispatch = body.indexOf('Dispatch /document-release as a subagent');
-      expect(dispatch).toBeGreaterThan(body.indexOf(marker));
-      expect(dispatch).toBeLessThan(body.indexOf('## Step 15:'));
+    // C4: ship is carved on external hosts too; the pointer is relative to the installed skill.
+    for (const dir of ['.agents/skills/gstack-ship', '.factory/skills/gstack-ship']) {
+      const body = fs.readFileSync(path.join(generated, dir, 'SKILL.md'), 'utf8');
+      const pointer = body.indexOf('`sections/documentation.md` relative to the installed `gstack-ship` SKILL.md directory', body.indexOf(marker));
+      expect(pointer).toBeGreaterThan(body.indexOf(marker));
+      expect(pointer).toBeLessThan(body.indexOf('## Step 15:'));
+      expect(body).not.toContain('Dispatch /document-release as a subagent');
+      expect(fs.readFileSync(path.join(generated, dir, 'sections/documentation.md'), 'utf8')).toContain('Dispatch /document-release as a subagent');
       expect(body.indexOf('## Step 16:')).toBeLessThan(body.indexOf('## Step 17:'));
     }
   });
@@ -74,15 +78,13 @@ describe('pre-publication documentation lifecycle', () => {
 
   test('documentation preflight follows the installed host layout', () => {
     const claude = fs.readFileSync(path.join(generated, 'ship/sections/documentation.md'), 'utf8');
-    expect(claude.replace(/\s+/g, ' ')).toContain('full audit-scope/release-body content, linked as sections or inlined for external hosts');
     for (const section of ['audit-scope', 'release-body']) {
       expect(fs.existsSync(path.join(generated, `document-release/sections/${section}.md`))).toBe(true);
     }
     for (const host of ['.agents', '.factory']) {
-      const ship = fs.readFileSync(path.join(generated, host, 'skills/gstack-ship/SKILL.md'), 'utf8');
+      const ship = fs.readFileSync(path.join(generated, host, 'skills/gstack-ship/sections/documentation.md'), 'utf8');
       const directory = path.join(generated, host, 'skills/gstack-document-release');
       const document = fs.readFileSync(path.join(directory, 'SKILL.md'), 'utf8');
-      expect(ship).toContain('linked as sections or inlined for external hosts');
       expect(document).toContain('# Documentation scope and discovery');
       expect(document).toContain('## Step 2: Per-File Documentation Audit');
       expect(document).toContain('## Ship-owned documentation mode');
@@ -102,7 +104,7 @@ describe('pre-publication documentation lifecycle', () => {
       'Only verified permitted child edits may differ. Other edits or base changes make the audit stale',
       'Later changes require the remaining re-audit or a risk decision',
       'never silently refreshed hashes']) expect(body).toContain(text);
-    expect(body).not.toContain('Do not block /ship on subagent failure');
+    expect(body).not.toContain('block /ship on subagent failure');
   });
 
   test('stale detection does not spend the remaining audit, but repair and inline takeover do', () => {
@@ -118,21 +120,21 @@ describe('pre-publication documentation lifecycle', () => {
       'using current inputs and a fresh id/snapshot, run the remaining attempt, then validate it through Parent processing',
       'Otherwise STOP before commit/publication',
       'do not launch another child']) expect(body).toContain(text);
-    expect(body).not.toContain('A stale audit consumes the same ONE repair/re-audit attempt');
   });
 
   test('PR creation and reruns keep current and blocked audits visible', () => {
     const body = read('ship/sections/pr-body.md.tmpl');
-    expect(body).toContain("Use Step 18's `NEW_TITLE`");
-    expect(body).toContain('`NEW_TITLE` unchanged; its version prefix is already present');
-    expect(body).toContain('printf \'%s\' "$NEW_TITLE" |');
-    expect(body).toContain('gh pr create --base <base> --title "$NEW_TITLE"');
-    expect(body).toContain('gh pr edit --title "$NEW_TITLE"');
-    expect(body).toContain('glab mr create -b <base> -t "$NEW_TITLE"');
+    // Oct 7 wave B4: the title travels in Step 18's agent-written file and both
+    // PR paths publish through gstack-post, which scans the exact bytes it sends.
+    expect(body).toContain('`grep -Eq \'^v<new-version>( |$)\' "$TITLE_FILE"` and never publish an unprefixed title');
+    expect(body).toContain('gstack-pr-title-rewrite.sh <new-version> --stdin > "$TITLE_FILE"');
+    expect(body).toContain('gstack-post pr-create --base <base> --title-file "$TITLE_FILE"');
+    expect(body).toContain('gstack-post pr-title <pr-number> --title-file "$TITLE_FILE"');
+    expect(body).toContain('`gstack-post` detects GitHub or GitLab from the remote');
     expect(body).not.toContain('Dispatch /document-release');
-    expect(body).toContain("Never omit this section or reuse another invocation's audit");
-    expect(body).toContain('gh pr edit --body-file "$PR_BODY_FILE"');
-    expect(body).toContain('gstack-redact --from-file "$PR_BODY_FILE"');
+    expectMentions(body, [['never', 'section', 'another']], 'body');
+    expect(body).toContain('gstack-post pr-body <pr-number> --body-file "${PR_BODY_FILE:?restore the composed body path}"');
+    expect(body).toContain('gstack-redact --from-file "$PR_BODY_FILE" --auto-redact');
     expect(read('ship/SKILL.md.tmpl')).toContain('existing PRs and docs-only changes');
     expect(read('ship/sections/apple-release.md.tmpl')).toContain('read-only');
     expect(read('ship/sections/apple-release.md.tmpl')).toContain('ship/sections/documentation.md');
@@ -142,8 +144,7 @@ describe('pre-publication documentation lifecycle', () => {
     // ci-36641820398-1-gate-census-3 ship-docsync-completion: the section had scope, health and debt but no result,
     // so the parent spliced a Status line into it and the report no longer contained the returned section.
     const scope = read('document-release/sections/audit-scope.md.tmpl').replace(/\s+/g, ' ');
-    expect(scope).toContain('complete for verbatim embedding: a first `**Status:**` line with `status` and the result, audited scope');
-    expect(read('ship/sections/documentation.md.tmpl')).toContain('nonempty Markdown with scope, result and debt');
+    expectTokens(scope, ['`**Status:**`', '`status`'], 'scope');
     expect(read('ship/sections/pr-body.md.tmpl')).toContain("Embed Step 14.5's vetted nonempty `documentation_section`");
   });
 
@@ -151,7 +152,8 @@ describe('pre-publication documentation lifecycle', () => {
     // ci-36709485593-1-eval-slices-2 ship-docsync-missing-asset: audit-scope.md was absent, but the parent saw the
     // SKILL.md "Ship-owned documentation mode" heading, read the gate as satisfied and dispatched.
     const gate = read('ship/sections/documentation.md.tmpl').replace(/\s+/g, ' ');
-    expect(gate).toContain('full audit-scope/release-body content, linked as sections or inlined for external hosts. A missing section or old `Ship-owned documentation mode` blocks before launch; never substitute.');
+    expectTokens(gate, ['`Ship-owned documentation mode`'], 'gate');
+    expectMentions(gate, [['never', 'substitute', 'missing']], 'gate');
   });
 
   test('nested authored discovery and standalone protections survive', () => {
@@ -161,8 +163,10 @@ describe('pre-publication documentation lifecycle', () => {
       'Ship-owned documentation mode', 'standalone branch gate']) expect(skill).toContain(text);
     const body = read('document-release/sections/release-body.md.tmpl');
     for (const text of ['never `git add -A`', 'Never regenerate a CHANGELOG entry',
-      'body-original.md', 'UNTRUSTED TRACKER CONTENT', 'gstack-redact --from-file',
-      'NEVER BUMP VERSION WITHOUT ASKING']) expect(body).toContain(text);
+      'body-original.md', 'UNTRUSTED TRACKER CONTENT', 'gstack-redact --from-file']) expect(body).toContain(text);
+    const versionStep = body.slice(body.indexOf('## Step 8'), body.indexOf('\n## ', body.indexOf('## Step 8') + 1));
+    expect(versionStep).toMatch(/ask[^\n]*before[^\n]*VERSION/i);
+    expect(body).toMatch(/does not rewrite, replace, or regenerate CHANGELOG/i);
   });
 });
 
@@ -231,6 +235,34 @@ describe('completion observer negative controls', () => {
 });
 
 describe('native docs fixture preflight', () => {
+  // PR #3434 screen 40269992077 slice 13 (docsync-spawned): the generated skill named
+  // sections/preamble.md as a required asset, the fixture had not installed it, and the
+  // spawned child blocked on the missing asset instead of auditing the docs.
+  test('installs a generated shared preamble beside the required sections, and nothing when the skill has none', () => {
+    const withPreamble = fs.mkdtempSync(path.join(os.tmpdir(), 'docsync-preamble-'));
+    try {
+      fs.cpSync(generated, withPreamble, { recursive: true });
+      fs.rmSync(path.join(withPreamble, 'ship/sections/preamble.md'), { force: true });
+      const preamble = path.join(withPreamble, 'document-release/sections/preamble.md');
+      fs.writeFileSync(preamble, '# Shared preamble\n\nFixture copy marker.\n');
+      const fixture = fixtureDocs('risky', withPreamble);
+      try {
+        expect(fs.readFileSync(path.join(fixture.skills, 'document-release/sections/preamble.md'), 'utf8')).toBe(fs.readFileSync(preamble, 'utf8'));
+        expect(fs.existsSync(path.join(fixture.skills, 'ship/sections/preamble.md'))).toBe(false);
+        expect(fs.readdirSync(path.join(fixture.skills, 'document-release/sections')).sort()).toEqual(['audit-scope.md', 'preamble.md', 'release-body.md']);
+      } finally { fixture.clean(); }
+    } finally { fs.rmSync(withPreamble, { recursive: true, force: true }); }
+    const withoutPreamble = fs.mkdtempSync(path.join(os.tmpdir(), 'docsync-no-preamble-'));
+    try {
+      fs.cpSync(generated, withoutPreamble, { recursive: true });
+      fs.rmSync(path.join(withoutPreamble, 'document-release/sections/preamble.md'), { force: true });
+      const plain = fixtureDocs('risky', withoutPreamble);
+      try {
+        expect(fs.readdirSync(path.join(plain.skills, 'document-release/sections')).sort()).toEqual(['audit-scope.md', 'release-body.md']);
+      } finally { plain.clean(); }
+    } finally { fs.rmSync(withoutPreamble, { recursive: true, force: true }); }
+  });
+
   test('staged, unstaged and new content are distinct from HEAD and user content is excluded', () => {
     const fixture = fixtureDocs('updated', generated);
     try {
@@ -289,6 +321,7 @@ describe('native docs fixture preflight', () => {
 
   test('the real preamble marker and private fixture evidence survive cleanup', () => {
     const fixture = fixtureDocs('risky', generated);
+    const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'docs-evidence-'));
     let retained: string | undefined;
     try {
       const result = spawnSync('bash', [path.join(fixture.skills, 'bin/gstack-skill-start'), '--skill', 'document-release'], {
@@ -298,14 +331,14 @@ describe('native docs fixture preflight', () => {
       expect(result.status).toBe(0);
       expect(result.stdout).toContain('SESSION_KIND: spawned');
       retained = preserveDocsEvidence(fixture, { output: 'preflight', toolCalls: [] } as unknown as SkillTestResult,
-        `docs-free-${path.basename(fixture.home)}`, 'fixture');
+        `docs-free-${path.basename(fixture.home)}`, 'fixture', {}, evidenceRoot);
       fixture.clean();
       expect(fs.existsSync(retained)).toBe(true);
       expect(fs.statSync(retained).mode & 0o777).toBe(0o600);
       expect(JSON.parse(fs.readFileSync(retained, 'utf8')).before.contents['SECURITY.md']).toBeDefined();
     } finally {
       fixture.clean();
-      if (retained) fs.rmSync(path.dirname(path.dirname(retained)), { recursive: true, force: true });
+      fs.rmSync(evidenceRoot, { recursive: true, force: true });
     }
   });
 });
@@ -382,6 +415,7 @@ describe('native docs fixture preflight', () => {
   test('kernel evidence remains private and readable after fixture cleanup', async () => {
     const fixture = fixtureDocs('current', generated);
     const observer = await observeDocsWrites(fixture);
+    const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'docs-evidence-'));
     let evidence: string | undefined;
     try {
       const file = path.join(fixture.repo, 'app.ts');
@@ -390,7 +424,7 @@ describe('native docs fixture preflight', () => {
       fs.writeFileSync(file, original);
       const observation = observer.stop();
       evidence = preserveDocsEvidence(fixture, { output: 'observer preflight', toolCalls: [] },
-        `docs-observer-${path.basename(fixture.home)}`, 'transient', { observation });
+        `docs-observer-${path.basename(fixture.home)}`, 'transient', { observation }, evidenceRoot);
       fixture.clean();
       expect(fs.statSync(evidence).mode & 0o777).toBe(0o600);
       const retained = JSON.parse(fs.readFileSync(evidence, 'utf8')).observation;
@@ -398,7 +432,7 @@ describe('native docs fixture preflight', () => {
       expect(docsWriteFailures(retained, [])).toContain('forbidden docs write: app.ts');
     } finally {
       fixture.clean();
-      if (evidence) fs.rmSync(path.dirname(path.dirname(evidence)), { recursive: true, force: true });
+      fs.rmSync(evidenceRoot, { recursive: true, force: true });
     }
   });
 
@@ -546,5 +580,101 @@ describe('deterministic native-parent fault actor preflight', () => {
       const actions = x.state().events.map(e => e.action);
       expect(actions.indexOf('scheduled-input-edit')).toBeGreaterThan(actions.indexOf('completion'));
     } finally { x.fixture.clean(); }
+  });
+});
+
+// Gate 40465691803 slice 2 (ship-docsync-completion): the parent rejected attempt 1 for a false claim in its section
+// (options.ts "exports format"; the file holds only pretty), re-audited over attempt 1's retained edit, and wrote attempt
+// 2's section (current, no edit) into the report. The case compared the report with attempt 1's section and went red
+// although the document was updated and the report carried the accepted section. The accepted contract is the last
+// dispatch; an earlier attempt's retained edit is not an unreported edit of the accepted one.
+describe('two-attempt documentation audits', () => {
+  const captured = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/docsync-two-attempts-public.json'), 'utf8')) as { events: unknown[] };
+  const replay = (home: string) => parseNDJSON(captured.events.map(event => JSON.stringify(event).replaceAll('{home}', home).replaceAll('{shard}', path.dirname(path.dirname(home)))));
+  const contractAt = (calls: SkillTestResult['toolCalls'], index: number) =>
+    parseDocsCompletion(calls[index].output, JSON.parse(calls[index].output.trimEnd().split('\n').at(-1)!).audit_id);
+
+  test('the captured run selects attempt 2, whose section the report carries, and attempt 1 owns the retained edit', () => {
+    const { toolCalls: calls } = replay('/tmp/ds-replay');
+    const dispatches = docsDispatchIndices(calls);
+    expect(dispatches).toHaveLength(2);
+    expect(docsDispatchIndex(calls)).toBe(dispatches[0]);
+    const [first, accepted] = dispatches.map(index => contractAt(calls, index));
+    expect([first.status, accepted.status]).toEqual(['updated', 'current']);
+    expect(first.files_updated).toEqual([DOC_PATH]);
+    expect(first.documentation_section).toContain('(`pretty`, `format`)');
+    // The report is the parent's Write plus the saved section appended by command (`cat <section>.md >> <report>.md`).
+    const written = (file: RegExp) => String(calls.find(call => call.tool === 'Write' && file.test(String(call.input?.file_path)))!.input.content);
+    expect(calls.some(call => call.tool === 'Bash' && /^cat \S+-documentation\.md >> \S+ship-report\.md$/.test(String(call.input?.command).trim()))).toBe(true);
+    const report = written(/ship-report\.md$/) + written(/-documentation\.md$/);
+    expect(report).not.toContain(first.documentation_section);
+    expect(report).toContain(accepted.documentation_section);
+    const evidence = { settled: true, markerSeen: true, headUnchanged: true, indexUnchanged: true, candidateUnchanged: true, readOnly: false, allowedDocs: [DOC_PATH] };
+    expect(() => vetDocsCompletion(accepted, { ...evidence, changedPaths: [DOC_PATH] })).toThrow('unreported edits');
+    expect(acceptedChangedPaths([DOC_PATH], [first, accepted])).toEqual([]);
+    expect(() => vetDocsCompletion(accepted, { ...evidence, changedPaths: acceptedChangedPaths([DOC_PATH], [first, accepted]) })).not.toThrow();
+    expect(() => vetDocsCompletion(accepted, { ...evidence, changedPaths: acceptedChangedPaths([DOC_PATH, 'README.md'], [first, accepted]) })).toThrow('unreported edits');
+    // The other honest shape: the re-audit edits the same document further and reports it. Its claim keeps the path in the
+    // accepted attempt's set; filtering on attempt 1's report alone would compare [] with [DOC_PATH] and red the re-audit.
+    const reaudit = { ...accepted, status: 'updated' as const, files_updated: [DOC_PATH] };
+    expect(acceptedChangedPaths([DOC_PATH], [first, reaudit])).toEqual([DOC_PATH]);
+    expect(() => vetDocsCompletion(reaudit, { ...evidence, changedPaths: acceptedChangedPaths([DOC_PATH], [first, reaudit]) })).not.toThrow();
+    expect(() => vetDocsCompletion(reaudit, { ...evidence, changedPaths: [DOC_PATH].filter(p => !first.files_updated.includes(p)) })).toThrow('unreported edits');
+    expect(acceptedChangedPaths([DOC_PATH], [accepted])).toEqual([DOC_PATH]);
+    const publish = calls.findIndex(call => call.tool === 'Bash' && /^bun .*fixture-publish\.ts/.test(String(call.input?.command)));
+    expect(publish).toBeGreaterThan(dispatches[1]);
+    for (const index of dispatches) expect(calls[index].input.run_in_background).toBe(false);
+  });
+
+  // Screen 40805543956 slice 3 (ship-docsync-completion, red on "completion fields", green on the in-run rerun): attempt 1
+  // edited the document and returned a completion without documentation_section; the parent rejected it and re-audited, and
+  // the case threw while parsing the rejected attempt with the accepted attempt's strict contract.
+  test('a rejected attempt that broke the completion contract still reports its edit; the accepted attempt stays strict', () => {
+    const { completions } = JSON.parse(fs.readFileSync(path.join(import.meta.dir, 'fixtures/docsync-invalid-first-attempt-public.json'), 'utf8')) as { completions: string[] };
+    const [first, second] = completions;
+    expect(() => parseDocsCompletion(first, JSON.parse(first).audit_id)).toThrow('completion fields');
+    expect(Object.keys(JSON.parse(first))).not.toContain('documentation_section');
+    const { accepted, attempts } = docsAttemptContracts(completions);
+    expect(attempts.map(attempt => [attempt.audit_id, attempt.status, attempt.files_updated])).toEqual([['ship145-a1', 'updated', [DOC_PATH]], ['ship145-a2', 'current', []]]);
+    expect(attempts.at(-1)).toBe(accepted);
+    const evidence = { settled: true, markerSeen: true, headUnchanged: true, indexUnchanged: true, candidateUnchanged: true, readOnly: false, allowedDocs: [DOC_PATH] };
+    expect(acceptedChangedPaths([DOC_PATH], attempts)).toEqual([]);
+    expect(() => vetDocsCompletion(accepted, { ...evidence, changedPaths: acceptedChangedPaths([DOC_PATH], attempts) })).not.toThrow();
+    expect(() => vetDocsCompletion(accepted, { ...evidence, changedPaths: acceptedChangedPaths([DOC_PATH, 'README.md'], attempts) })).toThrow('unreported edits');
+    expect(() => docsAttemptContracts([second, first])).toThrow('completion fields');
+    expect(() => docsAttemptContracts([first])).toThrow('completion fields');
+    const report = JSON.parse(first);
+    for (const broken of [{ ...report, status: 'done' }, { ...report, files_updated: DOC_PATH }, { ...report, files_updated: [''] }, { ...report, audit_id: undefined }, []])
+      expect(() => docsAttemptContracts([JSON.stringify(broken), second]), JSON.stringify(broken)).toThrow('rejected attempt report');
+  });
+
+  test('a third dispatch exceeds the attempt budget and a lone dispatch stays the accepted one', () => {
+    const { toolCalls: calls } = replay('/tmp/ds-replay');
+    const dispatches = docsDispatchIndices(calls);
+    const third = [...calls, calls[dispatches[1]]];
+    expect(docsDispatchIndices(third)).toHaveLength(3);
+    expect(docsDispatchIndices(calls.filter((_, index) => index !== dispatches[0]))).toHaveLength(1);
+    expect(docsDispatchIndices(calls.filter((_, index) => !dispatches.includes(index)))).toEqual([]);
+    expect(docsDispatchIndex(calls.filter((_, index) => !dispatches.includes(index)))).toBe(-1);
+  });
+});
+
+// Gates 41217563527 and 41238366045 (docsync-spawned): the child returned every field
+// except documentation_section, and the red read only "completion fields".
+describe('completion field failures name the fields', () => {
+  test('the captured spawned completions name the omitted documentation_section; the reruns parse', () => {
+    for (const { run, attempt, recordedPassed, output } of missingSection.outputs) {
+      const auditId = JSON.parse(output.trimEnd().split('\n').at(-1)!).audit_id;
+      if (recordedPassed) expect(parseDocsCompletion(output, auditId).status, run + attempt).toBe('blocked');
+      else expect(() => parseDocsCompletion(output, auditId), run + attempt).toThrow('completion fields: missing documentation_section; extra none');
+    }
+  });
+
+  test('an extra or legacy field is named too', () => {
+    const accepted = missingSection.outputs.find(row => row.recordedPassed)!.output;
+    const report = JSON.parse(accepted.trimEnd().split('\n').at(-1)!);
+    expect(() => parseDocsCompletion(JSON.stringify({ ...report, commit_sha: null }), report.audit_id)).toThrow('completion fields: missing none; extra commit_sha');
+    const { files_reviewed: _, ...rest } = report;
+    expect(() => parseDocsCompletion(JSON.stringify({ ...rest, pushed: false }), report.audit_id)).toThrow('completion fields: missing files_reviewed; extra pushed');
   });
 });

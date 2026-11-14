@@ -326,9 +326,9 @@ function sharedCurlRequest(args: string[]) {
   else {
     try {
       const url = new URL(urls[0]);
-      const repoPath = /^\/repos\/fixture\/shared-libs(?:\/(?:contents\/.+|pulls(?:\/\d+(?:\/files)?)?|commits(?:\/(?:[a-f0-9]{40}|main))?|branches\/[^/]+))?$/;
+      const repoPath = /^\/repos\/fixture\/shared-libs(?:\/(?:contents\/.+|pulls(?:\/\d+(?:\/files)?)?|commits(?:\/(?:[a-f0-9]{40}|main))?|branches(?:\/[^/]+)?))?$/;
       if (url.protocol !== 'https:' || url.hostname !== 'api.github.com' || url.port || url.username || url.password || url.hash ||
-        (!repoPath.test(url.pathname) && url.pathname !== '/search/issues')) throw new Error('unsupported URL');
+        (!repoPath.test(url.pathname) && !['/search/issues', '/rate_limit'].includes(url.pathname))) throw new Error('unsupported URL');
       result.endpoint = url.pathname.slice(1) + url.search;
     } catch { result.violations.push('unsupported curl URL: fixture GitHub GET endpoints only'); }
   }
@@ -478,6 +478,16 @@ const SAFE_GIT_CONFIG = ['core.fsmonitor=false', 'log.showSignature=false', 'dif
 
 /** A repository Git process that carries the complete safe prefix bin/gstack-safe-git applies, including its
  * environment, plus patch-driver disabling for diffs; a partial literal prefix does not qualify. */
+/**
+ * The report discloses the unavailable local-history and API coverage in its own words. The shims'
+ * error text ("unknown option: --no-lazy-fetch", "API unavailable in this fixture") is removed first,
+ * so pasting a tool error is not a disclosure; Opus wrote "I couldn't read Git history".
+ */
+export function disclosesUnavailableHistory(output: string): boolean {
+  const own = output.replaceAll('unknown option: --no-lazy-fetch', '').replaceAll('API unavailable in this fixture', '');
+  return /unavailable|unsupported|unreadable|cannot|can['’]t|could ?not|couldn['’]t|coverage|limited|no (?:commit |git |local )?history/i.test(own);
+}
+
 export function isGuardedGitRequest(request: SourceRequest): boolean {
   const args = request.args, command = args.findIndex((arg, i) => !arg.startsWith('-') && args[i - 1] !== '-c' && args[i - 1] !== '-C');
   const globals = command < 0 ? args : args.slice(0, command), rest = command < 0 ? [] : args.slice(command);
@@ -490,16 +500,53 @@ export function isGuardedGitRequest(request: SourceRequest): boolean {
 
 /** Claude's own workspace probes are not commands requested by the skill. */
 export function isInternalClaudeGitRequest(request: SourceRequest, commands: string[]): boolean {
-  const hostPrefix = ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false',
-    '-c', 'log.showSignature=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
+  const head = ['-c', 'protocol.ext.allow=never', '-c', 'submodule.recurse=false', '-c', 'log.showSignature=false'];
+  const tail = ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
     '--literal-pathspecs', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=',
     '-c', 'core.askPass=', '-c', 'core.quotePath=false', '-c', 'core.safecrlf=false'];
+  // Observed host prefixes: Claude Code 2.1.284, and 2.1.292, which adds format.pretty=medium,
+  // then disables every git hook by name before --literal-pathspecs.
+  const hooks292 = [
+    'applypatch-msg', 'pre-applypatch', 'post-applypatch', 'pre-commit', 'pre-merge-commit', 'prepare-commit-msg',
+    'commit-msg', 'post-commit', 'pre-rebase', 'post-checkout', 'post-merge', 'pre-push',
+    'pre-receive', 'update', 'proc-receive', 'post-receive', 'post-update', 'reference-transaction',
+    'push-to-checkout', 'pre-auto-gc', 'post-rewrite', 'sendemail-validate', 'fsmonitor-watchman', 'p4-changelist',
+    'p4-prepare-changelist', 'p4-post-changelist', 'p4-pre-submit', 'post-index-change',
+  ].flatMap(hook => ['-c', `hook.${hook}.enabled=false`]);
+  const [gc, gcAuto, maint, maintAuto, ...afterMaintenance] = tail;
+  const hostPrefixes = [[...head, ...tail],
+    [...head, '-c', 'format.pretty=medium', gc!, gcAuto!, maint!, maintAuto!, ...hooks292, ...afterMaintenance]];
+  // 2.1.292's cwd probes: core.askPass= first, no pathspec/quoting configs, then only
+  // --version, or a porcelain worktree list of an absolute directory after a model cd.
+  const askPassPrefix = ['-c', 'core.askPass=', ...head, '-c', 'format.pretty=medium', gc!, gcAuto!, maint!, maintAuto!, ...hooks292,
+    '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor='];
+  const probe = request.args.slice(askPassPrefix.length);
+  const askPassProbe = JSON.stringify(request.args.slice(0, askPassPrefix.length)) === JSON.stringify(askPassPrefix)
+    && (JSON.stringify(probe) === '["--version"]' || probe.length === 6 && probe[0] === '-C' && path.isAbsolute(probe[1]!)
+      && JSON.stringify(probe.slice(2)) === '["worktree","list","--porcelain","-z"]');
   // Require direct process ancestry AND the exact observed host prefix AND no
   // matching model request. A shell/model-issued unguarded Git call still fails.
   return request.tool === 'git' && !!request.ppid &&
     /(?:^|[/\\])claude(?:\.exe)?$/.test(request.parentExecutable || '') &&
-    JSON.stringify(request.args.slice(0, hostPrefix.length)) === JSON.stringify(hostPrefix) &&
+    (hostPrefixes.some(prefix => JSON.stringify(request.args.slice(0, prefix.length)) === JSON.stringify(prefix)) ||
+      askPassProbe) &&
     !commands.some(command => command.includes('core.safecrlf=false') || command.includes('protocol.ext.allow=never'));
+}
+
+/** Repository-scoped Git calls the model caused, excluding Claude's own workspace probes. */
+export function repoGitRequests(requests: SourceRequest[], commands: string[], repo: string): SourceRequest[] {
+  return requests.filter(row => row.tool === 'git' && !isInternalClaudeGitRequest(row, commands) &&
+    (row.cwd === repo || row.cwd.startsWith(repo + path.sep) || row.args.some(arg => arg.includes(repo)) ||
+      row.args.some((arg, i) => arg === '-C' && row.args[i + 1] && path.resolve(row.cwd, row.args[i + 1]!) === repo)));
+}
+
+/** A repository Git call is read-only: guarded, with no state-changing or transport subcommand. */
+export function isReadOnlyRepoGitRequest(request: SourceRequest): boolean {
+  // This exact intrinsic diagnostic cannot inspect repository state or replace the probe.
+  if (request.args.length === 1 && request.args[0] === '--version') return true;
+  return !['status', 'fetch', 'ls-remote', 'pull', 'push', 'clone', 'add', 'write-tree', 'hash-object'].some(arg => request.args.includes(arg))
+    // Every repository read carries the complete gstack-safe-git prefix, environment included.
+    && isGuardedGitRequest(request);
 }
 
 /** Older open PRs outside the 14-day window: more than the skill's five 100-item open-metadata pages. */
@@ -685,6 +732,7 @@ else if(/\\/pulls\\/42(?:\\?|$)/.test(endpoint))out=pr(42,old);
 else if(/\\/pulls\\/\\d+(?:\\?|$)/.test(endpoint)){const row=prTable.find(row=>row.number===Number(endpoint.match(/\\/pulls\\/(\\d+)/)[1]));if(!row)apiError(404,'Not Found');out=toPr(row);}
 else if(endpoint.includes('/commits')){const isPrCommit=prHead!==${JSON.stringify(f.tip)}&&endpoint.includes(prHead);out=endpoint.includes('/commits/')?{sha:isPrCommit?prHead:${JSON.stringify(f.tip)},commit:{committer:{date:isPrCommit?old:now},message:'Fixture work'},files:Object.keys(isPrCommit?prFiles:files).map(filename=>({filename,status:'modified'}))}:[{sha:${JSON.stringify(f.tip)},commit:{committer:{date:now},message:'Fixture work'}}];}
 else if(endpoint.includes('/branches/'))out={name:'main',commit:{sha:${JSON.stringify(f.tip)}}};
+else if(/\\/branches(?:\\?|$)/.test(endpoint))out=[{name:'main',commit:{sha:${JSON.stringify(f.tip)}},protected:false}];
 else if(/^\\/?repos\\/fixture\\/shared-libs\\/?(?:\\?|$)/.test(endpoint))out={default_branch:'main',full_name:'fixture/shared-libs',html_url:'https://github.com/fixture/shared-libs'};
 else apiError(404,'Not Found');
 if(curl)curlResponse(out);
@@ -791,6 +839,11 @@ export function standaloneInstructions(f: SharedLibsFixture, codex = false): str
   const file = path.join(f.root, 'standalone-instructions.md');
   fs.writeFileSync(file, text);
   return file;
+}
+
+/** The skill's instructions as a loaded skill delivers them: in context before any tool call. */
+export function loadedInstructions(file: string): string {
+  return `\n\nThe /deslop-shared-libs instructions (already loaded):\n<skill-instructions>\n${fs.readFileSync(file, 'utf8')}\n</skill-instructions>`;
 }
 
 export function reviewLifecycleInstructions(f: SharedLibsFixture): string {
@@ -1031,19 +1084,22 @@ export function toolCommandTrace(result: { toolCalls: Array<{ tool: string; inpu
   return result.toolCalls.filter(call => call.tool === 'Bash').map(call => String(call.input?.command || ''));
 }
 
-/** Whether the first read of a PR's file-list page 1 left no usable file set:
- * truncated by `head -c`, or a failed filter (e.g. a jq error) that printed no
- * file entries. One recovery read of page 1 is then legitimate, still charged
- * to the page budget. */
-export function incompleteFirstFileView(result: { toolCalls: Array<{ tool: string; input: any; output?: string }> }, pr: number): boolean {
-  const page1 = new RegExp(String.raw`\b(?:gh\s+api|curl)\b[^;\n]*\/pulls\/${pr}\/files(?![^;\n]*[?&]page=(?!1\b)\d)`);
-  const first = result.toolCalls.find(call => call.tool === 'Bash' && page1.test(String(call.input?.command || '')));
-  if (!first) return false;
-  const command = String(first.input?.command || '');
-  if (new RegExp(String.raw`\b(?:gh\s+api|curl)\b[^;\n]*\/pulls\/${pr}\/files[^;\n]*\|\s*head\s+-c\s*\d+`).test(command)) return true;
-  const output = String(first.output ?? '');
-  const view = output.slice(Math.max(0, output.search(new RegExp(String.raw`\/pulls\/${pr}\/files|files page 1`))));
-  return /^jq: error\b/m.test(view) && !/"filename"\s*:/.test(view);
+/**
+ * PR-coverage request check against the skill's stated older-open-PR budget
+ * (five metadata pages, fifty file-list pages, plus recent PR 7's one page)
+ * and the coverage outcome: PR 42's file list was read from page 1 through
+ * page 2. How often a page was re-read within budget is not graded.
+ */
+export function prCoverageRequestViolations(endpoints: string[]): string[] {
+  const violations: string[] = [];
+  const coordination = endpoints.filter(endpoint => /\/pulls\/42\/files/.test(endpoint));
+  if (!coordination.some(endpoint => !/[?&]page=/.test(endpoint) || /[?&]page=1(?:&|$)/.test(endpoint))) violations.push('PR 42 first file page not read');
+  if (!coordination.some(endpoint => /[?&]page=2(?:&|$)/.test(endpoint))) violations.push('PR 42 second file page not read');
+  const openPages = endpoints.filter(endpoint => /\/pulls\?/.test(endpoint) && /state=open/.test(endpoint)).length;
+  if (openPages > 5) violations.push(`${openPages} open-PR metadata pages exceed the budget of 5`);
+  const filePages = endpoints.filter(endpoint => /\/pulls\/\d+\/files/.test(endpoint)).length;
+  if (filePages > 51) violations.push(`${filePages} file-list pages exceed the budget of 50 plus PR 7`);
+  return violations;
 }
 
 /** A raw-byte change hidden by Git normalization, reproducing a real snapshot blind spot. */
@@ -1219,6 +1275,7 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
   let timer: ReturnType<typeof setTimeout> | undefined;
   let actorFailure: Error | undefined;
   let captureStartedAt = 0;
+  let armedMs: number | undefined;
   const streamed: any[] = [];
   const diagnosticDirectory = path.join(SHARED_LIBS_ROOT, '.context/shared-libs-captures');
   const diagnostic = path.join(diagnosticDirectory, `${Date.now()}-${testName}-${path.basename(f.root)}.jsonl`);
@@ -1231,7 +1288,7 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
       userPrompt: prompt, workingDirectory: f.repo, testName, env: f.env,
       pathToClaudeCodeExecutable: claudeBinary,
       settingSources: [], maxTurns: SHARED_INTERACTIVE_MAX_TURNS, maxRetries: 0,
-      signal: fixtureOptions.attempt.signal,
+      signal: fixtureOptions.attempt.signal, sessionBudgetMs: () => armedMs, streamLiveness: true,
       allowedTools: ['Read', 'Bash', 'Write', 'Edit', 'Glob', 'Grep', 'AskUserQuestion'],
       queryProvider: args => {
         fixtureOptions.attempt.signal.throwIfAborted();
@@ -1239,7 +1296,8 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
         if (remaining <= 0) throw new Error('Shared capture attempt expired before admission');
         abortController = args.options?.abortController;
         if (!abortController) throw new Error('SDK capture lacks its owned abort controller');
-        timer = setTimeout(() => abortController!.abort(), Math.min(CAPTURE_MS, remaining));
+        armedMs = Math.min(CAPTURE_MS, remaining);
+        timer = setTimeout(() => abortController!.abort(), armedMs);
         captureStartedAt = Date.now();
         fs.mkdirSync(diagnosticDirectory, { recursive: true });
         const source = query({ ...args, options: { ...args.options,
@@ -1248,8 +1306,11 @@ export async function runSharedInteractive(f: SharedLibsFixture, testName: strin
           get(target, key) {
             if (key === Symbol.asyncIterator) return async function* () {
               for await (const event of target) {
-                streamed.push(event);
-                fs.appendFileSync(diagnostic, JSON.stringify(event) + '\n');
+                // Partial-message rows feed the runner's liveness summary only.
+                if (event.type !== 'stream_event') {
+                  streamed.push(event);
+                  fs.appendFileSync(diagnostic, JSON.stringify(event) + '\n');
+                }
                 yield event;
               }
             };

@@ -8,6 +8,9 @@
  * former claude-pty-runner.ts. Tests import through claude-pty-runner.ts.
  */
 import { launchClaudePty, type ClaudePtyOptions, type ClaudePtySession } from './launch';
+import { screenPanelEnd } from './screen';
+import { appendSessionLedger, sessionKey, type SessionEnd } from '../session-ledger';
+import { pricedTranscript } from './transcript-cost';
 
 /**
  * The runners' launch seam: how a session starts, and the clock the runner
@@ -31,12 +34,19 @@ export const realPtyDriver: PtyDriver = {
   sleep: ms => Bun.sleep(ms),
 };
 
+/** The session's end panel (screenPanelEnd), if the session can show its text; diagnostics never throw. */
+export function safePanelEnd(session: Pick<ClaudePtySession, 'visibleText'>): ReturnType<typeof screenPanelEnd> {
+  try { return screenPanelEnd(session.visibleText()); } catch { return null; }
+}
+
 /** One poll step: finish with a result, keep polling, or end the loop as a timeout. */
 export type PtyStep<R> = { done: R } | 'continue' | 'break';
 
 export interface PtySessionPlan<R> {
   driver: PtyDriver;
   launch: ClaudePtyOptions;
+  /** The observation budget the runner armed (session ledger); defaults to the launch wall. */
+  budgetMs?: number;
   /** Owned fixture cleanup; runs after close, and when launch itself fails. */
   cleanup?: () => void;
   /** Boot and command submission. A returned result ends the run before polling. */
@@ -59,28 +69,36 @@ export interface PtySessionPlan<R> {
  * owned cleanup runs last.
  */
 export async function runPtySession<R>(plan: PtySessionPlan<R>): Promise<R> {
+  const started = plan.driver.monotonic();
+  const startedAt = new Date(plan.driver.now()).toISOString();
+  let end: SessionEnd = 'error';
   let session: ClaudePtySession;
   try {
-    session = await plan.driver.launch(plan.launch);
+    session = await plan.driver.launch({ ...plan.launch, sessionLedger: false });
   } catch (error) {
     plan.cleanup?.();
     throw error;
   }
   let failure: { error: unknown } | undefined;
   try {
+    const ended = (result: R) => { end = (result as { outcome?: unknown })?.outcome === 'timeout' ? 'observer_timeout' : 'completed'; return result; };
     const early = await plan.start(session);
-    if (early !== undefined) return early;
+    if (early !== undefined) return ended(early);
     while (await plan.poll(session)) {
       const step = await plan.tick(session);
       if (step === 'break') break;
-      if (step !== 'continue') return step.done;
+      if (step !== 'continue') return ended(step.done);
     }
+    end = 'observer_timeout';
     return plan.timeout(session);
   } catch (error) {
     failure = { error };
     plan.onError?.(session, error);
     throw error;
   } finally {
+    appendSessionLedger({ key: sessionKey('pty', undefined), runner: 'pty', started_at: startedAt,
+      budget_ms: plan.budgetMs ?? plan.launch.timeoutMs ?? 240_000, elapsed_ms: plan.driver.monotonic() - started,
+      end, ...safePanelEnd(session), billed: false, ...pricedTranscript(session) });
     try {
       try { plan.beforeClose?.(session, failure); }
       catch (error) { if (!failure) { failure = { error }; throw error; } }

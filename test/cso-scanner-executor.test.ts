@@ -10,7 +10,7 @@ import { total } from '../lib/cso/admission';
 import { SCANNER_IDS, ScannerExecution, ScannerId, scannerPlans } from '../lib/cso/scanners';
 import { type PreparationSandboxRunner } from '../lib/cso/preparation-executor';
 import { canonicalStartPlan } from '../lib/cso/verification';
-import { completeRuntimeCatalogFixture } from './helpers/cso-runtime-catalog';
+import { completeRuntimeCatalogFixture, unqualifiedRuntimeCatalog } from './helpers/cso-runtime-catalog';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -29,6 +29,7 @@ function catalog(..._ids: ScannerId[]): ScannerCatalog {
   const scanners = SCANNER_IDS.flatMap(id => [profile(id), profile(id, 'linux/arm64')]);
   return { schemaVersion: 1, helperAbi: 3, revision: 'unit-fixture-only', promotion: { sourceCommit: 'b'.repeat(40), workflow: 'https://github.com/garrytan/gstack/actions/runs/42', evidenceDigest: `sha256:${sha256(canonical(scanners))}` }, scanners };
 }
+const EMPTY_CATALOG = { schemaVersion: 1, revision: 'cso-scanners-v3-unqualified', previousRevision: null, helperAbi: 3, scanners: [] } as unknown as ScannerCatalog;
 const scannerProfile = (c: ScannerCatalog, id: ScannerId, platform: 'linux/amd64' | 'linux/arm64' = 'linux/amd64') => c.scanners.find(item => item.scanner === id && item.platform === platform)!;
 const runtimes = completeRuntimeCatalogFixture('scanner-runtime-fixture');
 function request(): ScannerRequest {
@@ -60,7 +61,13 @@ function result(id: ScannerId): ScannerExecution {
 }
 
 describe('reviewed scanner catalog contract', () => {
-  test('the shipped catalog has no executable unqualified fallback', () => { expect(SCANNER_CATALOG.scanners).toEqual([]); expect(() => selectScanner('gitleaks', 'linux/amd64')).toThrow('No qualified'); });
+  test('the shipped catalog has no executable unqualified fallback', () => {
+    validateScannerCatalog(SCANNER_CATALOG);
+    for (const profile of SCANNER_CATALOG.scanners) expect([profile.state, profile.image]).toEqual(['qualified', expect.stringMatching(/@sha256:[a-f0-9]{64}$/)]);
+    for (const id of SCANNER_IDS) for (const platform of ['linux/amd64', 'linux/arm64'] as const)
+      if (!SCANNER_CATALOG.scanners.some(profile => profile.scanner === id && profile.platform === platform)) expect(() => selectScanner(id, platform)).toThrow('No qualified');
+    expect(() => selectScanner('gitleaks', 'linux/amd64', undefined, EMPTY_CATALOG)).toThrow('No qualified');
+  });
   test.each(SCANNER_IDS)('selects a qualified immutable %s profile', id => { const c = catalog(id); validateScannerCatalog(c); expect(selectScanner(id, 'linux/amd64', undefined, c)).toEqual(scannerProfile(c, id)); });
   test.each(['tag', 'entrypoint', 'policy', 'abi', 'qualification', 'executable', 'version', 'capabilities'])('rejects unreviewed %s', field => {
     const c = catalog('gitleaks'), p = scannerProfile(c, 'gitleaks') as any;
@@ -110,7 +117,7 @@ describe('all six helper-owned scanner execution paths', () => {
     if (id === 'osv' || id === 'trivy') expect(record.outcome.databaseUpdatedAt).toBe('2026-09-09T00:00:00.000Z');
   });
   test('missing catalog never creates a runner and records the exact prerequisite', async () => {
-    let calls = 0; const out = await executeScanner(input('gitleaks'), { runnerFactory: async () => { calls++; throw new Error('must not run'); } });
+    let calls = 0; const out = await executeScanner(input('gitleaks'), { catalog: EMPTY_CATALOG, runnerFactory: async () => { calls++; throw new Error('must not run'); } });
     expect(calls).toBe(0); expect(out.coverage.status).toBe('not_assessed'); expect(out.outcome.gaps[0].message).toContain('No qualified gitleaks');
   });
   test.each(['semgrep', 'osv', 'trivy'] as ScannerId[])('%s missing baked assets cannot launch a scanner or download replacements', async id => {
@@ -179,7 +186,7 @@ describe('Schemathesis application admission', () => {
     expect(calls).toBe(0); expect(out.outcome.gaps[0].message).toContain('boundary is missing or transformed');
   });
   test('no runtime profile means a prerequisite, not a scanner success', async () => {
-    const out = await executeScanner(input('schemathesis'), { catalog: catalog('schemathesis') });
+    const out = await executeScanner(input('schemathesis'), { catalog: catalog('schemathesis'), runtimes: unqualifiedRuntimeCatalog() });
     expect(out.outcome.status).toBe('not_assessed'); expect(out.outcome.gaps[0].message).toContain('runtime is unavailable');
   });
   test.each(['remote-ref', 'server', 'hook', 'callback', 'operation', 'unbounded', 'source-command'])('rejects hostile or ambiguous %s harness input', kind => {

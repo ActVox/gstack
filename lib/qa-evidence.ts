@@ -138,13 +138,58 @@ function completeReceipts(root: string): Record<string, any>[] {
 const completeCaptures = (root: string): string[] => completeReceipts(root).map(receipt => receipt.id);
 const latestCompleteCapture = (root: string): string | undefined => completeCaptures(root).at(-1);
 
-/** Required native probes the caller declared (GSTACK_QA_REQUIRED_PROBES, a JSON array of child commands) that no complete capture has run yet. Informational only. */
+function latestMtimeMs(target: string): number {
+  let stat: fs.Stats;
+  try { stat = fs.lstatSync(target); } catch { return 0; }
+  if (!stat.isDirectory()) return stat.mtimeMs;
+  return Math.max(stat.mtimeMs, ...fs.readdirSync(target).map(name => latestMtimeMs(path.join(target, name))));
+}
+
+/**
+ * Earliest start time a capture needs to count toward required probes. The caller
+ * may declare GSTACK_QA_REQUIRED_AFTER_EDIT={"paths":[absolute paths],"since":ISO}:
+ * only captures started after the last edit under those paths count, and none
+ * count before the first edit after since. Without it every capture counts.
+ */
+function requiredBoundaryMs(): number {
+  let declared: unknown;
+  try { declared = JSON.parse(process.env.GSTACK_QA_REQUIRED_AFTER_EDIT ?? 'null'); } catch { return Infinity; }
+  if (declared === null) return -Infinity;
+  if (!object(declared) || !Array.isArray(declared.paths) || !declared.paths.every(item => typeof item === 'string' && path.isAbsolute(item))
+    || !Number.isFinite(Date.parse(declared.since))) return Infinity;
+  const edited = Math.max(0, ...declared.paths.map(latestMtimeMs));
+  return edited > Date.parse(declared.since) ? Math.floor(edited) : Infinity;
+}
+
+/** Required native probes the caller declared (GSTACK_QA_REQUIRED_PROBES, a JSON array of child commands) that no counted complete capture has run yet. Informational only. */
 function requiredRemaining(root: string): { requiredRemaining?: string[] } {
   let required: unknown;
   try { required = JSON.parse(process.env.GSTACK_QA_REQUIRED_PROBES ?? 'null'); } catch { return {}; }
   if (!Array.isArray(required) || !required.every(item => typeof item === 'string')) return {};
-  const run = new Set(completeReceipts(root).map(receipt => Array.isArray(receipt.argv) ? receipt.argv.join(' ') : ''));
+  const boundary = requiredBoundaryMs();
+  const run = new Set(completeReceipts(root).filter(receipt => Date.parse(receipt.startedAt) >= boundary)
+    .map(receipt => Array.isArray(receipt.argv) ? receipt.argv.join(' ') : ''));
   return { requiredRemaining: required.filter(command => !run.has(command)) };
+}
+
+const snapshotOf = (observed: unknown) => object(observed) && typeof observed.snapshot === 'string' ? observed.snapshot : undefined;
+
+/**
+ * Commands whose complete captures declared an older input snapshot than the
+ * latest capture and were not rerun on the current snapshot. Materialize keeps
+ * each one open (the verdict cannot pass), and it publishes only once, so
+ * every capture names them while they can still be rerun.
+ */
+function staleCommands(root: string): string[][] {
+  const observed = completeReceipts(root).flatMap(receipt => {
+    try { return [{ argv: receipt.argv as string[], snapshot: snapshotOf(readQaCapture(root, receipt.id).observed) }]; } catch { return []; }
+  });
+  const current = observed.at(-1)?.snapshot;
+  if (current === undefined) return [];
+  const rerun = new Set(observed.filter(row => row.snapshot === current).map(row => JSON.stringify(row.argv)));
+  const stale = new Map(observed.filter(row => row.snapshot !== undefined && !rerun.has(JSON.stringify(row.argv)))
+    .map(row => [JSON.stringify(row.argv), row.argv]));
+  return [...stale.values()];
 }
 
 async function capture(root: string, captureId: string, publicOutput: boolean, option: string, budget: string, command: string, args: string[], after?: { capture: string; hypothesis: string }) {
@@ -235,10 +280,13 @@ async function capture(root: string, captureId: string, publicOutput: boolean, o
     completedAt, exitCode, signal: result.signal, status, observation, publicOutput,
     ...streams };
   const sha256 = publish(root, `.qa-evidence/${captureId}/receipt.json`, receipt);
+  const revalidate = status === 'complete' ? staleCommands(root) : [];
   return { action: 'capture', id: captureId, status, sha256, exitCode, signal: result.signal, publicOutput,
     startedAt, completedAt, durationMs: Date.parse(completedAt) - Date.parse(startedAt), ...(remainingMs === undefined ? {} : { remainingMs }),
     ...(checkpointSha256 ? { checkpoint: captureId, checkpointSha256, link: `[checkpoint ${captureId}](exploration-${captureId}.json)` } : {}),
-    ...(status === 'complete' ? { next: `Another probe requires a checkpoint anchored on capture ${captureId}: add --after ${captureId} --hypothesis 'TEXT' before --. To stop exploring, run none.` } : {}),
+    ...(status === 'complete' ? { next: `Another probe requires a checkpoint anchored on capture ${captureId}: add --after ${captureId} --hypothesis 'TEXT' before --. To stop exploring, run none.${revalidate.length
+      ? ` Inputs changed since these commands ran; materialize runs once and keeps each one open (the verdict cannot pass) until it is rerun on current inputs: ${revalidate.map(argv => argv.join(' ')).join('; ')}.` : ''}` } : {}),
+    ...(revalidate.length ? { revalidate: revalidate.map(argv => argv.join(' ')) } : {}),
     ...requiredRemaining(root) };
 }
 
@@ -298,7 +346,6 @@ function materialize(root: string, source: string) {
     argv.push(JSON.stringify(captured.receipt.argv));
     return { command: row.command, contract: row.contract, expected: row.expected, classification: row.classification, observed: captured.observed };
   });
-  const snapshotOf = (observed: unknown) => object(observed) && typeof observed.snapshot === 'string' ? observed.snapshot : undefined;
   const latestCapture = latestCompleteCapture(root);
   const currentSnapshot = latestCapture ? snapshotOf(readQaCapture(root, latestCapture).observed) : undefined;
   const superseded = currentSnapshot === undefined ? [] : annotations.evidence.filter((row: any, index: number) => {
@@ -338,10 +385,40 @@ function materialize(root: string, source: string) {
   const sha256 = publish(root, 'evidence.json', { ...annotations, evidence, learning, verdict });
   return { action: 'materialize', status: 'complete', sha256, annotationsSha256: hash(bytes), exitCode: 0, verdict,
     reportLinks: notes.map(note => `[checkpoint ${note.name.slice(12, 15)}](${note.name})`),
-    next: `Include every reportLinks entry in the Markdown report, and report the overall status as ${verdict.status}${verdict.open.length ? ` (open: ${verdict.open.join('; ')})` : ''}; rerun what is open first if a pass is required.` };
+    next: `Include every reportLinks entry in the Markdown report, and report the overall status as ${verdict.status}${verdict.open.length ? ` (open: ${verdict.open.join('; ')})` : ''}; this verdict is final. Next, write the Markdown report beside evidence.json.` };
 }
 
-const QA_EVIDENCE_USAGE = 'capture ROOT ID [--public] --deadline FILE|--timeout-ms MS [--after PREVIOUS_CAPTURE --hypothesis TEXT] -- COMMAND ARGS (--after publishes checkpoint ID linking PREVIOUS_CAPTURE to this probe; required after the first complete capture unless a checkpoint was published) | checkpoint ROOT ID CAPTURE OBSERVATION_COMMAND HYPOTHESIS NEXT_COMMAND | checkpoint ROOT ID INTENT_FILE | materialize ROOT ANNOTATIONS (annotations: {evidence: [{capture, command, contract, expected, classification: pass|superseded|product-defect|fail|setup-blocked|blocked|inconclusive}], limits: [..]}; revision, runtime, cwd and learning are filled in)';
+/** A fresh report root for caller QA (/review and /ship) under the repository's git-excluded .gstack/tmp, so probes never change the reviewed tree. */
+function reportDir(): Record<string, any> {
+  const top = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 5000 });
+  if (top.status !== 0 || !top.stdout.trim()) throw new QaEvidenceError('report-dir needs a git work tree');
+  const repoRoot = fs.realpathSync(top.stdout.trim());
+  const exclude = spawnSync('git', ['rev-parse', '--git-path', 'info/exclude'], { encoding: 'utf8', timeout: 5000 });
+  if (exclude.status !== 0 || !exclude.stdout.trim()) throw new QaEvidenceError('report-dir cannot locate the git exclude file');
+  const excludeFile = path.resolve(exclude.stdout.trim());
+  fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
+  const excluded = fs.existsSync(excludeFile) ? fs.readFileSync(excludeFile, 'utf8') : '';
+  if (!excluded.split(/\r?\n/).includes('/.gstack/tmp/')) fs.appendFileSync(excludeFile, `${excluded && !excluded.endsWith('\n') ? '\n' : ''}/.gstack/tmp/\n`);
+  const parent = path.join(repoRoot, '.gstack', 'tmp', 'qa-reports');
+  for (const dir of [path.join(repoRoot, '.gstack'), path.dirname(parent), parent]) {
+    try {
+      if (fs.lstatSync(dir).isSymbolicLink()) throw new QaEvidenceError(`report-dir refuses the linked ${path.relative(repoRoot, dir)}`);
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error;
+      fs.mkdirSync(dir, { mode: 0o700 });
+    }
+  }
+  const ignored = spawnSync('git', ['check-ignore', '-q', path.join(parent, 'report.md')], { cwd: repoRoot, encoding: 'utf8', timeout: 5000 });
+  if (ignored.status !== 0) throw new QaEvidenceError('report-dir: .gstack/tmp is not git-ignored here (a .gitignore rule overrides info/exclude)');
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  for (let n = 1; ; n++) {
+    const dir = path.join(parent, `run-${stamp}${n > 1 ? `-${n}` : ''}`);
+    try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (error: any) { if (error?.code === 'EEXIST') continue; throw error; }
+    return { action: 'report-dir', status: 'complete', reportDir: qaEvidenceRoot(dir), exitCode: 0 };
+  }
+}
+
+const QA_EVIDENCE_USAGE = 'report-dir (prints a fresh git-excluded report root for /review and /ship QA) | capture ROOT ID [--public] --deadline FILE|--timeout-ms MS [--after PREVIOUS_CAPTURE --hypothesis TEXT] -- COMMAND ARGS (--after publishes checkpoint ID linking PREVIOUS_CAPTURE to this probe; required after the first complete capture unless a checkpoint was published) | checkpoint ROOT ID CAPTURE OBSERVATION_COMMAND HYPOTHESIS NEXT_COMMAND | checkpoint ROOT ID INTENT_FILE | materialize ROOT ANNOTATIONS (annotations: {evidence: [{capture, command, contract, expected, classification: pass|superseded|product-defect|fail|setup-blocked|blocked|inconclusive}], limits: [..]}; revision, runtime, cwd and learning are filled in)';
 
 export async function qaEvidenceMain(args: string[]): Promise<number> {
   return withQaReceiptOutput(false, 'qa-evidence-receipt', value => value.event === 'observation'
@@ -351,6 +428,12 @@ export async function qaEvidenceMain(args: string[]): Promise<number> {
       const [action, reportRoot, ...rest] = args;
       if (action === '--help' && args.length === 1) {
         emit('stdout', { action: 'help', status: 'complete', usage: QA_EVIDENCE_USAGE, exitCode: 0 });
+        return 0;
+      }
+      if (action === 'report-dir' && args.length === 1) {
+        let created: Record<string, any>;
+        try { created = reportDir(); } catch (error: any) { throw error instanceof QaEvidenceError ? error : new QaEvidenceError(`report-dir failed: ${error?.code ?? 'unknown error'}`); }
+        emit('stdout', created);
         return 0;
       }
       const root = qaEvidenceRoot(reportRoot);
