@@ -57,6 +57,10 @@ describe('optional lean instruction profile', () => {
         expect(ship).toContain('## Scope and completion');
         expect(ship).not.toContain('Shared preamble (load first)');
         expect(ship).not.toContain('gstack-skill-start');
+        // ActVox fork: one local-only completion line keeps the local usage log
+        // alive in lean renders (no lease, sync or remote telemetry).
+        expect(ship).toContain('## Completion (run last)');
+        expect(ship).toMatch(/\/bin\/gstack-skill-end --local-only --skill '(gstack-)?ship' --outcome success/);
         expect(fs.existsSync(path.join(path.dirname(skill('ship')), 'sections', 'preamble.md'))).toBe(false);
         expect(fs.existsSync(skill('plan-eng-review'))).toBe(true);
         const links = [...ship.matchAll(/\]\(([^)]+\/sections\/[^)]+\.md)\)/g)].map(m => m[1]);

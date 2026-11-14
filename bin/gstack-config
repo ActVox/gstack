@@ -74,6 +74,10 @@ CONFIG_HEADER='# gstack configuration — edit freely, changes take effect on ne
 #                           # with the repo name and branch; those two fields are
 #                           # stripped before upload. Off logs nothing there.
 #
+# local_usage: off          # on | off (ActVox fork). on = log each skill run to
+#                           # analytics/skill-usage.jsonl on this machine even
+#                           # with telemetry off. Nothing is sent anywhere.
+#
 # ─── Session markers (local functional state, not telemetry) ─────────
 # sessions/<pid>            # One empty file per live agent session, touched at
 #                           #   skill start and deleted after 120 minutes. The
@@ -330,6 +334,7 @@ lookup_default() {
     proactive) echo "core" ;; # core | all | off (true = all, false = off); core suggests only /office-hours, /review, /qa, /ship
     routing_declined) echo "false" ;;
     telemetry) echo "off" ;;
+    local_usage) echo "off" ;; # on | off — ActVox fork: log each skill run to analytics/skill-usage.jsonl locally, even with telemetry off
     auto_upgrade) echo "false" ;;
     update_check) echo "true" ;;
     update_channel) echo "auto" ;; # auto | stable | main — bin/gstack-update-channel.sh resolves auto (docs/releases.md)
@@ -1008,6 +1013,10 @@ $_gstack_legacy_root"
     # memorable_recall is a CONSENT key: `on` lets a Claude Code hook hand every
     # prompt to a third-party binary. Reject like codex_reviews -- a typo must
     # never flip consent in either direction, so nothing is coerced or stored.
+    if [ "$KEY" = "local_usage" ] && [ "$VALUE" != "on" ] && [ "$VALUE" != "off" ]; then
+      echo "Error: local_usage '$VALUE' not recognized. Valid values: on, off. Existing value left unchanged." >&2
+      exit 1
+    fi
     if [ "$KEY" = "memorable_recall" ] && [ "$VALUE" != "on" ] && [ "$VALUE" != "off" ]; then
       echo "Error: memorable_recall '$VALUE' not recognized. Valid values: on, off. Existing value left unchanged." >&2
       exit 1

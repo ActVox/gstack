@@ -1,5 +1,9 @@
 import type { TemplateContext } from '../types';
 
+function shellQuote(value: string): string {
+  return "'" + value.replaceAll("'", "'\\''") + "'";
+}
+
 /** Local opt-in profile: operational state only, without onboarding or model assumptions. */
 export function generateLeanPreamble(ctx: TemplateContext): string {
   if (!ctx.runtimeRoot) throw new Error('Lean profile requires a runtime root');
@@ -28,6 +32,12 @@ export function generateLeanPreamble(ctx: TemplateContext): string {
     '_TEL=$("$GSTACK_BIN/gstack-config" get telemetry 2>/dev/null || printf off)',
     '_SESSION_KIND=$("$GSTACK_BIN/gstack-session-kind" 2>/dev/null || printf interactive)',
     'eval "$("$GSTACK_BIN/gstack-slug" 2>/dev/null)"',
+    '```',
+    '',
+    '## Completion (run last)',
+    '',
+    '```bash',
+    `${root}/bin/gstack-skill-end --local-only --skill ${shellQuote(ctx.skillName)} --outcome success 2>/dev/null || true # or error|abort`,
     '```',
   ].join('\n');
 }
