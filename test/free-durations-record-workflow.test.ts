@@ -32,8 +32,9 @@ test('the recorder runs weekly before test-health and on dispatch, read-only exc
 
 test('Linux records on the free-suite runner image, turns red on any red file, and uploads only a complete recording', () => {
   const linux = recorder.jobs.linux;
-  expect(linux['runs-on']).toMatch(/^ubicloud-standard-\d+$/);
-  expect(freeTests.env.FREE_SUITE_RUNNER).toMatch(/^ubicloud-standard-\d+$/);
+  // ActVox fork: GitHub-hosted runners; a ubicloud label queues forever here (test/fork-ci-runner-policy.test.ts).
+  expect(linux['runs-on']).toBe('ubuntu-latest');
+  expect(freeTests.env.FREE_SUITE_RUNNER).toBe('ubuntu-latest');
   const runs = linux.steps.map((step: any) => step.run).filter(Boolean).join('\n');
   expect(runs).toContain('bash scripts/ubicloud/setup-free-suite.sh');
   const record = linux.steps.find((step: any) => step.name === 'Time every free file alone');

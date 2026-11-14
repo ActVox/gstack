@@ -288,7 +288,8 @@ describe('evals-periodic.yml host-run Codex slices', () => {
     expect(matrixStep.run).toContain('} >> "$GITHUB_OUTPUT"');
     expect(planner.outputs!.periodic_codex_slices).toBe('${{ steps.periodic-matrix.outputs.codex_slices }}');
     expect(codex.needs).toEqual(['build-image', 'plan-slices']);
-    expect(codex.if).toBe("${{ needs.plan-slices.outputs.periodic_lane == 'true' && needs.plan-slices.outputs.periodic_codex_slices != '[]' }}");
+    // ActVox fork: the ENABLE_PAID_EVALS gate prefixes every paid job (test/fork-ci-runner-policy.test.ts).
+    expect(codex.if).toBe("${{ vars.ENABLE_PAID_EVALS == 'true' && needs.plan-slices.outputs.periodic_lane == 'true' && needs.plan-slices.outputs.periodic_codex_slices != '[]' }}");
     expect(codex.strategy!.matrix.slice).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_codex_slices) }}');
     expect(codex['timeout-minutes']).toBe('${{ fromJSON(needs.plan-slices.outputs.periodic_slice_timeouts)[matrix.slice] }}');
     expect(codex.steps[0]!.run).toBe('echo "GSTACK_SLICE_JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"');
@@ -494,7 +495,8 @@ describe('scheduled paid lanes: concurrency and branch dispatch scope', () => {
     const wf = parse(periodicYml);
     expect(wf.on.workflow_dispatch!.inputs!.include_gate_census).toMatchObject({ type: 'boolean', default: false });
     // The planner selects the census arms (crew/scripts/census-arms.ts); no arm, no census job.
-    expect(wf.jobs['gate-census']!.if).toBe("${{ needs.plan-slices.outputs.gate_matrix != '[]' }}");
+    // ActVox fork: the ENABLE_PAID_EVALS gate prefixes every paid job (test/fork-ci-runner-policy.test.ts).
+    expect(wf.jobs['gate-census']!.if).toBe("${{ vars.ENABLE_PAID_EVALS == 'true' && needs.plan-slices.outputs.gate_matrix != '[]' }}");
     const select = wf.jobs['plan-slices']!.steps.find(step => step.id === 'census')!;
     expect(select.env?.INCLUDE_GATE_CENSUS).toBe("${{ github.ref == 'refs/heads/main' || inputs.include_gate_census }}");
     expect(select.run).toBe('bun --no-install run crew/scripts/census-arms.ts --select >> "$GITHUB_OUTPUT"');

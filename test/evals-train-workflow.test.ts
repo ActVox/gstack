@@ -117,7 +117,9 @@ function simulate(wf: Workflow, s: Scenario) {
     pending.splice(pending.indexOf(id), 1);
     const job = wf.jobs[id]!;
     const needs = [job.needs ?? []].flat();
-    const ctx = { github: s.github, inputs: s.inputs, vars: {}, secrets: {}, env: {}, steps: {}, matrix: {}, runner: {},
+    // ActVox fork: every paid job also requires vars.ENABLE_PAID_EVALS (test/fork-ci-runner-policy.test.ts);
+    // the simulation models a repository with paid evals enabled, so upstream's routing is what it proves.
+    const ctx = { github: s.github, inputs: s.inputs, vars: { ENABLE_PAID_EVALS: 'true' }, secrets: {}, env: {}, steps: {}, matrix: {}, runner: {},
       needs: Object.fromEntries(needs.map(n => [n, { result: result[n], outputs: outputs[n] ?? {} }])) };
     const allOk = needs.every(n => result[n] === 'success');
     const cond = job.if === undefined ? 'success()' : String(job.if);
